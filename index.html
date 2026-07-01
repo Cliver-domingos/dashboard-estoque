@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Controle de Estoque & Inventário</title>
+<style>
+  :root{
+    --bg:#0f172a; --bg2:#1e293b; --panel:#ffffff; --panel-soft:#f8fafc;
+    --line:#e2e8f0; --txt:#0f172a; --txt-soft:#64748b; --txt-inv:#f1f5f9;
+    --brand:#2563eb; --brand-d:#1d4ed8; --brand-soft:#eff6ff;
+    --green:#16a34a; --green-soft:#dcfce7;
+    --amber:#d97706; --amber-soft:#fef3c7;
+    --red:#dc2626; --red-soft:#fee2e2;
+    --violet:#7c3aed; --violet-soft:#ede9fe;
+    --radius:14px; --shadow:0 1px 3px rgba(15,23,42,.08),0 8px 24px rgba(15,23,42,.06);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--panel-soft);color:var(--txt);font-size:14px;line-height:1.45}
+  button{font-family:inherit;cursor:pointer;border:none;background:none}
+  input,select,textarea{font-family:inherit;font-size:14px}
+  a{color:var(--brand);text-decoration:none}
+
+  /* ---- Layout ---- */
+  .app{display:flex;min-height:100vh}
+  .sidebar{width:236px;background:linear-gradient(180deg,#0f172a,#1e293b);color:var(--txt-inv);display:flex;flex-direction:column;position:fixed;top:0;bottom:0;left:0;z-index:20}
+  .sidebar .logo{padding:22px 20px 16px;font-size:17px;font-weight:700;letter-spacing:.3px;display:flex;align-items:center;gap:10px}
+  .sidebar .logo .dot{width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,#3b82f6,#7c3aed);display:grid;place-items:center;font-size:16px}
+  .sidebar nav{padding:8px 12px;flex:1;overflow:auto}
+  .nav-item{display:flex;align-items:center;gap:11px;padding:11px 14px;border-radius:10px;color:#cbd5e1;font-weight:500;width:100%;text-align:left;margin-bottom:3px;transition:.15s}
+  .nav-item:hover{background:rgba(255,255,255,.07);color:#fff}
+  .nav-item.active{background:var(--brand);color:#fff;box-shadow:0 4px 12px rgba(37,99,235,.4)}
+  .nav-item .ic{font-size:17px;width:20px;text-align:center}
+  .sidebar .foot{padding:14px 18px;font-size:11px;color:#64748b;border-top:1px solid rgba(255,255,255,.08)}
+
+  .main{margin-left:236px;flex:1;min-width:0}
+  .topbar{background:var(--panel);border-bottom:1px solid var(--line);padding:16px 28px;display:flex;align-items:center;gap:16px;position:sticky;top:0;z-index:10}
+  .topbar h1{font-size:19px;font-weight:700}
+  .topbar .sub{color:var(--txt-soft);font-size:12.5px}
+  .topbar .spacer{flex:1}
+  .content{padding:24px 28px 60px}
+
+  /* ---- Buttons ---- */
+  .btn{display:inline-flex;align-items:center;gap:7px;padding:9px 15px;border-radius:9px;font-weight:600;font-size:13.5px;background:var(--panel);border:1px solid var(--line);color:var(--txt);transition:.15s}
+  .btn:hover{background:var(--panel-soft);border-color:#cbd5e1}
+  .btn.primary{background:var(--brand);color:#fff;border-color:var(--brand)}
+  .btn.primary:hover{background:var(--brand-d)}
+  .btn.green{background:var(--green);color:#fff;border-color:var(--green)}
+  .btn.red{background:var(--red);color:#fff;border-color:var(--red)}
+  .btn.ghost{background:transparent;border-color:transparent}
+  .btn.sm{padding:6px 11px;font-size:12.5px}
+  .btn:disabled{opacity:.5;cursor:not-allowed}
+
+  /* ---- Cards / KPI ---- */
+  .grid{display:grid;gap:18px}
+  .kpis{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
+  .kpi{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:18px 20px;box-shadow:var(--shadow);position:relative;overflow:hidden}
+  .kpi .lbl{color:var(--txt-soft);font-size:12.5px;font-weight:600;text-transform:uppercase;letter-spacing:.4px}
+  .kpi .val{font-size:30px;font-weight:800;margin-top:6px;letter-spacing:-.5px}
+  .kpi .ic{position:absolute;right:16px;top:16px;font-size:22px;width:44px;height:44px;border-radius:12px;display:grid;place-items:center}
+  .kpi.b .ic{background:var(--brand-soft);color:var(--brand)} .kpi.b .val{color:var(--brand)}
+  .kpi.g .ic{background:var(--green-soft);color:var(--green)} .kpi.g .val{color:var(--green)}
+  .kpi.a .ic{background:var(--amber-soft);color:var(--amber)} .kpi.a .val{color:var(--amber)}
+  .kpi.r .ic{background:var(--red-soft);color:var(--red)} .kpi.r .val{color:var(--red)}
+  .kpi.v .ic{background:var(--violet-soft);color:var(--violet)} .kpi.v .val{color:var(--violet)}
+
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow)}
+  .panel .ph{padding:16px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px}
+  .panel .ph h3{font-size:15px;font-weight:700}
+  .panel .ph .spacer{flex:1}
+  .panel .pb{padding:18px 20px}
+
+  /* ---- Table ---- */
+  .tbl-wrap{overflow:auto;max-height:none}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{text-align:left;padding:11px 14px;color:var(--txt-soft);font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.4px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel);white-space:nowrap}
+  td{padding:11px 14px;border-bottom:1px solid #f1f5f9;vertical-align:middle}
+  tbody tr:hover{background:var(--brand-soft)}
+  td.mono{font-family:'Consolas',monospace;font-size:12px}
+
+  /* ---- Badges ---- */
+  .badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:11.5px;font-weight:700;white-space:nowrap}
+  .badge.estoque{background:var(--green-soft);color:var(--green)}
+  .badge.com_tecnico{background:var(--amber-soft);color:var(--amber)}
+  .badge.baixado{background:var(--red-soft);color:var(--red)}
+  .badge.gray{background:#f1f5f9;color:#64748b}
+  .badge.blue{background:var(--brand-soft);color:var(--brand)}
+  .badge.violet{background:var(--violet-soft);color:var(--violet)}
+  .tag-tipo{display:inline-block;padding:3px 9px;border-radius:7px;background:#f1f5f9;font-weight:600;font-size:12px}
+
+  /* ---- Forms ---- */
+  .field{margin-bottom:14px}
+  .field label{display:block;font-weight:600;font-size:12.5px;margin-bottom:5px;color:#334155}
+  .field input,.field select,.field textarea{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:9px;background:var(--panel);transition:.15s}
+  .field input:focus,.field select:focus,.field textarea:focus{outline:none;border-color:var(--brand);box-shadow:0 0 0 3px var(--brand-soft)}
+  .field .hint{font-size:11.5px;color:var(--txt-soft);margin-top:4px}
+  .row2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
+
+  .toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:16px}
+  .search{position:relative;flex:1;min-width:220px}
+  .search input{width:100%;padding:10px 12px 10px 36px;border:1px solid var(--line);border-radius:9px}
+  .search .si{position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--txt-soft)}
+  select.filter{padding:9px 12px;border:1px solid var(--line);border-radius:9px;background:var(--panel);font-weight:500;color:#334155}
+
+  /* ---- Modal ---- */
+  .modal-bg{position:fixed;inset:0;background:rgba(15,23,42,.55);backdrop-filter:blur(2px);display:none;align-items:flex-start;justify-content:center;z-index:50;padding:40px 16px;overflow:auto}
+  .modal-bg.show{display:flex}
+  .modal{background:var(--panel);border-radius:16px;width:100%;max-width:560px;box-shadow:0 20px 60px rgba(0,0,0,.3);animation:pop .18s ease}
+  .modal.lg{max-width:760px}
+  @keyframes pop{from{transform:translateY(12px) scale(.98);opacity:0}to{transform:none;opacity:1}}
+  .modal .mh{padding:18px 22px;border-bottom:1px solid var(--line);display:flex;align-items:center}
+  .modal .mh h3{font-size:17px;font-weight:700}
+  .modal .mh .x{margin-left:auto;font-size:22px;color:var(--txt-soft);width:32px;height:32px;border-radius:8px}
+  .modal .mh .x:hover{background:var(--panel-soft)}
+  .modal .mb{padding:22px}
+  .modal .mf{padding:16px 22px;border-top:1px solid var(--line);display:flex;gap:10px;justify-content:flex-end}
+
+  /* ---- Charts ---- */
+  .chart-row{display:grid;grid-template-columns:1.4fr 1fr;gap:18px}
+  .bar-row{display:flex;align-items:center;gap:12px;margin-bottom:12px}
+  .bar-row .bl{width:130px;font-weight:600;font-size:13px;display:flex;align-items:center;gap:7px}
+  .bar-track{flex:1;height:26px;background:#f1f5f9;border-radius:7px;overflow:hidden;position:relative}
+  .bar-fill{height:100%;border-radius:7px;transition:width .6s cubic-bezier(.4,0,.2,1);display:flex;align-items:center;justify-content:flex-end;padding-right:8px;color:#fff;font-weight:700;font-size:12px;min-width:28px}
+  .donut-wrap{display:flex;align-items:center;gap:22px;flex-wrap:wrap;justify-content:center}
+  .legend{display:flex;flex-direction:column;gap:9px}
+  .legend .li{display:flex;align-items:center;gap:9px;font-size:13px;font-weight:500}
+  .legend .sw{width:13px;height:13px;border-radius:4px}
+
+  .empty{text-align:center;padding:50px 20px;color:var(--txt-soft)}
+  .empty .big{font-size:40px;margin-bottom:10px;opacity:.5}
+
+  .pill-tabs{display:flex;gap:6px;background:#f1f5f9;padding:4px;border-radius:11px;width:fit-content}
+  .pill-tabs button{padding:8px 16px;border-radius:8px;font-weight:600;font-size:13px;color:var(--txt-soft)}
+  .pill-tabs button.active{background:var(--panel);color:var(--brand);box-shadow:var(--shadow)}
+
+  .checkbox{display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:500}
+  .checkbox input{width:auto}
+  .muted{color:var(--txt-soft)}
+  .right{text-align:right}.center{text-align:center}
+  .hidden{display:none!important}
+  .flash{position:fixed;bottom:24px;right:24px;background:#0f172a;color:#fff;padding:13px 20px;border-radius:11px;box-shadow:0 12px 30px rgba(0,0,0,.3);z-index:100;font-weight:600;display:flex;align-items:center;gap:10px;animation:slideup .25s ease}
+  .flash.green{background:var(--green)} .flash.red{background:var(--red)}
+  @keyframes slideup{from{transform:translateY(20px);opacity:0}to{transform:none;opacity:1}}
+  .count-badge{background:#f1f5f9;color:#64748b;font-weight:700;font-size:12px;padding:2px 9px;border-radius:20px}
+
+  /* selecionar itens em movimentação */
+  .pick-list{max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:10px}
+  .pick-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-bottom:1px solid #f1f5f9}
+  .pick-item:hover{background:var(--brand-soft)}
+  .chips{display:flex;flex-wrap:wrap;gap:7px;margin-top:8px}
+  .chip{background:var(--brand-soft);color:var(--brand);padding:5px 10px;border-radius:20px;font-size:12px;font-weight:600;display:flex;align-items:center;gap:6px}
+  .chip .rm{cursor:pointer;font-weight:700}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="logo"><span class="dot">📦</span> <span>Estoque<b style="font-weight:800">A365</b></span></div>
+    <nav id="nav"></nav>
+    <div class="foot" id="footSync">Conectando...<br>Faça backup em <b>Dados</b>.</div>
+  </aside>
+  <div class="main">
+    <div class="topbar">
+      <div>
+        <h1 id="pageTitle">Visão Geral</h1>
+        <div class="sub" id="pageSub">Resumo do inventário</div>
+      </div>
+      <div class="spacer"></div>
+      <button class="btn primary" onclick="openMov()">＋ Nova movimentação</button>
+    </div>
+    <div class="content" id="content"></div>
+  </div>
+</div>
+
+<div class="modal-bg" id="modalBg"><div class="modal" id="modal"></div></div>
+
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js" onerror="window.__noXLSX=true"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
+<script>
+  const firebaseConfig = {
+    apiKey: "AIzaSyAhli5_z1946Tt8UQpKxm2oJ_xqs-QGzhc",
+    authDomain: "dashboard-estoque-284cb.firebaseapp.com",
+    projectId: "dashboard-estoque-284cb",
+    storageBucket: "dashboard-estoque-284cb.firebasestorage.app",
+    messagingSenderId: "28794670387",
+    appId: "1:28794670387:web:f288d97e5d56b127d24246"
+  };
+  firebase.initializeApp(firebaseConfig);
+  window.firestoreDB = firebase.firestore();
+</script>
+<script src="app.js"></script>
+</body>
+</html>
