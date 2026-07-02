@@ -161,6 +161,19 @@
   .login-box .switch{text-align:center;font-size:12.5px;margin-top:14px;color:var(--txt-soft)}
   .login-box .switch a{cursor:pointer;font-weight:600}
 
+  /* ---- Modo escuro ---- */
+  body.dark{background:#0b1220}
+  body.dark{--panel:#1e293b;--panel-soft:#0f172a;--line:#334155;--txt:#f1f5f9;--txt-soft:#94a3b8;--txt-inv:#f1f5f9;--brand-soft:#1e3a5f;--green-soft:#0f2e1a;--amber-soft:#3a2a0a;--red-soft:#3a1414;--violet-soft:#2c1f4a}
+  body.dark .sidebar{background:linear-gradient(180deg,#020617,#0f172a)}
+  body.dark .topbar{background:var(--panel)}
+  body.dark th{background:var(--panel)}
+  body.dark .modal-bg{background:rgba(0,0,0,.7)}
+  body.dark .bar-track,body.dark .tag-tipo,body.dark .count-badge{background:#0f172a}
+  body.dark .badge.gray{background:#0f172a;color:#94a3b8}
+  body.dark .pill-tabs{background:#0f172a}
+  body.dark .field input,body.dark .field select,body.dark .field textarea{background:var(--panel);color:var(--txt)}
+  body.dark tbody tr:hover{background:#0f2540}
+
   /* ---- Menu mobile ---- */
   .hamburger{display:none;font-size:20px;width:38px;height:38px;border-radius:9px;align-items:center;justify-content:center;flex-shrink:0}
   .hamburger:hover{background:var(--panel-soft)}
@@ -212,6 +225,15 @@
     <div class="switch">Ainda não tem conta? <a onclick="loginAlternar()" id="loginAlternarLink">Criar conta</a></div>
   </div>
 </div>
+<div class="login-bg" id="pendingBg" style="display:none">
+  <div class="login-box" style="max-width:440px;text-align:center">
+    <div style="font-size:40px;margin-bottom:6px">⏳</div>
+    <h2>Aguardando aprovação</h2>
+    <div class="sub" style="margin-bottom:18px">Sua conta foi criada, mas um administrador ainda precisa liberar seu acesso e definir sua permissão.</div>
+    <div class="muted" style="font-size:11.5px;background:var(--panel-soft);padding:10px;border-radius:9px;margin-bottom:16px" id="pendingInfo"></div>
+    <button class="btn" style="width:100%;justify-content:center" onclick="logout()">Sair</button>
+  </div>
+</div>
 <div class="app" id="appRoot" style="display:none">
   <aside class="sidebar">
     <div class="logo"><span class="dot">📦</span> <span>Estoque<b style="font-weight:800">A365</b></span></div>
@@ -227,6 +249,7 @@
       </div>
       <div class="spacer"></div>
       <div class="muted" id="userEmailLbl" style="font-size:12.5px;margin-right:4px"></div>
+      <button class="btn ghost sm" title="Alternar modo escuro" onclick="toggleDark()">🌙</button>
       <button class="btn ghost sm" onclick="logout()">Sair</button>
       <button class="btn primary" onclick="openMov()">＋ Nova movimentação</button>
     </div>

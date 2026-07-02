@@ -4,9 +4,10 @@
    ========================================================= */
 
 const STORE_KEY = 'estoque_a365_v1';
+const DIAS_PARADO = 20; // a partir de quantos dias com técnico um item é considerado "parado"
 const STATUS = { estoque:'Em estoque', com_tecnico:'Com técnico', baixado:'Baixado' };
 const TIPO_CORES = ['#2563eb','#7c3aed','#16a34a','#d97706','#dc2626','#0891b2','#db2777','#65a30d'];
-const MOV_LABEL = { entrada:'Entrada', saida:'Saída p/ técnico', transferencia:'Transferência', baixa:'Baixa/Defeito' };
+const MOV_LABEL = { entrada:'Entrada', saida:'Saída p/ técnico', transferencia:'Transferência', baixa:'Baixa/Defeito', confirmacao:'Confirmação de recebimento' };
 
 /* ---------- Estado ---------- */
 let DB = carregar();
@@ -59,17 +60,61 @@ function loginSubmit(){
 }
 function logout(){ if(confirm('Sair da sua conta?')) window.firebaseAuth.signOut(); }
 
-window.firebaseAuth.onAuthStateChanged(user=>{
+/* ---------- Perfis / hierarquia (admin, supervisor, técnico) ---------- */
+const USERS_REF = window.firestoreDB.collection('usuarios');
+let MEU_PERFIL = null; // {uid, email, nome, papel:'pendente'|'admin'|'supervisor'|'tecnico', regioes:[], tecnicoId}
+let syncIniciado = false;
+let perfilListenerAtivo = null;
+
+function souAdmin(){ return !!MEU_PERFIL && MEU_PERFIL.papel==='admin'; }
+function souSupervisor(){ return !!MEU_PERFIL && MEU_PERFIL.papel==='supervisor'; }
+function souTecnico(){ return !!MEU_PERFIL && MEU_PERFIL.papel==='tecnico'; }
+function regiaoPermitida(dep){
+  if(!MEU_PERFIL) return false;
+  if(MEU_PERFIL.papel==='admin') return true;
+  if(MEU_PERFIL.papel==='supervisor') return (MEU_PERFIL.regioes||[]).includes(dep);
+  return false;
+}
+
+window.firebaseAuth.onAuthStateChanged(async user=>{
+  if(perfilListenerAtivo){ perfilListenerAtivo(); perfilListenerAtivo=null; }
   if(user){
     $('#loginBg').style.display='none';
-    $('#appRoot').style.display='';
-    $('#userEmailLbl').textContent = user.email;
-    iniciarSyncNuvem();
+    $('#pendingBg').style.display='none';
+    const ref = USERS_REF.doc(user.uid);
+    const snap = await ref.get().catch(()=>null);
+    if(snap && !snap.exists){
+      await ref.set({ email:user.email, nome:(user.email||'').split('@')[0], papel:'pendente', regioes:[], tecnicoId:null, criadoEm:Date.now() }).catch(()=>{});
+    }
+    perfilListenerAtivo = ref.onSnapshot(s=>{
+      MEU_PERFIL = s.exists ? Object.assign({uid:user.uid}, s.data()) : null;
+      aplicarPerfil(user);
+    }, ()=>{ MEU_PERFIL=null; aplicarPerfil(user); });
   } else {
+    MEU_PERFIL = null; syncIniciado=false;
     $('#loginBg').style.display='flex';
+    $('#pendingBg').style.display='none';
     $('#appRoot').style.display='none';
   }
 });
+
+function aplicarPerfil(user){
+  if(!MEU_PERFIL || MEU_PERFIL.papel==='pendente'){
+    $('#appRoot').style.display='none';
+    $('#pendingBg').style.display='flex';
+    $('#pendingInfo').textContent = 'Conta: '+user.email;
+    return;
+  }
+  $('#pendingBg').style.display='none';
+  $('#appRoot').style.display='';
+  $('#userEmailLbl').textContent = (MEU_PERFIL.nome||user.email) + ' · ' + PAPEL_LABEL[MEU_PERFIL.papel];
+  if(!syncIniciado){ syncIniciado=true; iniciarSyncNuvem(); }
+  renderNav();
+  goto(PAGE_ATUAL_VALIDA()?PAGE:PAGINA_INICIAL());
+}
+const PAPEL_LABEL = { admin:'Administrador', supervisor:'Supervisor', tecnico:'Técnico' };
+function PAGINA_INICIAL(){ return souTecnico() ? 'meusItens' : 'dashboard'; }
+function PAGE_ATUAL_VALIDA(){ return paginasDisponiveis().some(p=>p.id===PAGE); }
 
 /* ---------- Sincronização em nuvem (Firestore) ---------- */
 const DOC_REF = window.firestoreDB.collection('estoques').doc('dashboard');
@@ -110,7 +155,7 @@ function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(
 /* ---------- Helpers ---------- */
 const $ = s => document.querySelector(s);
 const esc = s => (s==null?'':String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-function tecNome(id){ const t = DB.tecnicos.find(x=>x.id===id); return t?t.nome:'—'; }
+function tecNome(id){ const t = DB.tecnicos.find(x=>x.id===id); if(!t) return '—'; return (t.regiao?'['+t.regiao+'] ':'')+t.nome; }
 function tipoNome(cod){ return (DB.tipos[cod]&&DB.tipos[cod].nome)||cod; }
 function tipoCor(cod){ const k=Object.keys(DB.tipos); const i=k.indexOf(cod); return (DB.tipos[cod]&&DB.tipos[cod].cor)||TIPO_CORES[i%TIPO_CORES.length]||'#64748b'; }
 function fmtData(d){ if(!d) return '—'; if(d instanceof Date) return d.toLocaleDateString('pt-BR'); return d; }
@@ -122,37 +167,51 @@ function fmtDias(n){ if(n==null) return '—'; if(n===0) return 'hoje'; if(n===1
 function ultimaAuditoria(alvoTipo, alvoId){ const a=DB.auditorias.filter(x=>x.alvoTipo===alvoTipo&&x.alvoId===alvoId); return a.length?a[a.length-1]:null; }
 function itensDoTecnico(id){ return DB.equipamentos.filter(e=>e.tecnicoId===id && e.status==='com_tecnico'); }
 function itensDoDeposito(dep){ return DB.equipamentos.filter(e=>e.status==='estoque' && (e.local||e.deposito||'')===dep); }
-function estoqueMinAlertas(){ const r=[]; Object.keys(DB.tipos).forEach(t=>{ const min=DB.tipos[t].min||0; if(min>0){ const n=DB.equipamentos.filter(e=>e.tipo===t&&e.status==='estoque').length; if(n<min) r.push({tipo:t,atual:n,min}); } }); return r; }
+function estoqueMinAlertas(lista){ lista=lista||DB.equipamentos; const r=[]; Object.keys(DB.tipos).forEach(t=>{ const min=DB.tipos[t].min||0; if(min>0){ const n=lista.filter(e=>e.tipo===t&&e.status==='estoque').length; if(n<min) r.push({tipo:t,atual:n,min}); } }); return r; }
+
+/* ---------- Modo escuro ---------- */
+function toggleDark(){ document.body.classList.toggle('dark'); localStorage.setItem('estoque_dark', document.body.classList.contains('dark')?'1':'0'); }
+if(localStorage.getItem('estoque_dark')==='1') document.body.classList.add('dark');
 
 /* ---------- Navegação ---------- */
 const PAGES = [
-  { id:'dashboard', icon:'📊', titulo:'Visão Geral', sub:'Resumo do inventário' },
-  { id:'equip',     icon:'📦', titulo:'Equipamentos', sub:'Inventário item a item' },
-  { id:'mov',       icon:'🔄', titulo:'Movimentar', sub:'Registrar entrada, saída, transferência ou baixa' },
-  { id:'tecnicos',  icon:'👷', titulo:'Técnicos', sub:'Cadastro e equipamentos em posse' },
-  { id:'auditoria', icon:'🔍', titulo:'Auditoria', sub:'Conferência de estoque por técnico ou depósito' },
-  { id:'hist',      icon:'🕓', titulo:'Histórico', sub:'Todas as movimentações registradas' },
-  { id:'tipos',     icon:'🏷️', titulo:'Tipos', sub:'Os 5 tipos de equipamento' },
-  { id:'dados',     icon:'💾', titulo:'Dados', sub:'Importar, exportar e backup' },
+  { id:'dashboard', icon:'📊', titulo:'Visão Geral', sub:'Resumo do inventário', papeis:['admin','supervisor'] },
+  { id:'equip',     icon:'📦', titulo:'Equipamentos', sub:'Inventário item a item', papeis:['admin','supervisor'] },
+  { id:'mov',       icon:'🔄', titulo:'Movimentar', sub:'Registrar entrada, saída, transferência ou baixa', papeis:['admin','supervisor'] },
+  { id:'tecnicos',  icon:'👷', titulo:'Técnicos', sub:'Cadastro e equipamentos em posse', papeis:['admin','supervisor'] },
+  { id:'parados',   icon:'⏰', titulo:'Itens Parados', sub:`Equipamentos com técnicos há ${DIAS_PARADO}+ dias`, papeis:['admin','supervisor'] },
+  { id:'auditoria', icon:'🔍', titulo:'Auditoria', sub:'Conferência de estoque por técnico ou depósito', papeis:['admin','supervisor'] },
+  { id:'hist',      icon:'🕓', titulo:'Histórico', sub:'Todas as movimentações registradas', papeis:['admin','supervisor'] },
+  { id:'tipos',     icon:'🏷️', titulo:'Tipos', sub:'Os 5 tipos de equipamento', papeis:['admin','supervisor'] },
+  { id:'dados',     icon:'💾', titulo:'Dados', sub:'Importar, exportar e backup', papeis:['admin'] },
+  { id:'usuarios',  icon:'🔐', titulo:'Usuários', sub:'Aprovar acessos e definir permissões', papeis:['admin'] },
+  { id:'meusItens', icon:'📦', titulo:'Meus Equipamentos', sub:'Itens sob sua responsabilidade', papeis:['tecnico'] },
+  { id:'meuHistorico', icon:'🕓', titulo:'Meu Histórico', sub:'Movimentações dos seus itens', papeis:['tecnico'] },
 ];
 let PAGE = 'dashboard';
+function paginasDisponiveis(){ const papel = MEU_PERFIL?MEU_PERFIL.papel:null; return PAGES.filter(p=>p.papeis.includes(papel)); }
 
 function renderNav(){
-  $('#nav').innerHTML = PAGES.map(p=>`
+  $('#nav').innerHTML = paginasDisponiveis().map(p=>`
     <button class="nav-item ${p.id===PAGE?'active':''}" onclick="goto('${p.id}')">
       <span class="ic">${p.icon}</span> ${p.titulo}
     </button>`).join('');
 }
-function goto(id){ PAGE=id; const p=PAGES.find(x=>x.id===id); $('#pageTitle').textContent=p.titulo; $('#pageSub').textContent=p.sub; renderNav(); render(); window.scrollTo(0,0); toggleSidebar(false); }
+function goto(id){
+  const p = paginasDisponiveis().find(x=>x.id===id); if(!p) return;
+  PAGE=id; $('#pageTitle').textContent=p.titulo; $('#pageSub').textContent=p.sub; renderNav(); render(); window.scrollTo(0,0); toggleSidebar(false);
+}
 function toggleSidebar(force){
   const open = typeof force==='boolean' ? force : !document.querySelector('.sidebar').classList.contains('open');
   document.querySelector('.sidebar').classList.toggle('open', open);
   $('#sidebarOverlay').classList.toggle('show', open);
 }
 
+const RENDERERS = { dashboard:renderDashboard, equip:renderEquip, mov:renderMovPage, tecnicos:renderTecnicos, parados:renderParados, auditoria:renderAuditoria, hist:renderHist, tipos:renderTipos, dados:renderDados, usuarios:renderUsuarios, meusItens:renderMeusItens, meuHistorico:renderMeuHistorico };
 function render(){
-  if(DB.equipamentos.length===0 && PAGE!=='dados' && PAGE!=='tipos'){ return renderVazio(); }
-  ({ dashboard:renderDashboard, equip:renderEquip, mov:renderMovPage, tecnicos:renderTecnicos, auditoria:renderAuditoria, hist:renderHist, tipos:renderTipos, dados:renderDados }[PAGE])();
+  const semDados = ['dados','tipos','usuarios','meusItens','meuHistorico'];
+  if(DB.equipamentos.length===0 && !semDados.includes(PAGE)){ return renderVazio(); }
+  RENDERERS[PAGE]();
 }
 
 function renderVazio(){
@@ -172,12 +231,23 @@ function renderVazio(){
 /* =========================================================
    VISÃO GERAL
    ========================================================= */
+let dashFiliais = []; // array de depósitos selecionados; vazio = todas
+function dashToggleFilial(d){
+  const i = dashFiliais.indexOf(d);
+  if(i>=0) dashFiliais.splice(i,1); else dashFiliais.push(d);
+  renderDashboard();
+}
 function renderDashboard(){
-  const eq = DB.equipamentos;
+  let todasFiliais = [...new Set(DB.equipamentos.map(e=>e.deposito).filter(Boolean))].sort();
+  if(souSupervisor()) todasFiliais = todasFiliais.filter(regiaoPermitida);
+  const baseEq = souSupervisor() ? DB.equipamentos.filter(e=>regiaoPermitida(e.deposito)) : DB.equipamentos;
+  const eq = dashFiliais.length ? baseEq.filter(e=>dashFiliais.includes(e.deposito)) : baseEq;
   const total = eq.length;
   const emEstoque = eq.filter(e=>e.status==='estoque').length;
   const comTec = eq.filter(e=>e.status==='com_tecnico').length;
   const baixados = eq.filter(e=>e.status==='baixado').length;
+  const seriesEq = new Set(eq.map(e=>e.serie));
+  const auditoriasFiltradas = dashFiliais.length ? DB.auditorias.filter(a=>a.alvoTipo==='deposito'&&dashFiliais.includes(a.alvoId)) : DB.auditorias;
 
   // por tipo
   const porTipo = {};
@@ -185,26 +255,49 @@ function renderDashboard(){
   const tiposArr = Object.entries(porTipo).sort((a,b)=>b[1]-a[1]);
   const maxTipo = Math.max(1,...tiposArr.map(t=>t[1]));
 
-  // por depósito
-  const porDep = {};
-  eq.filter(e=>e.status!=='baixado').forEach(e=>{ const d=e.local||e.deposito||'—'; porDep[d]=(porDep[d]||0)+1; });
-  const depArr = Object.entries(porDep).sort((a,b)=>b[1]-a[1]).slice(0,8);
-  const maxDep = Math.max(1,...depArr.map(d=>d[1]));
+  // painel secundário: por depósito (visão geral) OU por técnico (quando uma ou mais filiais estão selecionadas)
+  let painel2Titulo, painel2Arr, painel2Max, painel2Cor='#2563eb', painel2PorTecnico=false;
+  if(dashFiliais.length){
+    const porTec = {};
+    eq.filter(e=>e.status==='com_tecnico').forEach(e=>{ const id=e.tecnicoId; porTec[id]=(porTec[id]||0)+1; });
+    painel2Titulo = '👷 Itens com técnicos das filiais selecionadas <span class="muted" style="font-size:11px;font-weight:500">(clique num técnico para ver a ficha completa)</span>';
+    painel2Arr = Object.entries(porTec).sort((a,b)=>b[1]-a[1]).slice(0,8);
+    painel2Max = Math.max(1,...painel2Arr.map(d=>d[1]));
+    painel2Cor='#d97706';
+    painel2PorTecnico=true;
+  } else {
+    const porDep = {};
+    eq.filter(e=>e.status!=='baixado').forEach(e=>{ const d=e.local||e.deposito||'—'; porDep[d]=(porDep[d]||0)+1; });
+    painel2Titulo = '📍 Itens ativos por depósito/local';
+    painel2Arr = Object.entries(porDep).sort((a,b)=>b[1]-a[1]).slice(0,8);
+    painel2Max = Math.max(1,...painel2Arr.map(d=>d[1]));
+  }
 
-  const ultimas = [...DB.movimentacoes].slice(-8).reverse();
+  const ultimas = DB.movimentacoes.filter(m=>seriesEq.has(m.serie)).slice(-8).reverse();
 
   // alertas
-  const alertasMin = estoqueMinAlertas();
-  const parados = DB.equipamentos.filter(e=>e.status==='com_tecnico' && (diasEmPosse(e)||0)>=90);
-  const tecsSemAud = DB.tecnicos.filter(t=>itensDoTecnico(t.id).length>0 && !ultimaAuditoria('tecnico',t.id));
+  const alertasMin = estoqueMinAlertas(eq);
+  const parados = eq.filter(e=>e.status==='com_tecnico' && (diasEmPosse(e)||0)>=DIAS_PARADO);
+  const tecsSemAud = DB.tecnicos.filter(t=>itensDoTecnico(t.id).some(e=>seriesEq.has(e.serie)) && !ultimaAuditoria('tecnico',t.id));
 
   $('#content').innerHTML = `
+  <div class="panel" style="margin-bottom:18px"><div class="pb" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+    <span style="font-weight:700;font-size:12.5px;color:var(--txt-soft);white-space:nowrap">🏢 FILIAL / DEPÓSITO ${dashFiliais.length?`<span class="muted" style="font-weight:500">(${dashFiliais.length} selecionada${dashFiliais.length>1?'s':''} · clique para adicionar/remover)</span>`:'<span class="muted" style="font-weight:500">(clique para filtrar, pode escolher várias)</span>'}</span>
+    <div class="pill-tabs" style="flex-wrap:wrap;background:transparent;padding:0;gap:8px">
+      <button class="${!dashFiliais.length?'active':''}" style="background:${!dashFiliais.length?'var(--brand)':'var(--panel-soft)'};color:${!dashFiliais.length?'#fff':'var(--txt)'};border-radius:9px" onclick="dashFiliais=[];renderDashboard()">Todas <span class="count-badge" style="background:rgba(255,255,255,.25);color:inherit;margin-left:4px">${baseEq.length}</span></button>
+      ${todasFiliais.map(d=>{ const n=baseEq.filter(e=>e.deposito===d).length; const on=dashFiliais.includes(d); return `
+        <button class="${on?'active':''}" style="background:${on?'var(--brand)':'var(--panel-soft)'};color:${on?'#fff':'var(--txt)'};border-radius:9px" onclick="dashToggleFilial('${esc(d)}')">${on?'✓ ':''}${esc(d)} <span class="count-badge" style="background:${on?'rgba(255,255,255,.25)':'#e2e8f0'};color:inherit;margin-left:4px">${n}</span></button>`;}).join('')}
+    </div>
+    <div class="spacer"></div>
+    <button class="btn sm" onclick="relatorioFilial()">🖨️ Gerar relatório</button>
+  </div></div>
+
   <div class="grid kpis" style="margin-bottom:20px">
     ${kpi('b','📦','Total de itens',total)}
     ${kpi('g','✅','Em estoque',emEstoque)}
     ${kpi('a','👷','Com técnicos',comTec)}
     ${kpi('r','⚠️','Baixados',baixados)}
-    ${kpi('v','🔍','Auditorias',DB.auditorias.length)}
+    ${kpi('v','🔍','Auditorias',auditoriasFiltradas.length)}
   </div>
 
   ${(alertasMin.length||parados.length||tecsSemAud.length)?`
@@ -212,7 +305,7 @@ function renderDashboard(){
     <div class="ph"><h3>⚠️ Alertas</h3></div>
     <div class="pb" style="display:flex;flex-wrap:wrap;gap:10px">
       ${alertasMin.map(a=>`<div class="badge baixado" style="padding:8px 12px">Estoque baixo: <b style="margin-left:4px">${esc(tipoNome(a.tipo))}</b> — ${a.atual}/${a.min}</div>`).join('')}
-      ${parados.length?`<button class="badge com_tecnico" style="padding:8px 12px;border:0;cursor:pointer" onclick="goto('equip')">${parados.length} ${parados.length===1?'item parado':'itens parados'} 90+ dias com técnico</button>`:''}
+      ${parados.length?`<button class="badge com_tecnico" style="padding:8px 12px;border:0;cursor:pointer" onclick="goto('equip')">${parados.length} ${parados.length===1?'item parado':'itens parados'} ${DIAS_PARADO}+ dias com técnico</button>`:''}
       ${tecsSemAud.length?`<button class="badge gray" style="padding:8px 12px;border:0;cursor:pointer" onclick="goto('auditoria')">${tecsSemAud.length} ${tecsSemAud.length===1?'técnico nunca auditado':'técnicos nunca auditados'}</button>`:''}
     </div>
   </div>`:''}
@@ -238,12 +331,13 @@ function renderDashboard(){
 
   <div class="chart-row">
     <div class="panel">
-      <div class="ph"><h3>📍 Itens ativos por depósito/local</h3></div>
+      <div class="ph"><h3>${painel2Titulo}</h3></div>
       <div class="pb">
-        ${depArr.length?depArr.map(([d,n])=>`
-          <div class="bar-row">
-            <div class="bl">${esc(d)}</div>
-            <div class="bar-track"><div class="bar-fill" style="width:${n/maxDep*100}%;background:#2563eb">${n}</div></div>
+        ${painel2Arr.length?painel2Arr.map(([d,n])=>`
+          <div class="bar-row" ${painel2PorTecnico?`style="cursor:pointer" onclick="fichaTecnico('${esc(d)}')"`:''}>
+            <div class="bl">${esc(painel2PorTecnico?tecNome(d):d)}</div>
+            <div class="bar-track"><div class="bar-fill" style="width:${n/painel2Max*100}%;background:${painel2Cor}">${n}</div></div>
+            ${painel2PorTecnico?'<span class="muted" style="font-size:12px">→</span>':''}
           </div>`).join(''):'<div class="empty">Sem dados</div>'}
       </div>
     </div>
@@ -264,7 +358,7 @@ function renderDashboard(){
   </div>`;
 }
 function kpi(c,ic,lbl,val){ return `<div class="kpi ${c}"><div class="ic">${ic}</div><div class="lbl">${lbl}</div><div class="val">${val}</div></div>`; }
-function movBadge(t){ const m={entrada:'badge blue',saida:'badge com_tecnico',transferencia:'badge violet',baixa:'badge baixado'}; return `<span class="${m[t]||'badge gray'}">${MOV_LABEL[t]||t}</span>`; }
+function movBadge(t){ const m={entrada:'badge blue',saida:'badge com_tecnico',transferencia:'badge violet',baixa:'badge baixado',confirmacao:'badge estoque'}; return `<span class="${m[t]||'badge gray'}">${MOV_LABEL[t]||t}</span>`; }
 
 function donut(data){
   const total = data.reduce((s,d)=>s+d[1],0)||1;
@@ -340,6 +434,31 @@ function renderEquipTabela(){
 }
 
 /* =========================================================
+   ITENS PARADOS (90+ dias com técnico)
+   ========================================================= */
+function renderParados(){
+  const parados = DB.equipamentos.filter(e=>e.status==='com_tecnico' && (diasEmPosse(e)||0)>=DIAS_PARADO)
+    .sort((a,b)=>(diasEmPosse(b)||0)-(diasEmPosse(a)||0));
+  $('#content').innerHTML = `
+  <div class="panel"><div class="ph"><h3>⏰ Itens parados com técnicos (${DIAS_PARADO}+ dias)</h3><span class="count-badge">${parados.length}</span></div>
+  <div class="tbl-wrap">${
+    parados.length? `<table><thead><tr><th>Nº Série</th><th>Tipo</th><th>Técnico</th><th>Filial</th><th>Há quanto tempo</th><th class="right">Ações</th></tr></thead><tbody>
+      ${parados.map(e=>{ const t=DB.tecnicos.find(x=>x.id===e.tecnicoId); return `<tr>
+        <td class="mono"><a href="#" onclick="abrirKardex('${esc(e.serie)}');return false"><b>${esc(e.serie)}</b></a></td>
+        <td><span class="tag-tipo" style="border-left:3px solid ${tipoCor(e.tipo)}">${esc(tipoNome(e.tipo))}</span></td>
+        <td>${esc(tecNome(e.tecnicoId))}</td>
+        <td>${esc(e.deposito||'—')}</td>
+        <td><b style="color:var(--red)">${fmtDias(diasEmPosse(e))}</b></td>
+        <td class="right">
+          <button class="btn sm" onclick="openMov('${esc(e.serie)}')">Mover</button>
+          ${t?`<button class="btn sm ghost" onclick="fichaTecnico('${t.id}')">Ver técnico</button>`:''}
+        </td>
+      </tr>`;}).join('')}</tbody></table>`
+    : `<div class="empty"><div class="big">✅</div>Nenhum item parado há ${DIAS_PARADO}+ dias. Tudo em dia!</div>`
+  }</div></div>`;
+}
+
+/* =========================================================
    MOVIMENTAR
    ========================================================= */
 function renderMovPage(){
@@ -366,14 +485,74 @@ function movCard(tipo,ic,titulo,desc,cor){
 /* =========================================================
    TÉCNICOS
    ========================================================= */
+const TECNICOS_PADRAO = [
+  {nome:'Thiago Silveira Alvez', regiao:'IAI', matricula:'EPV'},
+  {nome:'David Cleiton Silva da Costa', regiao:'SOO', matricula:'EPV'},
+  {nome:'Izaque Alves De Jesus', regiao:'CCO', matricula:'EPV'},
+  {nome:'Marcos Heleno Barbosa dos Santos', regiao:'CTA', matricula:'EPV'},
+  {nome:'Alexandre Henrique Braz Pereira Santos', regiao:'RBP', matricula:'EPV'},
+  {nome:'Ygor Da Costa Ferreira', regiao:'SOO', matricula:'EPV'},
+  {nome:'Guilherme Nunes Pereira', regiao:'JLE', matricula:'EPV'},
+  {nome:'Lucas Borges Navarro', regiao:'SRR', matricula:'EPV'},
+  {nome:'Luis Fernando B. Carvalho', regiao:'PAE', matricula:'EPV'},
+  {nome:'Robson da Rosa', regiao:'SOO', matricula:'EPV'},
+  {nome:'Gilson Cristovão', regiao:'SOO', matricula:'EPV'},
+  {nome:'Marlon De Paula', regiao:'PAE', matricula:'EPV'},
+  {nome:'Hevertton William Lechernakoski', regiao:'CTA', matricula:'EPV'},
+  {nome:'Mauricio Da Silva Fraga', regiao:'SOO', matricula:'EPV'},
+  {nome:'Abinadabe Nascimento Piaui', regiao:'GNA', matricula:'EPV'},
+  {nome:'Davi Augusto Pagno Dos Santos', regiao:'IAI', matricula:'EPV'},
+  {nome:'Bruno Das Neves Feliciano', regiao:'PAE', matricula:'EPV'},
+  {nome:'Vitor Jorge de Araujo Pinto', regiao:'CAS', matricula:'EPV'},
+  {nome:'Fabiano Pereira De Carvalho', regiao:'BNU', matricula:'EPV'},
+  {nome:'Victor Ferraro', regiao:'PAE', matricula:'EPV'},
+  {nome:'Diego Platt', regiao:'SOO', matricula:'EPV'},
+  {nome:'Mauro Roberto Nascimento Valente', regiao:'SOO', matricula:'EPV'},
+  {nome:'Rogerio Alves Junior', regiao:'BQE', matricula:'EPV'},
+  {nome:'Douglas Leandro Vital dos Santos', regiao:'JLE', matricula:'EPV'},
+  {nome:'Renata Da Silva Souza', regiao:'IAI', matricula:'EPV'},
+  {nome:'Roque Gali Vieira', regiao:'CAS', matricula:'EPV'},
+  {nome:'Carlos Eduardo Alves De Oliveira', regiao:'CTA', matricula:'EPV'},
+  {nome:'Maikon Barbosa Leite', regiao:'JGS', matricula:'EPV'},
+  {nome:'Weberth Mesquita Xavier', regiao:'GNA', matricula:'EPV'},
+  {nome:'Thayrone Said Silva', regiao:'CAS', matricula:'EPV'},
+  {nome:'Ralpho Secco Comisso', regiao:'CAS', matricula:'EPV'},
+  {nome:'Leonardo Carlos Batista', regiao:'IAI', matricula:'EPV'},
+  {nome:'Willian Ribeiro Medeiros', regiao:'IAI', matricula:'EPV'},
+  {nome:'Andre Luiz De Sa', regiao:'IAI', matricula:'EPV'},
+  {nome:'Pedro Afonso Vidal de Carvalho', regiao:'IAI', matricula:'EPV'},
+  {nome:'Claudio Santos', regiao:'PMJ', matricula:'EPV'},
+  {nome:'Gleydson de Jesus Pinto', regiao:'BSB', matricula:'PJ · INST COML'},
+  {nome:'Thiago Silva de Matias', regiao:'LGS', matricula:'PJ'},
+  {nome:'Talyson Emmanuel de Jesus', regiao:'BSB', matricula:'PJ · INST COML'},
+  {nome:'Álvaro Pontes Armando', regiao:'BSB', matricula:'PJ'},
+  {nome:'Edson Marcos Marin', regiao:'SRR', matricula:'PJ'},
+  {nome:'Leonardo Zuliani Marques Rodrigues', regiao:'RBP', matricula:'PJ'},
+  {nome:'Matheus Ferreira Bento', regiao:'RBP', matricula:'PJ'},
+  {nome:'Pedro Augusto Furtado', regiao:'GNA', matricula:'PJ'},
+  {nome:'Robson da Silva Monteiro', regiao:'CAS', matricula:'PJ'},
+  {nome:'Waldemar Leite da Silva Junior', regiao:'SRR', matricula:'PJ'}
+];
+function importarTecnicosPadrao(){
+  if(!confirm('Importar a lista oficial de '+TECNICOS_PADRAO.length+' técnicos? Quem já estiver cadastrado (mesmo nome) não será duplicado.')) return;
+  const existentes = new Set(DB.tecnicos.map(t=>t.nome.trim().toLowerCase()));
+  let novos=0;
+  TECNICOS_PADRAO.forEach(t=>{
+    const chave=t.nome.trim().toLowerCase();
+    if(!existentes.has(chave)){ DB.tecnicos.push({id:uid(), nome:t.nome, regiao:t.regiao, matricula:t.matricula}); existentes.add(chave); novos++; }
+  });
+  salvar(); render(); flash(`✅ ${novos} técnico(s) importado(s)${TECNICOS_PADRAO.length-novos>0?', '+(TECNICOS_PADRAO.length-novos)+' já existiam':''}`,'green');
+}
 function renderTecnicos(){
+  const tecnicosLista = souSupervisor() ? DB.tecnicos.filter(t=>regiaoPermitida(t.regiao)) : DB.tecnicos;
   $('#content').innerHTML = `
   <div class="toolbar">
     <div style="flex:1"></div>
+    ${souAdmin()?`<button class="btn" onclick="importarTecnicosPadrao()">📋 Importar lista oficial</button>`:''}
     <button class="btn primary" onclick="openTec()">＋ Novo técnico</button>
   </div>
   <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(280px,1fr))">
-    ${DB.tecnicos.length? DB.tecnicos.map(t=>{
+    ${tecnicosLista.length? tecnicosLista.map(t=>{
       const itens = DB.equipamentos.filter(e=>e.tecnicoId===t.id && e.status==='com_tecnico');
       const aud = ultimaAuditoria('tecnico',t.id);
       return `<div class="panel" style="cursor:pointer" onclick="fichaTecnico('${t.id}')"><div class="pb">
@@ -598,14 +777,21 @@ function salvarTipo(cod){
    ========================================================= */
 let movSel = [];  // séries selecionadas
 let movTipo = 'saida';
+let movFilialTec = '';
 function openMov(serie, tipo){
   movTipo = tipo || 'saida';
   movSel = serie? [serie] : [];
+  movFilialTec = '';
   desenharMov();
 }
 function desenharMov(){
-  const tecsOpt = DB.tecnicos.map(t=>`<option value="${t.id}">${esc(t.nome)}</option>`).join('');
-  const semTec = DB.tecnicos.length===0;
+  let regioesTec = [...new Set(DB.tecnicos.map(t=>t.regiao).filter(Boolean))].sort();
+  if(souSupervisor()) regioesTec = regioesTec.filter(regiaoPermitida);
+  const tecsBase = souSupervisor() ? DB.tecnicos.filter(t=>regiaoPermitida(t.regiao)) : DB.tecnicos;
+  const tecsFiltrados = tecsBase.filter(t=>!movFilialTec||t.regiao===movFilialTec);
+  const tecsOpt = tecsFiltrados.map(t=>`<option value="${t.id}">${t.regiao?'['+esc(t.regiao)+'] ':''}${esc(t.nome)}</option>`).join('');
+  const semTec = tecsBase.length===0;
+  const semTecFiltro = tecsFiltrados.length===0 && !semTec;
   modal('🔄 Registrar movimentação', `
     <div class="field"><label>Tipo de movimentação</label>
       <div class="pill-tabs" style="width:100%">
@@ -620,10 +806,19 @@ function desenharMov(){
     </div>
 
     ${movTipo==='saida'||movTipo==='transferencia'? `
-      <div class="field"><label>${movTipo==='transferencia'?'Transferir PARA o técnico *':'Entregar ao técnico *'}</label>
-        <select id="movTec">${semTec?'<option value="">— cadastre um técnico antes —</option>':tecsOpt}</select>
-        ${semTec?'<div class="hint">Vá em <b>Técnicos</b> e cadastre ao menos um.</div>':''}
-      </div>`:''}
+      <div class="row2">
+        <div class="field"><label>Filtrar por filial</label>
+          <select onchange="movFilialTec=this.value;desenharMov()">
+            <option value="">Todas as filiais</option>
+            ${regioesTec.map(r=>`<option value="${esc(r)}" ${movFilialTec===r?'selected':''}>${esc(r)}</option>`).join('')}
+          </select>
+        </div>
+        <div class="field"><label>${movTipo==='transferencia'?'Transferir PARA o técnico *':'Entregar ao técnico *'}</label>
+          <select id="movTec">${semTec?'<option value="">— cadastre um técnico antes —</option>':(semTecFiltro?'<option value="">— nenhum técnico nessa filial —</option>':tecsOpt)}</select>
+        </div>
+      </div>
+      ${semTec?'<div class="hint">Vá em <b>Técnicos</b> e cadastre ao menos um.</div>':''}
+      ${semTecFiltro?'<div class="hint">Nenhum técnico cadastrado na filial selecionada. Escolha outra filial.</div>':''}`:''}
     ${movTipo==='entrada'? `<div class="field"><label>Depósito de destino</label><input id="movDep" placeholder="Ex.: CASEPV"></div>`:''}
     ${movTipo==='baixa'? `<div class="field"><label>Motivo da baixa</label><input id="movMotivo" placeholder="Ex.: Defeito irreparável, perda..."></div>`:''}
 
@@ -676,9 +871,9 @@ function confirmarMov(){
   movSel.forEach(serie=>{
     const e=DB.equipamentos.find(x=>x.serie===serie); if(!e) return;
     const de = e.status==='com_tecnico'? tecNome(e.tecnicoId) : (e.local||e.deposito||'Estoque');
-    if(movTipo==='saida'||movTipo==='transferencia'){ e.status='com_tecnico'; e.tecnicoId=tecId; e.local=tecNome(tecId); }
-    else if(movTipo==='entrada'){ e.status='estoque'; e.tecnicoId=null; if($('#movDep')&&$('#movDep').value.trim()){e.deposito=$('#movDep').value.trim();} e.local=e.deposito; }
-    else if(movTipo==='baixa'){ e.status='baixado'; e.tecnicoId=null; e.local='Baixado'; }
+    if(movTipo==='saida'||movTipo==='transferencia'){ e.status='com_tecnico'; e.tecnicoId=tecId; e.local=tecNome(tecId); e.confirmado=false; }
+    else if(movTipo==='entrada'){ e.status='estoque'; e.tecnicoId=null; e.confirmado=true; if($('#movDep')&&$('#movDep').value.trim()){e.deposito=$('#movDep').value.trim();} e.local=e.deposito; }
+    else if(movTipo==='baixa'){ e.status='baixado'; e.tecnicoId=null; e.local='Baixado'; e.confirmado=true; }
     e.desde = Date.now();
     const motivo = movTipo==='baixa' && $('#movMotivo')? $('#movMotivo').value.trim() : '';
     DB.movimentacoes.push({ id:uid(), ts:Date.now(), tipo:movTipo, serie, de, para:destinoTxt, tecnicoId:tecId, usuario, obs:[obs,motivo].filter(Boolean).join(' · ') });
@@ -772,6 +967,47 @@ function exportarHistCSV(){
   const linhas=[...DB.movimentacoes].reverse().map(m=>[fmtTS(m.ts),MOV_LABEL[m.tipo],m.serie,m.de,m.para,m.usuario,m.obs]);
   baixar('historico_movimentacoes.csv','﻿'+[csvLinha(head),...linhas.map(csvLinha)].join('\n'),'text/csv');
 }
+function relatorioFilial(){
+  const baseEqRel = souSupervisor() ? DB.equipamentos.filter(e=>regiaoPermitida(e.deposito)) : DB.equipamentos;
+  const eq = dashFiliais.length ? baseEqRel.filter(e=>dashFiliais.includes(e.deposito)) : baseEqRel;
+  const titulo = dashFiliais.length ? dashFiliais.join(', ') : 'Todas as filiais';
+  const total=eq.length, emEstoque=eq.filter(e=>e.status==='estoque').length, comTec=eq.filter(e=>e.status==='com_tecnico').length, baixados=eq.filter(e=>e.status==='baixado').length;
+  const porTipo={}; eq.forEach(e=>porTipo[e.tipo]=(porTipo[e.tipo]||0)+1);
+  const porTec={}; eq.filter(e=>e.status==='com_tecnico').forEach(e=>{ const n=tecNome(e.tecnicoId); porTec[n]=(porTec[n]||0)+1; });
+  const parados = eq.filter(e=>e.status==='com_tecnico'&&(diasEmPosse(e)||0)>=DIAS_PARADO);
+  const alertasMin = estoqueMinAlertas(eq);
+  const hoje = new Date().toLocaleDateString('pt-BR')+' '+new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
+  const linha=(l,v,cor)=>`<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #eee"><span>${l}</span><b style="color:${cor||'#111'}">${v}</b></div>`;
+  const html=`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="utf-8"><title>Relatório — ${esc(titulo)}</title>
+    <style>body{font-family:Arial,sans-serif;max-width:820px;margin:30px auto;padding:0 24px;color:#111;font-size:13px;line-height:1.5}
+    h1{font-size:20px;margin-bottom:2px}h2{font-size:13px;font-weight:normal;color:#555;margin-bottom:20px}
+    h3{font-size:14px;margin:22px 0 8px;border-bottom:2px solid #2563eb;padding-bottom:4px}
+    table{width:100%;border-collapse:collapse;margin:8px 0}th,td{border:1px solid #ccc;padding:7px 9px;text-align:left;font-size:12px}th{background:#f0f0f0}
+    .kpis{display:flex;gap:14px;flex-wrap:wrap;margin:14px 0}
+    .kpi{flex:1;min-width:120px;border:1px solid #ddd;border-radius:8px;padding:12px 14px}
+    .kpi b{display:block;font-size:22px;margin-top:4px}
+    @media print{button{display:none}}</style></head><body>
+    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">🖨️ Imprimir / Salvar PDF</button>
+    <h1>Relatório de Estoque — ${esc(titulo)}</h1>
+    <h2>${esc(DB.config.empresa||'A365')} · gerado em ${hoje}</h2>
+    <div class="kpis">
+      <div class="kpi">Total de itens<b>${total}</b></div>
+      <div class="kpi">Em estoque<b style="color:#16a34a">${emEstoque}</b></div>
+      <div class="kpi">Com técnicos<b style="color:#d97706">${comTec}</b></div>
+      <div class="kpi">Baixados<b style="color:#dc2626">${baixados}</b></div>
+      <div class="kpi">Parados ${DIAS_PARADO}+ dias<b style="color:#dc2626">${parados.length}</b></div>
+    </div>
+    <h3>Itens por tipo</h3>
+    ${Object.keys(porTipo).length?Object.entries(porTipo).sort((a,b)=>b[1]-a[1]).map(([t,n])=>linha(esc(tipoNome(t)),n)).join(''):'<i>Sem dados.</i>'}
+    <h3>Itens por técnico (em posse)</h3>
+    ${Object.keys(porTec).length?Object.entries(porTec).sort((a,b)=>b[1]-a[1]).map(([t,n])=>linha(esc(t),n)).join(''):'<i>Nenhum item com técnico.</i>'}
+    ${alertasMin.length?`<h3>⚠️ Alertas de estoque mínimo</h3>${alertasMin.map(a=>linha(esc(tipoNome(a.tipo)),a.atual+' / mín. '+a.min,'#dc2626')).join('')}`:''}
+    ${parados.length?`<h3>⏰ Itens parados (${DIAS_PARADO}+ dias)</h3><table><thead><tr><th>Nº Série</th><th>Tipo</th><th>Técnico</th><th>Dias</th></tr></thead><tbody>
+      ${parados.map(e=>`<tr><td>${esc(e.serie)}</td><td>${esc(tipoNome(e.tipo))}</td><td>${esc(tecNome(e.tecnicoId))}</td><td>${diasEmPosse(e)}</td></tr>`).join('')}
+    </tbody></table>`:''}
+    </body></html>`;
+  const w=window.open('','_blank'); if(!w) return flash('Permita pop-ups para gerar o relatório','red'); w.document.write(html); w.document.close();
+}
 function exportarBackup(){ baixar('backup_estoque_'+new Date().toISOString().slice(0,10)+'.json', JSON.stringify(DB,null,2),'application/json'); flash('✅ Backup exportado','green'); }
 function importarBackup(input){
   const f=input.files[0]; if(!f) return;
@@ -811,20 +1047,41 @@ function fichaTecnico(id){
   const itens=itensDoTecnico(id);
   const aud=ultimaAuditoria('tecnico',id);
   const porTipo={}; itens.forEach(e=>porTipo[e.tipo]=(porTipo[e.tipo]||0)+1);
-  modal('👷 '+esc(t.nome), `
-    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px">
+  const dias = itens.map(e=>diasEmPosse(e)||0);
+  const mediaDias = dias.length? Math.round(dias.reduce((a,b)=>a+b,0)/dias.length) : 0;
+  const parados = itens.filter(e=>(diasEmPosse(e)||0)>=DIAS_PARADO).length;
+  const donutData = Object.entries(porTipo).sort((a,b)=>b[1]-a[1]).map(([tp,n])=>[tipoNome(tp),n,tipoCor(tp)]);
+  modal('👷 '+(t.regiao?'['+esc(t.regiao)+'] ':'')+esc(t.nome), `
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px">
       <span class="badge blue" style="padding:8px 12px">${esc(t.regiao||'Sem região')}</span>
-      ${t.matricula?`<span class="badge gray" style="padding:8px 12px">Matrícula ${esc(t.matricula)}</span>`:''}
-      <span class="badge ${itens.length?'com_tecnico':'gray'}" style="padding:8px 12px">${itens.length} itens em posse</span>
+      ${t.matricula?`<span class="badge gray" style="padding:8px 12px">${esc(t.matricula)}</span>`:''}
       <span class="badge ${aud?'estoque':'baixado'}" style="padding:8px 12px">${aud?'Auditado '+fmtTS(aud.ts):'Nunca auditado'}</span>
+      ${parados?`<span class="badge com_tecnico" style="padding:8px 12px">${parados} parado${parados>1?'s':''} ${DIAS_PARADO}+ dias</span>`:''}
     </div>
-    ${Object.keys(porTipo).length?`<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px">${Object.entries(porTipo).map(([tp,n])=>`<span class="tag-tipo" style="border-left:3px solid ${tipoCor(tp)}">${esc(tipoNome(tp))}: ${n}</span>`).join('')}</div>`:''}
-    <div class="tbl-wrap" style="max-height:340px">${
+    <div class="chart-row" style="margin-bottom:18px">
+      <div class="panel" style="box-shadow:none">
+        <div class="ph"><h3>📊 Equipamentos por tipo</h3></div>
+        <div class="pb"><div class="donut-wrap">
+          ${donutData.length? donut(donutData) : '<div class="empty">Nenhum item em posse.</div>'}
+        </div></div>
+      </div>
+      <div class="panel" style="box-shadow:none">
+        <div class="ph"><h3>Resumo</h3></div>
+        <div class="pb" style="display:flex;flex-direction:column;gap:14px">
+          <div class="grid" style="grid-template-columns:1fr 1fr;gap:12px">
+            <div class="kpi a" style="padding:14px 16px"><div class="lbl" style="font-size:10px;letter-spacing:0">👷 EM POSSE</div><div class="val" style="font-size:22px">${itens.length}</div></div>
+            <div class="kpi v" style="padding:14px 16px"><div class="lbl" style="font-size:10px;letter-spacing:0">🕓 MÉDIA POSSE</div><div class="val" style="font-size:22px">${mediaDias}d</div></div>
+          </div>
+          ${Object.keys(porTipo).length?`<div style="display:flex;gap:8px;flex-wrap:wrap">${Object.entries(porTipo).sort((a,b)=>b[1]-a[1]).map(([tp,n])=>`<span class="tag-tipo" style="border-left:3px solid ${tipoCor(tp)}">${esc(tipoNome(tp))}: ${n}</span>`).join('')}</div>`:''}
+        </div>
+      </div>
+    </div>
+    <div class="tbl-wrap" style="max-height:320px">${
       itens.length? `<table><thead><tr><th>Nº Série</th><th>Tipo</th><th>Há quanto tempo</th><th></th></tr></thead><tbody>
         ${itens.map(e=>`<tr>
           <td class="mono"><a href="#" onclick="abrirKardex('${esc(e.serie)}');return false">${esc(e.serie)}</a></td>
           <td><span class="tag-tipo">${esc(tipoNome(e.tipo))}</span></td>
-          <td class="${(diasEmPosse(e)||0)>=90?'':''}">${fmtDias(diasEmPosse(e))} ${(diasEmPosse(e)||0)>=90?'<span class="badge com_tecnico" style="font-size:10px">parado</span>':''}</td>
+          <td>${fmtDias(diasEmPosse(e))} ${(diasEmPosse(e)||0)>=DIAS_PARADO?'<span class="badge com_tecnico" style="font-size:10px">parado</span>':''}</td>
           <td class="right"><button class="btn sm" onclick="closeModal();openMov('${esc(e.serie)}')">Mover</button></td>
         </tr>`).join('')}</tbody></table>`
       : '<div class="empty">Nenhum equipamento em posse.</div>'
@@ -881,6 +1138,17 @@ function renderAuditoria(){
           <span>📍 ${esc(d)} <span class="count-badge">${itensDoDeposito(d).length}</span></span></button>`).join('')}</div>` : '<div class="empty">Nenhum depósito com itens.</div>'}
     </div></div>
   </div>
+  ${DB.auditorias.length?`<div class="panel" style="margin-bottom:20px"><div class="ph"><h3>📈 Evolução das divergências</h3><span class="muted" style="font-size:11.5px;margin-left:6px">(clique numa barra para ver o laudo)</span></div>
+    <div class="pb">
+      ${[...DB.auditorias].sort((a,b)=>a.ts-b.ts).map(a=>{
+        const div=a.faltando.length+a.sobrando.length;
+        const max=Math.max(1,...DB.auditorias.map(x=>x.faltando.length+x.sobrando.length));
+        return `<div class="bar-row" style="cursor:pointer" onclick="verLaudo('${a.id}')">
+          <div class="bl" style="width:190px;font-size:12px">${new Date(a.ts).toLocaleDateString('pt-BR')} · ${a.alvoTipo==='tecnico'?'👷':'📍'} ${esc(a.alvoNome)}</div>
+          <div class="bar-track"><div class="bar-fill" style="width:${Math.max(6,div/max*100)}%;background:${div?'var(--red)':'var(--green)'}">${div}</div></div>
+        </div>`;}).join('')}
+    </div>
+  </div>`:''}
   <div class="panel"><div class="ph"><h3>📋 Auditorias realizadas</h3><span class="count-badge">${DB.auditorias.length}</span></div>
     <div class="tbl-wrap">${
       DB.auditorias.length? `<table><thead><tr><th>Data</th><th>Alvo</th><th>Auditor</th><th class="center">Esperado</th><th class="center">Conferido</th><th class="center">Faltando</th><th class="center">Sobrando</th><th></th></tr></thead><tbody>
@@ -987,6 +1255,129 @@ function verLaudo(id){
     `<button class="btn" onclick="closeModal()">Fechar</button>`, 'lg');
 }
 
+/* =========================================================
+   ÁREA DO TÉCNICO (visão simplificada, mobile)
+   ========================================================= */
+function meuTecnico(){ return MEU_PERFIL && MEU_PERFIL.tecnicoId ? DB.tecnicos.find(t=>t.id===MEU_PERFIL.tecnicoId) : null; }
+function semVinculoHtml(){
+  return `<div class="panel"><div class="pb"><div class="empty"><div class="big">🔗</div>
+    <h2 style="margin-bottom:8px">Seu acesso ainda não foi vinculado</h2>
+    <p class="muted" style="max-width:420px;margin:0 auto">Peça para o administrador vincular seu login a um técnico cadastrado, na página <b>Usuários</b>.</p>
+  </div></div></div>`;
+}
+function renderMeusItens(){
+  const t = meuTecnico();
+  if(!t) return $('#content').innerHTML = semVinculoHtml();
+  const itens = itensDoTecnico(t.id);
+  const pendentes = itens.filter(e=>e.confirmado===false);
+  const confirmados = itens.filter(e=>e.confirmado!==false);
+  $('#content').innerHTML = `
+  <div class="grid kpis" style="margin-bottom:20px">
+    ${kpi('a','📦','Itens em posse',itens.length)}
+    ${kpi('r','⏳','Aguardando confirmação',pendentes.length)}
+  </div>
+  ${pendentes.length?`
+  <div class="panel" style="margin-bottom:20px;border-left:4px solid var(--amber)">
+    <div class="ph"><h3>⏳ Aguardando sua confirmação de recebimento</h3></div>
+    <div class="pb" style="display:flex;flex-direction:column;gap:10px">
+      ${pendentes.map(e=>`
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 12px;background:var(--amber-soft);border-radius:10px">
+          <div style="flex:1;min-width:160px"><span class="mono"><b>${esc(e.serie)}</b></span> <span class="tag-tipo" style="margin-left:6px">${esc(tipoNome(e.tipo))}</span></div>
+          <button class="btn green sm" onclick="confirmarRecebimento('${esc(e.serie)}')">✅ Confirmar recebimento</button>
+        </div>`).join('')}
+    </div>
+  </div>`:''}
+  <div class="panel"><div class="ph"><h3>📦 Meus equipamentos</h3><span class="count-badge">${confirmados.length}</span></div>
+    <div class="tbl-wrap">${
+      confirmados.length? `<table><thead><tr><th>Nº Série</th><th>Tipo</th><th>Há quanto tempo</th></tr></thead><tbody>
+        ${confirmados.map(e=>`<tr>
+          <td class="mono"><b>${esc(e.serie)}</b></td>
+          <td><span class="tag-tipo" style="border-left:3px solid ${tipoCor(e.tipo)}">${esc(tipoNome(e.tipo))}</span></td>
+          <td>${fmtDias(diasEmPosse(e))} ${(diasEmPosse(e)||0)>=DIAS_PARADO?`<span class="badge com_tecnico" style="font-size:10px">parado</span>`:''}</td>
+        </tr>`).join('')}</tbody></table>`
+      : '<div class="empty">Nenhum equipamento confirmado ainda.</div>'
+    }</div></div>`;
+}
+function confirmarRecebimento(serie){
+  const e = DB.equipamentos.find(x=>x.serie===serie); if(!e) return;
+  if(!confirm('Confirmar o recebimento do equipamento '+serie+'?')) return;
+  e.confirmado = true;
+  DB.movimentacoes.push({ id:uid(), ts:Date.now(), tipo:'confirmacao', serie, de:tecNome(e.tecnicoId), para:tecNome(e.tecnicoId), tecnicoId:e.tecnicoId, usuario:(MEU_PERFIL&&MEU_PERFIL.nome)||'', obs:'Recebimento confirmado pelo técnico' });
+  salvar(); render(); flash('✅ Recebimento confirmado','green');
+}
+function renderMeuHistorico(){
+  const t = meuTecnico();
+  if(!t) return $('#content').innerHTML = semVinculoHtml();
+  const movs = DB.movimentacoes.filter(m=>m.tecnicoId===t.id).slice().reverse();
+  $('#content').innerHTML = `
+  <div class="panel"><div class="ph"><h3>🕓 Meu histórico</h3><span class="count-badge">${movs.length}</span></div>
+    <div class="tbl-wrap">${movs.length?tabelaMov(movs.slice(0,300)):'<div class="empty">Nenhuma movimentação ainda.</div>'}</div>
+  </div>`;
+}
+
+/* =========================================================
+   ADMINISTRAÇÃO DE USUÁRIOS (só admin)
+   ========================================================= */
+let USUARIOS_LISTA = [];
+let usuariosListenerAtivo = null;
+function renderUsuarios(){
+  if(!souAdmin()){ $('#content').innerHTML='<div class="empty">Acesso restrito.</div>'; return; }
+  if(!usuariosListenerAtivo){
+    usuariosListenerAtivo = USERS_REF.onSnapshot(snap=>{
+      USUARIOS_LISTA = snap.docs.map(d=>Object.assign({uid:d.id}, d.data()));
+      if(PAGE==='usuarios') renderUsuarios();
+    });
+    return; // vai re-renderizar assim que o snapshot chegar
+  }
+  const regioesConhecidas = [...new Set(DB.tecnicos.map(t=>t.regiao).filter(Boolean))].sort();
+  const ordenados = [...USUARIOS_LISTA].sort((a,b)=>(a.papel==='pendente'?0:1)-(b.papel==='pendente'?0:1) || (a.criadoEm||0)-(b.criadoEm||0));
+  $('#content').innerHTML = `
+  <div class="panel"><div class="ph"><h3>🔐 Usuários e permissões</h3><span class="count-badge">${USUARIOS_LISTA.length}</span></div>
+    <div class="pb" style="display:flex;flex-direction:column;gap:12px">
+      ${ordenados.map(u=>`
+        <div class="panel" style="box-shadow:none;${u.papel==='pendente'?'border-color:var(--amber)':''}"><div class="pb" style="display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end">
+          <div style="min-width:180px;flex:1">
+            <div style="font-weight:700">${esc(u.nome||u.email)}</div>
+            <div class="muted" style="font-size:12px">${esc(u.email)}</div>
+            ${u.papel==='pendente'?'<span class="badge baixado" style="margin-top:4px">Aguardando aprovação</span>':''}
+          </div>
+          <div class="field" style="margin:0;min-width:150px"><label>Permissão</label>
+            <select onchange="usuarioAtualizarCampo('${u.uid}','papel',this.value)">
+              <option value="pendente" ${u.papel==='pendente'?'selected':''}>Pendente</option>
+              <option value="tecnico" ${u.papel==='tecnico'?'selected':''}>Técnico (operador)</option>
+              <option value="supervisor" ${u.papel==='supervisor'?'selected':''}>Supervisor (regional)</option>
+              <option value="admin" ${u.papel==='admin'?'selected':''}>Administrador</option>
+            </select>
+          </div>
+          ${u.papel==='supervisor'?`
+          <div class="field" style="margin:0;min-width:220px"><label>Filiais permitidas</label>
+            <select multiple size="4" style="min-height:80px" onchange="usuarioAtualizarRegioes('${u.uid}',this)">
+              ${regioesConhecidas.map(r=>`<option value="${esc(r)}" ${(u.regioes||[]).includes(r)?'selected':''}>${esc(r)}</option>`).join('')}
+            </select>
+          </div>`:''}
+          ${u.papel==='tecnico'?`
+          <div class="field" style="margin:0;min-width:220px"><label>Vincular ao técnico cadastrado</label>
+            <select onchange="usuarioAtualizarCampo('${u.uid}','tecnicoId',this.value||null)">
+              <option value="">— nenhum —</option>
+              ${DB.tecnicos.map(t=>`<option value="${t.id}" ${u.tecnicoId===t.id?'selected':''}>${t.regiao?'['+esc(t.regiao)+'] ':''}${esc(t.nome)}</option>`).join('')}
+            </select>
+          </div>`:''}
+          <button class="btn sm red ghost" onclick="usuarioRemover('${u.uid}','${esc(u.email)}')">Remover</button>
+        </div></div>`).join('')}
+    </div>
+  </div>`;
+}
+function usuarioAtualizarCampo(uid, campo, valor){
+  USERS_REF.doc(uid).update({[campo]:valor}).then(()=>flash('✅ Atualizado','green')).catch(e=>flash('⚠️ '+e.message,'red'));
+}
+function usuarioAtualizarRegioes(uid, select){
+  const vals = Array.from(select.selectedOptions).map(o=>o.value);
+  USERS_REF.doc(uid).update({regioes:vals}).then(()=>flash('✅ Filiais atualizadas','green')).catch(e=>flash('⚠️ '+e.message,'red'));
+}
+function usuarioRemover(uid, email){
+  if(!confirm('Remover o acesso de '+email+'? A pessoa poderá criar uma conta nova, mas terá que ser aprovada de novo.')) return;
+  USERS_REF.doc(uid).delete().then(()=>flash('Usuário removido')).catch(e=>flash('⚠️ '+e.message,'red'));
+}
+
 /* ---------- Boot ---------- */
 renderNav();
-goto('dashboard');
