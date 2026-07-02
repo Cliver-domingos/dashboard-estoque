@@ -27,6 +27,50 @@ function carregar(){
 }
 function salvarLocal(){ localStorage.setItem(STORE_KEY, JSON.stringify(DB)); }
 
+/* ---------- Login (Firebase Auth) ---------- */
+let loginModo = 'entrar'; // ou 'criar'
+function loginAlternar(){
+  loginModo = loginModo==='entrar' ? 'criar' : 'entrar';
+  $('#loginSub').textContent = loginModo==='entrar' ? 'Entre com seu e-mail e senha' : 'Crie sua conta com e-mail e senha';
+  $('#loginBtn').textContent = loginModo==='entrar' ? 'Entrar' : 'Criar conta';
+  $('#loginAlternarLink').textContent = loginModo==='entrar' ? 'Criar conta' : 'Já tenho conta';
+  $('#loginErr').style.display='none';
+}
+function loginErro(msg){ const e=$('#loginErr'); e.textContent=msg; e.style.display='block'; }
+const LOGIN_ERROS = {
+  'auth/invalid-email':'E-mail inválido.',
+  'auth/missing-password':'Informe a senha.',
+  'auth/weak-password':'A senha precisa ter ao menos 6 caracteres.',
+  'auth/email-already-in-use':'Já existe uma conta com esse e-mail. Clique em "Já tenho conta".',
+  'auth/invalid-credential':'E-mail ou senha incorretos.',
+  'auth/wrong-password':'E-mail ou senha incorretos.',
+  'auth/user-not-found':'Não existe conta com esse e-mail. Clique em "Criar conta".',
+  'auth/too-many-requests':'Muitas tentativas. Aguarde um pouco e tente de novo.'
+};
+function loginSubmit(){
+  const email = $('#loginEmail').value.trim();
+  const senha = $('#loginSenha').value;
+  if(!email||!senha) return loginErro('Preencha e-mail e senha.');
+  $('#loginErr').style.display='none';
+  const acao = loginModo==='entrar'
+    ? window.firebaseAuth.signInWithEmailAndPassword(email, senha)
+    : window.firebaseAuth.createUserWithEmailAndPassword(email, senha);
+  acao.catch(err=> loginErro(LOGIN_ERROS[err.code] || ('Erro: '+err.message)));
+}
+function logout(){ if(confirm('Sair da sua conta?')) window.firebaseAuth.signOut(); }
+
+window.firebaseAuth.onAuthStateChanged(user=>{
+  if(user){
+    $('#loginBg').style.display='none';
+    $('#appRoot').style.display='';
+    $('#userEmailLbl').textContent = user.email;
+    iniciarSyncNuvem();
+  } else {
+    $('#loginBg').style.display='flex';
+    $('#appRoot').style.display='none';
+  }
+});
+
 /* ---------- Sincronização em nuvem (Firestore) ---------- */
 const DOC_REF = window.firestoreDB.collection('estoques').doc('dashboard');
 let aplicandoRemoto = false;
@@ -941,4 +985,3 @@ function verLaudo(id){
 /* ---------- Boot ---------- */
 renderNav();
 goto('dashboard');
-iniciarSyncNuvem();
