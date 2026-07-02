@@ -48,6 +48,7 @@
   .btn.green{background:var(--green);color:#fff;border-color:var(--green)}
   .btn.red{background:var(--red);color:#fff;border-color:var(--red)}
   .btn.ghost{background:transparent;border-color:transparent}
+  .btn.red.ghost{color:var(--red)}
   .btn.sm{padding:6px 11px;font-size:12.5px}
   .btn:disabled{opacity:.5;cursor:not-allowed}
 
@@ -191,7 +192,7 @@
     .topbar .sub{font-size:11.5px}
     .content{padding:14px 12px 50px}
     #userEmailLbl{display:none}
-    .topbar .btn.primary{padding:9px 12px;font-size:12.5px}
+    .topbar .btn.primary{padding:9px 12px;font-size:12.5px;flex:1 1 100%;justify-content:center;order:3}
     .chart-row{grid-template-columns:1fr}
     .row2,.row3{grid-template-columns:1fr}
     .content .grid[style*="1fr 1fr"]{grid-template-columns:1fr!important}
@@ -243,15 +244,16 @@
   <div class="main">
     <div class="topbar">
       <button class="hamburger" onclick="toggleSidebar()">☰</button>
-      <div>
+      <div style="flex:1;min-width:0">
         <h1 id="pageTitle">Visão Geral</h1>
         <div class="sub" id="pageSub">Resumo do inventário</div>
       </div>
-      <div class="spacer"></div>
-      <div class="muted" id="userEmailLbl" style="font-size:12.5px;margin-right:4px"></div>
-      <button class="btn ghost sm" title="Alternar modo escuro" onclick="toggleDark()">🌙</button>
-      <button class="btn ghost sm" onclick="logout()">Sair</button>
-      <button class="btn primary" onclick="openMov()">＋ Nova movimentação</button>
+      <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
+        <div class="muted" id="userEmailLbl" style="font-size:12.5px;margin-right:4px"></div>
+        <button class="btn ghost sm" title="Alternar modo escuro" onclick="toggleDark()">🌙</button>
+        <button class="btn ghost sm" onclick="logout()">Sair</button>
+      </div>
+      <button class="btn primary" id="btnNovaMov" onclick="openMov()">＋ Nova movimentação</button>
     </div>
     <div class="content" id="content"></div>
   </div>
@@ -264,6 +266,7 @@
 <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-storage-compat.js"></script>
 <script>
   const firebaseConfig = {
     apiKey: "AIzaSyAhli5_z1946Tt8UQpKxm2oJ_xqs-QGzhc",
@@ -276,6 +279,7 @@
   firebase.initializeApp(firebaseConfig);
   window.firestoreDB = firebase.firestore();
   window.firebaseAuth = firebase.auth();
+  window.firebaseStorage = firebase.storage();
 </script>
 <script src="app.js"></script>
 </body>
