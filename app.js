@@ -143,7 +143,12 @@ function renderNav(){
       <span class="ic">${p.icon}</span> ${p.titulo}
     </button>`).join('');
 }
-function goto(id){ PAGE=id; const p=PAGES.find(x=>x.id===id); $('#pageTitle').textContent=p.titulo; $('#pageSub').textContent=p.sub; renderNav(); render(); window.scrollTo(0,0); }
+function goto(id){ PAGE=id; const p=PAGES.find(x=>x.id===id); $('#pageTitle').textContent=p.titulo; $('#pageSub').textContent=p.sub; renderNav(); render(); window.scrollTo(0,0); toggleSidebar(false); }
+function toggleSidebar(force){
+  const open = typeof force==='boolean' ? force : !document.querySelector('.sidebar').classList.contains('open');
+  document.querySelector('.sidebar').classList.toggle('open', open);
+  $('#sidebarOverlay').classList.toggle('show', open);
+}
 
 function render(){
   if(DB.equipamentos.length===0 && PAGE!=='dados' && PAGE!=='tipos'){ return renderVazio(); }
