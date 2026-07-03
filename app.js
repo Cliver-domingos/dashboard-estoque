@@ -15,6 +15,7 @@ let DB = carregar();
 function estadoInicial(){
   return {
     tipos: {},          // { "UBI.0001": {nome, cor, min} }  min = estoque mínimo
+    filiais: [],        // ["BNU","CAS", ...] — pode existir mesmo sem equipamento ainda
     tecnicos: [],       // { id, nome, regiao, matricula }
     equipamentos: [],   // { serie, tipo, deposito, status, tecnicoId, local, desde, dataEntrada, origem, familia, derivacao, um, obs }
     movimentacoes: [],  // { id, ts, tipo, serie, de, para, tecnicoId, usuario, obs }
@@ -153,6 +154,12 @@ function iniciarSyncNuvem(){
 }
 function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
 const FILIAL_CORRECOES = { 'SFO':'SOO', 'SF0':'SOO', 'JDA':'JND', 'POA':'PAE', 'RIP':'RBP' };
+function todasFiliaisConhecidas(){
+  const s = new Set(DB.filiais||[]);
+  DB.equipamentos.forEach(e=>{ if(e.deposito) s.add(e.deposito); });
+  DB.tecnicos.forEach(t=>{ if(t.regiao) s.add(t.regiao); });
+  return [...s].sort();
+}
 function detectarTipoPorSerie(serie){
   if(!serie) return null;
   const s = String(serie).trim().toUpperCase();
@@ -202,6 +209,7 @@ const PAGES = [
   { id:'auditoria', icon:'🔍', titulo:'Auditoria', sub:'Conferência de estoque por técnico ou depósito', papeis:['admin','supervisor'] },
   { id:'hist',      icon:'🕓', titulo:'Histórico', sub:'Todas as movimentações registradas', papeis:['admin','supervisor'] },
   { id:'tipos',     icon:'🏷️', titulo:'Tipos', sub:'Os 5 tipos de equipamento', papeis:['admin','supervisor'] },
+  { id:'filiais',   icon:'🏢', titulo:'Filiais', sub:'Cadastro de filiais e depósitos', papeis:['admin'] },
   { id:'dados',     icon:'💾', titulo:'Dados', sub:'Importar, exportar e backup', papeis:['admin'] },
   { id:'usuarios',  icon:'🔐', titulo:'Usuários', sub:'Aprovar acessos e definir permissões', papeis:['admin'] },
   { id:'meusItens', icon:'📦', titulo:'Meus Equipamentos', sub:'Itens sob sua responsabilidade', papeis:['tecnico'] },
@@ -227,9 +235,9 @@ function toggleSidebar(force){
   $('#sidebarOverlay').classList.toggle('show', open);
 }
 
-const RENDERERS = { dashboard:renderDashboard, equip:renderEquip, mov:renderMovPage, tecnicos:renderTecnicos, parados:renderParados, rma:renderRMA, estoquemin:renderEstoqueMinimo, auditoria:renderAuditoria, hist:renderHist, tipos:renderTipos, dados:renderDados, usuarios:renderUsuarios, meusItens:renderMeusItens, meuHistorico:renderMeuHistorico, retiradas:renderRetiradas };
+const RENDERERS = { dashboard:renderDashboard, equip:renderEquip, mov:renderMovPage, tecnicos:renderTecnicos, parados:renderParados, rma:renderRMA, estoquemin:renderEstoqueMinimo, auditoria:renderAuditoria, hist:renderHist, tipos:renderTipos, filiais:renderFiliais, dados:renderDados, usuarios:renderUsuarios, meusItens:renderMeusItens, meuHistorico:renderMeuHistorico, retiradas:renderRetiradas };
 function render(){
-  const semDados = ['dados','tipos','usuarios','meusItens','meuHistorico','rma','retiradas','estoquemin'];
+  const semDados = ['dados','tipos','filiais','usuarios','meusItens','meuHistorico','rma','retiradas','estoquemin'];
   if(DB.equipamentos.length===0 && !semDados.includes(PAGE)){ return renderVazio(); }
   RENDERERS[PAGE]();
 }
@@ -258,7 +266,7 @@ function dashToggleFilial(d){
   renderDashboard();
 }
 function renderDashboard(){
-  let todasFiliais = [...new Set(DB.equipamentos.map(e=>e.deposito).filter(Boolean))].sort();
+  let todasFiliais = todasFiliaisConhecidas();
   if(souSupervisor()) todasFiliais = todasFiliais.filter(regiaoPermitida);
   const baseEq = souSupervisor() ? DB.equipamentos.filter(e=>regiaoPermitida(e.deposito)) : DB.equipamentos;
   const eq = dashFiliais.length ? baseEq.filter(e=>dashFiliais.includes(e.deposito)) : baseEq;
@@ -491,7 +499,7 @@ function renderParados(){
    ESTOQUE MÍNIMO POR FILIAL
    ========================================================= */
 function alertasEstoqueMinPorFilial(){
-  const filiais = [...new Set(DB.equipamentos.map(e=>e.deposito).filter(Boolean))];
+  const filiais = todasFiliaisConhecidas();
   const alertas = [];
   filiais.forEach(f=>{
     if(souSupervisor() && !regiaoPermitida(f)) return;
@@ -537,7 +545,10 @@ function renderEstoqueMinimo(){
   $('#content').innerHTML = `
   ${!temMinConfigurado?`<div class="panel" style="margin-bottom:18px;border-left:4px solid var(--amber)"><div class="pb">Nenhum tipo tem estoque mínimo configurado ainda. ${souAdmin()?'Vá em <b>Dados</b> e clique em "🎯 Aplicar estoque mínimo oficial", ou defina manualmente em <b>Tipos</b>.':'Peça para um administrador configurar.'}</div></div>`:''}
   <div class="grid kpis" style="margin-bottom:20px">
-    ${kpi('r','⚠️','Alertas ativos',todosAlertas.length)}
+    ${kpi('r','📦','Total de equipamentos faltando',alertas.reduce((s,a)=>s+a.deficit,0))}
+    ${(()=>{ const porTipo={}; alertas.forEach(a=>{ porTipo[a.tipo]=(porTipo[a.tipo]||0)+a.deficit; }); const arr=Object.entries(porTipo).sort((a,b)=>b[1]-a[1]);
+      const texto = arr.length? esc(tipoNome(arr[0][0]))+' <span style="font-size:16px;color:var(--txt-soft)">('+arr[0][1]+')</span>' : '—';
+      return `<div class="kpi v"><div class="ic">🎯</div><div class="lbl">Tipo mais crítico</div><div class="val" style="font-size:22px">${texto}</div></div>`; })()}
     ${kpi('a','🏢','Filiais afetadas',filiaisAfetadas.length)}
   </div>
   ${filiaisAfetadas.length?`
@@ -546,9 +557,50 @@ function renderEstoqueMinimo(){
     <div class="pill-tabs" style="flex-wrap:wrap;background:transparent;padding:0;gap:8px">
       <button class="${!estoqueMinFilial?'active':''}" style="background:${!estoqueMinFilial?'var(--brand)':'var(--panel-soft)'};color:${!estoqueMinFilial?'#fff':'var(--txt)'};border-radius:9px" onclick="estoqueMinFilial='';renderEstoqueMinimo()">Todas <span class="count-badge" style="background:rgba(255,255,255,.25);color:inherit;margin-left:4px">${todosAlertas.length}</span></button>
       ${filiaisAfetadas.map(f=>{ const n=todosAlertas.filter(a=>a.filial===f).length; const on=estoqueMinFilial===f; return `
-        <button class="${on?'active':''}" style="background:${on?'var(--brand)':'var(--panel-soft)'};color:${on?'#fff':'var(--txt)'};border-radius:9px" onclick="estoqueMinFilial='${esc(f)}';renderEstoqueMinimo()">${esc(f)} <span class="count-badge" style="background:${on?'rgba(255,255,255,.25)':'#e2e8f0'};color:inherit;margin-left:4px">${n}</span></button>`;}).join('')}
+        <button class="${on?'active':''}" style="background:${on?'var(--brand)':'var(--panel-soft)'};color:${on?'#fff':'var(--txt)'};border-radius:9px" onclick="estoqueMinFilial=(estoqueMinFilial==='${esc(f)}')?'':'${esc(f)}';renderEstoqueMinimo()">${esc(f)} <span class="count-badge" style="background:${on?'rgba(255,255,255,.25)':'#e2e8f0'};color:inherit;margin-left:4px">${n}</span></button>`;}).join('')}
     </div>
   </div></div>`:''}
+  ${alertas.length?`
+  <div class="chart-row" style="margin-bottom:20px">
+    <div class="panel">
+      <div class="ph"><h3>📊 Necessidade por tipo de equipamento</h3></div>
+      <div class="pb">${(()=>{
+        const porTipo={}; alertas.forEach(a=>{ porTipo[a.tipo]=(porTipo[a.tipo]||0)+a.deficit; });
+        const arr=Object.entries(porTipo).sort((a,b)=>b[1]-a[1]);
+        const max=Math.max(1,...arr.map(t=>t[1]));
+        return arr.map(([t,n])=>`
+          <div class="bar-row">
+            <div class="bl"><span style="width:11px;height:11px;border-radius:3px;background:${tipoCor(t)};display:inline-block"></span>${esc(tipoNome(t))}</div>
+            <div class="bar-track"><div class="bar-fill" style="width:${n/max*100}%;background:${tipoCor(t)}">${n}</div></div>
+          </div>`).join('');
+      })()}</div>
+    </div>
+    <div class="panel">
+      <div class="ph"><h3>Distribuição da necessidade</h3></div>
+      <div class="pb"><div class="donut-wrap">${(()=>{
+        const porTipo={}; alertas.forEach(a=>{ porTipo[a.tipo]=(porTipo[a.tipo]||0)+a.deficit; });
+        const data=Object.entries(porTipo).sort((a,b)=>b[1]-a[1]).map(([t,n])=>[tipoNome(t),n,tipoCor(t)]);
+        return donut(data);
+      })()}</div></div>
+    </div>
+  </div>
+  <div class="panel" style="margin-bottom:20px">
+    <div class="ph"><h3>🏢 Necessidade por filial</h3><span class="muted" style="font-size:11px;font-weight:500;margin-left:6px">(clique para filtrar)</span></div>
+    <div class="pb">${(()=>{
+      const porFilial={}; todosAlertas.forEach(a=>{ porFilial[a.filial]=(porFilial[a.filial]||0)+a.deficit; });
+      const arr=Object.entries(porFilial).sort((a,b)=>b[1]-a[1]);
+      const max=Math.max(1,...arr.map(f=>f[1]));
+      return arr.map(([f,n])=>{
+        const intensidade = n/max; // 0 a 1 — mais crítico = vermelho mais forte/escuro
+        const cor = `rgb(${220-Math.round(60*(1-intensidade))},${38+Math.round(90*(1-intensidade))},${38+Math.round(90*(1-intensidade))})`;
+        const selecionada = estoqueMinFilial===f;
+        return `
+        <div class="bar-row" style="cursor:pointer${selecionada?';outline:2px solid var(--brand);border-radius:8px;padding:2px 4px' :''}" onclick="estoqueMinFilial=(estoqueMinFilial==='${esc(f)}')?'':'${esc(f)}';renderEstoqueMinimo()">
+          <div class="bl">${esc(f)}</div>
+          <div class="bar-track"><div class="bar-fill" style="width:${n/max*100}%;background:${cor}">${n}</div></div>
+        </div>`;}).join('');
+    })()}</div>
+  </div>`:''}
   ${estoqueMinFilial?`
   <div class="panel" style="margin-bottom:18px"><div class="ph"><h3>👷 Estoque por técnico em ${esc(estoqueMinFilial)}</h3><span class="muted" style="font-size:11px;font-weight:500;margin-left:6px">(clique para ver a ficha completa)</span></div>
     <div class="pb">
@@ -961,10 +1013,32 @@ function tabelaEquipSimples(lista){
 /* =========================================================
    TIPOS
    ========================================================= */
+function corrigirTiposDuplicados(){
+  if(!souAdmin()) return flash('Somente administradores podem fazer isso','red');
+  const contagem = {}; DB.equipamentos.forEach(e=>contagem[e.tipo]=(contagem[e.tipo]||0)+1);
+  const porNome = {};
+  Object.keys(DB.tipos).forEach(c=>{ const nome=(DB.tipos[c].nome||c).trim().toLowerCase(); (porNome[nome]=porNome[nome]||[]).push(c); });
+  const paraRemover = [];
+  Object.values(porNome).forEach(codigos=>{
+    if(codigos.length>1){
+      const comItens = codigos.filter(c=>(contagem[c]||0)>0);
+      const semItens = codigos.filter(c=>(contagem[c]||0)===0);
+      if(comItens.length>0) paraRemover.push(...semItens);
+    }
+  });
+  Object.keys(DB.tipos).forEach(c=>{
+    const nome = (DB.tipos[c].nome||c).trim().toLowerCase();
+    if(nome==='central' && (contagem[c]||0)===0 && !paraRemover.includes(c)) paraRemover.push(c);
+  });
+  if(!paraRemover.length) return flash('Nenhum tipo duplicado sem uso encontrado','green');
+  if(!confirm('Remover '+paraRemover.length+' tipo(s) duplicado(s) sem nenhum equipamento (ex.: "'+paraRemover[0]+'")? Os tipos com equipamentos reais não são afetados.')) return;
+  paraRemover.forEach(c=>delete DB.tipos[c]);
+  salvar(); render(); flash(`✅ ${paraRemover.length} tipo(s) duplicado(s) removido(s)`,'green');
+}
 function renderTipos(){
   const cods=Object.keys(DB.tipos);
   $('#content').innerHTML = `
-  <div class="panel"><div class="ph"><h3>🏷️ Tipos de equipamento</h3><div class="spacer"></div><button class="btn sm primary" onclick="openTipo()">＋ Adicionar tipo</button></div>
+  <div class="panel"><div class="ph"><h3>🏷️ Tipos de equipamento</h3><div class="spacer"></div>${souAdmin()?`<button class="btn sm" onclick="corrigirTiposDuplicados()">🧹 Remover duplicados sem uso</button>`:''}<button class="btn sm primary" onclick="openTipo()">＋ Adicionar tipo</button></div>
   <div class="pb">
     <p class="muted" style="margin-bottom:16px">Dê um nome amigável a cada código (ex.: <b>UBI.0001 → "Sirene"</b>). Os nomes aparecem em todo o dashboard.</p>
     ${cods.length? `<div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(260px,1fr))">
@@ -977,6 +1051,68 @@ function renderTipos(){
         </div></div>`;}).join('')}
     </div>`: `<div class="empty">Nenhum tipo. Importe dados ou adicione manualmente.</div>`}
   </div></div>`;
+}
+
+/* =========================================================
+   FILIAIS / DEPÓSITOS
+   ========================================================= */
+function renderFiliais(){
+  const filiais = todasFiliaisConhecidas();
+  $('#content').innerHTML = `
+  <div class="panel"><div class="ph"><h3>🏢 Filiais / Depósitos</h3><div class="spacer"></div><button class="btn sm primary" onclick="openFilial()">＋ Adicionar filial</button></div>
+  <div class="pb">
+    <p class="muted" style="margin-bottom:16px">Cadastre uma filial mesmo antes dela ter equipamentos ou técnicos — assim ela já aparece nos filtros e telas do sistema.</p>
+    ${filiais.length? `<div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(220px,1fr))">
+      ${filiais.map(f=>{ const n=DB.equipamentos.filter(e=>e.deposito===f).length; const tecs=DB.tecnicos.filter(t=>t.regiao===f).length; const alertas=alertasEstoqueMinPorFilial().filter(a=>a.filial===f).length; return `
+      <div class="panel" style="box-shadow:none;cursor:pointer" onclick="abrirFilial('${esc(f)}')"><div class="pb">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px"><div style="font-weight:700;font-size:15px">${esc(f)}</div>${alertas?`<span class="badge baixado" style="font-size:10px;margin-left:auto">⚠️ ${alertas}</span>`:''}</div>
+        <div class="muted" style="font-size:12px">${n} equipamento(s) · ${tecs} técnico(s)</div>
+      </div></div>`;}).join('')}
+    </div>` : '<div class="empty">Nenhuma filial cadastrada ainda.</div>'}
+  </div></div>`;
+}
+function abrirFilial(f){
+  const eqs = DB.equipamentos.filter(e=>e.deposito===f);
+  const emEstoque = eqs.filter(e=>e.status==='estoque').length;
+  const comTec = eqs.filter(e=>e.status==='com_tecnico').length;
+  const rma = eqs.filter(e=>e.status==='baixado').length;
+  const tecs = DB.tecnicos.filter(t=>t.regiao===f);
+  const alertasFilial = alertasEstoqueMinPorFilial().filter(a=>a.filial===f);
+  const podeExcluir = eqs.length===0 && tecs.length===0;
+  modal('🏢 '+esc(f), `
+    <div class="grid kpis" style="grid-template-columns:repeat(4,1fr);margin-bottom:18px">
+      ${kpi('b','📦','Total',eqs.length)}
+      ${kpi('g','✅','Em estoque',emEstoque)}
+      ${kpi('a','👷','Com técnicos',comTec)}
+      ${kpi('r','♻️','RMA',rma)}
+    </div>
+    ${alertasFilial.length?`<div class="badge baixado" style="padding:8px 12px;margin-bottom:16px">⚠️ ${alertasFilial.length} tipo(s) abaixo do estoque mínimo</div>`:''}
+    <h4 style="margin-bottom:8px;font-size:13.5px">👷 Técnicos vinculados (${tecs.length})</h4>
+    <div class="tbl-wrap" style="max-height:220px">${
+      tecs.length? `<table><tbody>${tecs.map(t=>{ const n=itensDoTecnico(t.id).length; return `
+        <tr style="cursor:pointer" onclick="closeModal();verEstoqueTecnico('${t.id}')"><td>${esc(t.nome)}</td><td class="right"><span class="count-badge">${n} itens</span></td></tr>`;}).join('')}</tbody></table>`
+      : '<div class="empty">Nenhum técnico vinculado a essa filial.</div>'
+    }</div>`,
+    `${podeExcluir?`<button class="btn red ghost" style="margin-right:auto" onclick="excluirFilial('${esc(f)}')">🗑️ Excluir filial</button>`:`<span class="muted" style="margin-right:auto;font-size:11.5px;max-width:260px">Só é possível excluir filiais sem equipamentos e sem técnicos vinculados.</span>`}
+     <button class="btn" onclick="closeModal()">Fechar</button>
+     <button class="btn primary" onclick="closeModal();estoqueMinFilial='${esc(f)}';goto('estoquemin')">Ver estoque mínimo →</button>`, 'lg');
+}
+function openFilial(){
+  modal('＋ Nova filial', `<div class="field"><label>Sigla da filial *</label><input id="fl_nome" placeholder="Ex.: NOV" maxlength="6" style="text-transform:uppercase"></div>`,
+    `<button class="btn" onclick="closeModal()">Cancelar</button><button class="btn primary" onclick="salvarFilial()">Salvar</button>`);
+}
+function salvarFilial(){
+  const nome = limparFilial($('#fl_nome').value);
+  if(!nome) return flash('Informe a sigla da filial','red');
+  if(todasFiliaisConhecidas().includes(nome)) return flash('Essa filial já existe','red');
+  DB.filiais = DB.filiais||[]; DB.filiais.push(nome);
+  salvar(); closeModal(); render(); flash('✅ Filial adicionada','green');
+}
+function excluirFilial(f){
+  if(!souAdmin()) return flash('Somente administradores podem fazer isso','red');
+  if(!confirm('Excluir a filial '+f+'?')) return;
+  DB.filiais = (DB.filiais||[]).filter(x=>x!==f);
+  salvar(); closeModal(); render(); flash('Filial excluída');
 }
 
 /* =========================================================
@@ -1007,6 +1143,7 @@ function renderDados(){
       <button class="btn green" onclick="exportarBackup()">⬇️ Exportar backup (.json)</button>
       <label class="btn">⬆️ Importar backup<input type="file" accept=".json" style="display:none" onchange="importarBackup(this)"></label>
       ${souAdmin()?`<button class="btn" onclick="limparSiglasFiliais()">🧹 Corrigir siglas de filiais (tirar "EPV")</button>`:''}
+      ${souAdmin()?`<button class="btn" onclick="corrigirItensCDO()">🧹 Corrigir itens presos em "CDO"</button>`:''}
       ${souAdmin()?`<button class="btn" onclick="corrigirTiposPorSerie()">🔎 Corrigir tipos pelo padrão do código</button>`:''}
       ${souAdmin()?`<button class="btn" onclick="aplicarMinimosOficiais()">🎯 Aplicar estoque mínimo oficial</button>`:''}
       ${souAdmin()?`<button class="btn" onclick="distribuirEquipamentosTeste()">🧪 Distribuir equipamentos entre técnicos (teste)</button>`:''}
@@ -1183,7 +1320,7 @@ function desenharMov(){
       </div>
       ${semTec?'<div class="hint">Vá em <b>Técnicos</b> e cadastre ao menos um.</div>':''}
       ${semTecFiltro?'<div class="hint">Nenhum técnico cadastrado na filial selecionada. Escolha outra filial.</div>':''}`:''}
-    ${movTipo==='entrada'? `<div class="field"><label>Depósito de destino</label><input id="movDep" placeholder="Ex.: CASEPV"></div>`:''}
+    ${movTipo==='entrada'? `<div class="field"><label>Depósito de destino</label><input id="movDep" list="listaFiliais" placeholder="Ex.: CAS"><datalist id="listaFiliais">${todasFiliaisConhecidas().map(f=>`<option value="${esc(f)}">`).join('')}</datalist></div>`:''}
     ${movTipo==='baixa'? `<div class="field"><label>Motivo do envio para RMA</label><input id="movMotivo" placeholder="Ex.: Defeito, garantia, devolução ao fabricante..."></div>`:''}
 
     <div class="field"><label>Observação</label><input id="movObs" placeholder="Opcional"></div>
@@ -1386,6 +1523,16 @@ function exportarBackup(){ baixar('backup_estoque_'+new Date().toISOString().sli
 function importarBackup(input){
   const f=input.files[0]; if(!f) return;
   const r=new FileReader(); r.onload=e=>{ try{ const d=JSON.parse(e.target.result); if(!d.equipamentos) throw 0; if(!confirm('Substituir TODOS os dados atuais pelo backup?')) return; DB=Object.assign(estadoInicial(),d); salvar(); render(); renderNav(); flash('✅ Backup restaurado','green'); }catch(err){ flash('Arquivo de backup inválido','red'); } }; r.readAsText(f); input.value='';
+}
+function corrigirItensCDO(){
+  if(!souAdmin()) return flash('Somente administradores podem fazer isso','red');
+  const presos = DB.equipamentos.filter(e=>/^CDO/i.test(e.deposito||'') || /^CDO/i.test(e.local||''));
+  if(!presos.length) return flash('Nenhum item preso em "CDO" encontrado — tudo certo','green');
+  const destino = prompt('Encontrei '+presos.length+' equipamento(s) com depósito "CDO" (sobra de um teste). Pra qual filial devo mover eles? (digite a sigla)');
+  if(!destino) return;
+  const nome = limparFilial(destino);
+  presos.forEach(e=>{ e.deposito=nome; if(e.status==='estoque') e.local=nome; });
+  salvar(); render(); flash(`✅ ${presos.length} equipamento(s) movido(s) para ${nome}`,'green');
 }
 function limparSiglasFiliais(){
   if(!souAdmin()) return flash('Somente administradores podem fazer isso','red');
