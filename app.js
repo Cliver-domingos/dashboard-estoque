@@ -903,19 +903,99 @@ function cancelarLoteTransferencia(destinoId){
   });
   salvar(); closeModal(); render(); flash(`✅ ${itens.length} envio(s) cancelado(s)`,'green');
 }
+let pendConfFilial = '';
+let pendConfTec = '';
 function abrirPendentesConfirmacao(){
+  pendConfFilial=''; pendConfTec='';
+  modal('⏳ Aguardando confirmação do técnico', `<div id="pendConfBody"></div>`, `<button class="btn" onclick="gerarRelatorioPendentes()">🖨️ Gerar relatório</button><button class="btn" onclick="closeModal()">Fechar</button>`, 'lg');
+  renderPendentesConfirmacaoBody();
+}
+function gruposPendentesFiltrados(){
   const pendentes = pendentesConfirmacaoLista();
-  modal('⏳ Aguardando confirmação do técnico', `
-    <div class="tbl-wrap" style="max-height:420px">${
-      pendentes.length? pendentes.map(e=>`
-        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 12px;border-bottom:1px solid #f1f5f9">
-          <div style="flex:1;min-width:180px">
-            <span class="mono"><b>${esc(e.serie)}</b></span> <span class="tag-tipo" style="margin-left:6px">${esc(tipoNome(e.tipo))}</span>
-            <div class="muted" style="font-size:11.5px;margin-top:2px">${esc(e.transitoDe||'—')} → ${esc(tecNome(e.transitoPara))} · enviado por ${esc(e.transitoUsuario||'—')} · ${fmtTS(e.transitoDesde)}</div>
+  const porDestino = {};
+  pendentes.forEach(e=>{ (porDestino[e.transitoPara]=porDestino[e.transitoPara]||[]).push(e); });
+  const filiaisComPendencia = [...new Set(Object.keys(porDestino).map(id=>{ const t=DB.tecnicos.find(x=>x.id===id); return t?t.regiao:null; }).filter(Boolean))].sort();
+  if(pendConfFilial && !filiaisComPendencia.includes(pendConfFilial)) pendConfFilial='';
+  const tecsComPendencia = Object.keys(porDestino).map(id=>DB.tecnicos.find(x=>x.id===id)).filter(Boolean)
+    .filter(t=>!pendConfFilial||t.regiao===pendConfFilial);
+  if(pendConfTec && !tecsComPendencia.some(t=>t.id===pendConfTec)) pendConfTec='';
+  let grupos = Object.entries(porDestino);
+  if(pendConfTec) grupos = grupos.filter(([id])=>id===pendConfTec);
+  else if(pendConfFilial) grupos = grupos.filter(([id])=>{ const t=DB.tecnicos.find(x=>x.id===id); return t&&t.regiao===pendConfFilial; });
+  grupos = grupos.sort((a,b)=>b[1].length-a[1].length);
+  return { grupos, filiaisComPendencia, tecsComPendencia };
+}
+function renderPendentesConfirmacaoBody(){
+  const { grupos, filiaisComPendencia, tecsComPendencia } = gruposPendentesFiltrados();
+  $('#pendConfBody').innerHTML = `
+    <div class="row2" style="margin-bottom:14px">
+      <div class="field" style="margin:0"><label>Filtrar por filial</label>
+        <select onchange="pendConfFilial=this.value;pendConfTec='';renderPendentesConfirmacaoBody()">
+          <option value="">Todas (${filiaisComPendencia.length})</option>
+          ${filiaisComPendencia.map(f=>`<option value="${esc(f)}" ${pendConfFilial===f?'selected':''}>${esc(f)}</option>`).join('')}
+        </select>
+      </div>
+      <div class="field" style="margin:0"><label>Filtrar por técnico</label>
+        <select onchange="pendConfTec=this.value;renderPendentesConfirmacaoBody()">
+          <option value="">Todos (${tecsComPendencia.length})</option>
+          ${tecsComPendencia.map(t=>`<option value="${t.id}" ${pendConfTec===t.id?'selected':''}>${esc(t.nome)}</option>`).join('')}
+        </select>
+      </div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:14px;max-height:400px;overflow:auto">${
+      grupos.length? grupos.map(([destId,lista])=>`
+        <div class="panel" style="box-shadow:none">
+          <div class="ph"><h3 style="font-size:14px">👷 ${esc(tecNome(destId))}</h3><span class="count-badge" style="margin-left:8px">${lista.length}</span><div class="spacer"></div>
+            ${souAdmin()||souSupervisor()?`<button class="btn sm red ghost" onclick="cancelarLotePendente('${destId}')">✕ Cancelar tudo deste lote</button>`:''}
           </div>
-          ${souAdmin()||souSupervisor()?`<button class="btn sm red ghost" onclick="cancelarEnvio('${esc(e.serie)}')">✕ Cancelar envio</button>`:''}
+          <div class="pb" style="display:flex;flex-direction:column;gap:8px">
+            ${lista.map(e=>`
+              <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:8px 10px;background:var(--panel-soft);border-radius:9px">
+                <div style="flex:1;min-width:180px">
+                  <span class="mono"><b>${esc(e.serie)}</b></span> <span class="tag-tipo" style="margin-left:6px">${esc(tipoNome(e.tipo))}</span>
+                  <div class="muted" style="font-size:11px;margin-top:2px">${esc(e.transitoDe||'—')} · enviado por ${esc(e.transitoUsuario||'—')} · ${fmtTS(e.transitoDesde)}</div>
+                </div>
+                ${souAdmin()||souSupervisor()?`<button class="btn sm ghost" onclick="cancelarEnvio('${esc(e.serie)}')">✕</button>`:''}
+              </div>`).join('')}
+          </div>
         </div>`).join('') : '<div class="empty"><div class="big">✅</div>Nada pendente no momento.</div>'
-    }</div>`, `<button class="btn" onclick="closeModal()">Fechar</button>`, 'lg');
+    }</div>`;
+}
+function gerarRelatorioPendentes(){
+  const { grupos } = gruposPendentesFiltrados();
+  const totalItens = grupos.reduce((s,[,l])=>s+l.length,0);
+  const titulo = pendConfTec ? tecNome(pendConfTec) : (pendConfFilial ? 'Filial '+pendConfFilial : 'Todas as pendências');
+  const hoje = new Date().toLocaleDateString('pt-BR')+' '+new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
+  const html=`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="utf-8"><title>Relatório de Pendências</title>
+    <style>body{font-family:Arial,sans-serif;max-width:820px;margin:30px auto;padding:0 24px;color:#111;font-size:13px;line-height:1.5}
+    h1{font-size:20px;margin-bottom:2px}h2{font-size:13px;font-weight:normal;color:#555;margin-bottom:20px}
+    h3{font-size:14px;margin:22px 0 8px;border-bottom:2px solid #d97706;padding-bottom:4px}
+    table{width:100%;border-collapse:collapse;margin:8px 0}th,td{border:1px solid #ccc;padding:7px 9px;text-align:left;font-size:12px}th{background:#f0f0f0}
+    @media print{button{display:none}}</style></head><body>
+    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">🖨️ Imprimir / Salvar PDF</button>
+    <h1>Relatório de Equipamentos Pendentes de Confirmação</h1>
+    <h2>${esc(titulo)} · ${totalItens} item(ns) · gerado em ${hoje}</h2>
+    ${grupos.length? grupos.map(([destId,lista])=>`
+      <h3>👷 ${esc(tecNome(destId))} — ${lista.length} item(ns)</h3>
+      <table><thead><tr><th>Nº Série</th><th>Tipo</th><th>De</th><th>Para</th><th>Enviado por</th><th>Data</th></tr></thead><tbody>
+        ${lista.map(e=>`<tr><td>${esc(e.serie)}</td><td>${esc(tipoNome(e.tipo))}</td><td>${esc(e.transitoDe||'—')}</td><td>${esc(tecNome(destId))}</td><td>${esc(e.transitoUsuario||'—')}</td><td>${fmtTS(e.transitoDesde)}</td></tr>`).join('')}
+      </tbody></table>`).join('') : '<p>Nenhuma pendência encontrada.</p>'}
+    </body></html>`;
+  const w=window.open('','_blank'); if(!w) return flash('Permita pop-ups para gerar o relatório','red'); w.document.write(html); w.document.close();
+}
+function cancelarLotePendente(destinoId){
+  if(!souAdmin() && !souSupervisor()) return flash('Você não pode cancelar esses envios','red');
+  const itens = pendentesConfirmacaoLista().filter(e=>e.transitoPara===destinoId);
+  if(!itens.length) return;
+  if(!confirm('Cancelar o envio de '+itens.length+' equipamento(s) para '+tecNome(destinoId)+'?')) return;
+  itens.forEach(e=>{
+    const destino = tecNome(e.transitoPara);
+    e.emTransito=false; e.transitoPara=null; e.transitoDesde=null; e.transitoDe=null; e.transitoUsuario=null; e.transitoDeTecnicoId=null;
+    registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:'cancelamento', serie:e.serie, de:'Em trânsito', para:destino+' (cancelado em lote)', tecnicoId:null, usuario:nomeUsuarioAtual(), obs:'Envio cancelado em lote antes da confirmação' });
+  });
+  salvar(); render();
+  if($('#pendConfBody')) renderPendentesConfirmacaoBody(); else closeModal();
+  flash(`✅ ${itens.length} envio(s) cancelado(s)`,'green');
 }
 function cancelarEnvio(serie){
   const e = DB.equipamentos.find(x=>x.serie===serie); if(!e || !e.emTransito) return;
@@ -926,7 +1006,10 @@ function cancelarEnvio(serie){
   const destino = tecNome(e.transitoPara);
   e.emTransito=false; e.transitoPara=null; e.transitoDesde=null; e.transitoDe=null; e.transitoUsuario=null; e.transitoDeTecnicoId=null;
   registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:'cancelamento', serie, de:'Em trânsito', para:destino+' (cancelado)', tecnicoId:null, usuario:nomeUsuarioAtual(), obs:'Envio cancelado antes da confirmação' });
-  salvar(); render(); if($('#modal')&&document.getElementById('modalBg').classList.contains('show')){ closeModal(); } flash('Envio cancelado','green');
+  salvar(); render();
+  if($('#pendConfBody')) renderPendentesConfirmacaoBody();
+  else if(document.getElementById('modalBg') && document.getElementById('modalBg').classList.contains('show')) closeModal();
+  flash('Envio cancelado','green');
 }
 function movCard(tipo,ic,titulo,desc,cor){
   return actionCard(ic,titulo,desc,cor,`openMov(null,'${tipo}')`);
