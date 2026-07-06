@@ -1567,10 +1567,25 @@ function filtrarPickMov(q){
 }
 function addMovSerie(serie){ if(!movSel.includes(serie)){ movSel.push(serie); renderMovChips(); filtrarPickMov($('#movBusca').value);} }
 function addMovSerieBusca(){
-  const v=$('#movBusca').value.trim(); if(!v) return;
-  const e=DB.equipamentos.find(x=>x.serie.toLowerCase()===v.toLowerCase());
-  if(!e) return flash('Nº de série não encontrado','red');
-  addMovSerie(e.serie); $('#movBusca').value='';
+  const bruto=$('#movBusca').value.trim(); if(!bruto) return;
+  const tokens=bruto.split(/[\s,;]+/).map(s=>s.trim()).filter(Boolean);
+  if(tokens.length<=1){
+    const v=tokens[0]||'';
+    const e=DB.equipamentos.find(x=>x.serie.toLowerCase()===v.toLowerCase());
+    if(!e) return flash('Nº de série não encontrado','red');
+    addMovSerie(e.serie); $('#movBusca').value='';
+    return;
+  }
+  let achados=0, naoAchados=[];
+  tokens.forEach(v=>{
+    const e=DB.equipamentos.find(x=>x.serie.toLowerCase()===v.toLowerCase());
+    if(e){ if(!movSel.includes(e.serie)) movSel.push(e.serie); achados++; }
+    else naoAchados.push(v);
+  });
+  renderMovChips(); filtrarPickMov('');
+  $('#movBusca').value='';
+  if(achados) flash(`✅ ${achados} equipamento(s) adicionado(s)`+(naoAchados.length?` — ${naoAchados.length} não encontrado(s)`:''), naoAchados.length?'red':'green');
+  else flash('Nenhum dos códigos colados foi encontrado','red');
 }
 function removeMovSerie(serie){ movSel=movSel.filter(s=>s!==serie); renderMovChips(); filtrarPickMov($('#movBusca')?$('#movBusca').value:''); }
 function renderMovChips(){
@@ -2214,9 +2229,13 @@ function renderFormFotosPreview(){
     </div>`).join('');
 }
 function formAddSerieBusca(){
-  const v=$('#formBusca').value.trim(); if(!v) return;
-  if(formSel.includes(v)) return flash('Esse item já foi bipado','red');
-  formSel.push(v); desenharRegistrarForm();
+  const bruto=$('#formBusca').value.trim(); if(!bruto) return;
+  const tokens=[...new Set(bruto.split(/[\s,;]+/).map(s=>s.trim()).filter(Boolean))];
+  let add=0, dup=0;
+  tokens.forEach(v=>{ if(formSel.includes(v)) dup++; else { formSel.push(v); add++; } });
+  desenharRegistrarForm();
+  if(tokens.length>1) flash(`✅ ${add} adicionado(s)`+(dup?` — ${dup} já bipado(s)`:''), 'green');
+  else if(dup) flash('Esse item já foi bipado','red');
 }
 function formRemoveSerie(s){ formSel=formSel.filter(x=>x!==s); desenharRegistrarForm(); }
 function renderFormChips(){
