@@ -120,15 +120,25 @@ function PAGE_ATUAL_VALIDA(){ return paginasDisponiveis().some(p=>p.id===PAGE); 
 
 /* ---------- Sincronização em nuvem (Firestore) ---------- */
 const DOC_REF = window.firestoreDB.collection('estoques').doc('dashboard');
+const MOVS_REF = window.firestoreDB.collection('movimentacoes');
 let aplicandoRemoto = false;
 let salvarTimeout = null;
+let movsCarregadas = false;
+
+// O histórico de movimentações fica numa coleção própria (sem o limite de 1MB do doc único
+// estoques/dashboard). Cada evento vira 1 documento, gravado na hora em que acontece.
+function registrarMovimentacao(m){
+  DB.movimentacoes.push(m);
+  MOVS_REF.doc(m.id).set(m).catch(e=>flash('⚠️ Falha ao salvar movimentação: '+e.message,'red'));
+}
 
 function salvar(){
   salvarLocal();
   if(aplicandoRemoto) return;
   clearTimeout(salvarTimeout);
   salvarTimeout = setTimeout(()=>{
-    DOC_REF.set(DB).catch(e=>flash('⚠️ Falha ao sincronizar: '+e.message,'red'));
+    const { movimentacoes, ...semMovs } = DB;
+    DOC_REF.set(semMovs).catch(e=>flash('⚠️ Falha ao sincronizar: '+e.message,'red'));
   }, 400);
 }
 
@@ -140,17 +150,26 @@ function iniciarSyncNuvem(){
     const data = snap.data();
     if(data){
       aplicandoRemoto = true;
+      const movsAtual = DB.movimentacoes;
       DB = Object.assign(estadoInicial(), data);
+      DB.movimentacoes = movsAtual; // histórico é gerenciado pelo listener da coleção própria
       salvarLocal();
       aplicandoRemoto = false;
       renderNav(); render();
     } else {
-      DOC_REF.set(DB); // primeira vez: envia os dados locais como base
+      const { movimentacoes, ...semMovs } = DB;
+      DOC_REF.set(semMovs); // primeira vez: envia os dados locais como base
     }
   }, err=>{
     if(foot) foot.innerHTML = '⚠️ Sem conexão com a nuvem<br>Usando dados locais.';
     flash('⚠️ Erro de sincronização: '+err.message,'red');
   });
+  MOVS_REF.orderBy('ts','asc').limitToLast(3000).onSnapshot(snap=>{
+    DB.movimentacoes = snap.docs.map(d=>d.data());
+    salvarLocal();
+    if(movsCarregadas) render();
+    movsCarregadas = true;
+  }, err=>{ flash('⚠️ Erro ao carregar histórico: '+err.message,'red'); });
 }
 function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
 const FILIAL_CORRECOES = { 'SFO':'SOO', 'SF0':'SOO', 'JDA':'JND', 'POA':'PAE', 'RIP':'RBP' };
@@ -785,7 +804,7 @@ function retornarSelecionadosRMA(tecnicoId){
     const e=DB.equipamentos.find(x=>x.serie===serie); if(!e||e.status!=='baixado') return;
     const destino = e.rmaDeposito||e.deposito||'estoque';
     e.status='estoque'; e.tecnicoId=null; e.deposito=e.rmaDeposito||e.deposito; e.local=e.deposito; e.confirmado=true; e.desde=Date.now();
-    DB.movimentacoes.push({ id:uid(), ts:Date.now(), tipo:'retorno_rma', serie, de:'RMA', para:destino, tecnicoId:null, usuario:nomeUsuarioAtual(), obs:'Retorno do RMA ao estoque (admin, em lote)' });
+    registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:'retorno_rma', serie, de:'RMA', para:destino, tecnicoId:null, usuario:nomeUsuarioAtual(), obs:'Retorno do RMA ao estoque (admin, em lote)' });
     n++;
   });
   salvar(); closeModal(); render(); flash(`✅ ${n} equipamento(s) retornado(s) ao estoque`,'green');
@@ -796,7 +815,7 @@ function retornarDoRMA(serie){
   const destino = e.rmaDeposito||e.deposito||'estoque';
   if(!confirm('Retornar o equipamento '+serie+' do RMA para o estoque de '+destino+'?')) return;
   e.status='estoque'; e.tecnicoId=null; e.deposito=e.rmaDeposito||e.deposito; e.local=e.deposito; e.confirmado=true; e.desde=Date.now();
-  DB.movimentacoes.push({ id:uid(), ts:Date.now(), tipo:'retorno_rma', serie, de:'RMA', para:destino, tecnicoId:null, usuario:nomeUsuarioAtual(), obs:'Retorno do RMA ao estoque (admin)' });
+  registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:'retorno_rma', serie, de:'RMA', para:destino, tecnicoId:null, usuario:nomeUsuarioAtual(), obs:'Retorno do RMA ao estoque (admin)' });
   salvar(); render(); flash('✅ Equipamento retornado ao estoque','green');
 }
 
@@ -860,7 +879,7 @@ function cancelarEnvio(serie){
   if(!confirm('Cancelar o envio do equipamento '+serie+' para '+tecNome(e.transitoPara)+'? Ele volta a ficar disponível de onde saiu.')) return;
   const destino = tecNome(e.transitoPara);
   e.emTransito=false; e.transitoPara=null; e.transitoDesde=null; e.transitoDe=null; e.transitoUsuario=null;
-  DB.movimentacoes.push({ id:uid(), ts:Date.now(), tipo:'cancelamento', serie, de:'Em trânsito', para:destino+' (cancelado)', tecnicoId:null, usuario:nomeUsuarioAtual(), obs:'Envio cancelado antes da confirmação' });
+  registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:'cancelamento', serie, de:'Em trânsito', para:destino+' (cancelado)', tecnicoId:null, usuario:nomeUsuarioAtual(), obs:'Envio cancelado antes da confirmação' });
   salvar(); render(); abrirPendentesConfirmacao(); flash('Envio cancelado','green');
 }
 function movCard(tipo,ic,titulo,desc,cor){
@@ -1137,6 +1156,11 @@ function renderDados(){
     </div></div>
   </div>
 
+  ${souAdmin()?`<div class="panel" style="margin-top:18px;border-left:4px solid var(--red)"><div class="pb">
+    <b>🚑 Correção urgente de sincronização</b>
+    <p class="muted" style="margin:6px 0 12px">Se aparecer erro de "documento muito grande" ao movimentar itens, clique aqui uma vez para migrar o histórico de movimentações para um armazenamento sem limite de tamanho.</p>
+    <button class="btn red" onclick="migrarHistoricoParaColecao()">🚑 Corrigir armazenamento (migrar histórico)</button>
+  </div></div>`:''}
   <div class="panel" style="margin-top:18px"><div class="ph"><h3>💾 Backup & compartilhamento</h3></div><div class="pb">
     <p class="muted" style="margin-bottom:14px">Os dados ficam salvos <b>neste navegador</b>. Para fazer cópia de segurança ou usar em outra máquina/compartilhar via rede, exporte o backup e importe no outro computador.</p>
     <div style="display:flex;gap:10px;flex-wrap:wrap">
@@ -1219,7 +1243,7 @@ function excluirEquip(serie){
   const e = DB.equipamentos.find(x=>x.serie===serie); if(!e) return;
   if(!confirm('Excluir DEFINITIVAMENTE o equipamento '+serie+' do sistema?\n\nEle será removido do inventário, mas fica um registro permanente no Histórico de quem excluiu, quando e em que situação estava.')) return;
   const snapshot = `tipo:${tipoNome(e.tipo)} · status:${STATUS[e.status]||e.status} · local:${e.local||e.deposito||'—'}${e.tecnicoId?' · com '+tecNome(e.tecnicoId):''}`;
-  DB.movimentacoes.push({ id:uid(), ts:Date.now(), tipo:'exclusao', serie, de:snapshot, para:'Excluído do sistema', tecnicoId:e.tecnicoId||null, usuario:nomeUsuarioAtual(), obs:'Exclusão definitiva por administrador' });
+  registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:'exclusao', serie, de:snapshot, para:'Excluído do sistema', tecnicoId:e.tecnicoId||null, usuario:nomeUsuarioAtual(), obs:'Exclusão definitiva por administrador' });
   DB.equipamentos = DB.equipamentos.filter(x=>x.serie!==serie);
   salvar(); closeModal(); render(); flash('Equipamento excluído — registro mantido no Histórico');
 }
@@ -1336,7 +1360,7 @@ function filtrarPickMov(q){
     const meuId = meuTecnico()?meuTecnico().id:null;
     cand = cand.filter(e=>e.tecnicoId===meuId && e.status==='com_tecnico');
   }
-  else if(movTipo==='saida') cand=cand.filter(e=>e.status==='estoque');
+  else if(movTipo==='saida'){ cand=cand.filter(e=>e.status==='estoque'); if(movFilialTec) cand=cand.filter(e=>e.deposito===movFilialTec); }
   else if(movTipo==='transferencia') cand=cand.filter(e=>e.status==='com_tecnico');
   else if(movTipo==='entrada') cand=cand.filter(e=>e.status!=='estoque');
   else if(movTipo==='baixa') cand=cand.filter(e=>e.status!=='baixado');
@@ -1387,7 +1411,7 @@ function confirmarMov(){
     const motivo = movTipo==='baixa' && $('#movMotivo')? $('#movMotivo').value.trim() : '';
     const tecIdMov = movTipo==='baixa' ? tecnicoAnterior : tecId;
     const paraTxt = (movTipo==='saida'||movTipo==='transferencia') ? destinoTxt+' (aguardando confirmação)' : destinoTxt;
-    DB.movimentacoes.push({ id:uid(), ts:Date.now(), tipo:movTipo, serie, de, para:paraTxt, tecnicoId:tecIdMov, usuario, obs:[obs,motivo].filter(Boolean).join(' · ') });
+    registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:movTipo, serie, de, para:paraTxt, tecnicoId:tecIdMov, usuario, obs:[obs,motivo].filter(Boolean).join(' · ') });
     n++;
   });
   salvar(); closeModal(); render(); flash(`✅ ${n} ${n===1?'movimentação registrada':'movimentações registradas'}`+((movTipo==='saida'||movTipo==='transferencia')?' — aguardando confirmação do técnico':''),'green');
@@ -1522,7 +1546,48 @@ function relatorioFilial(){
 function exportarBackup(){ baixar('backup_estoque_'+new Date().toISOString().slice(0,10)+'.json', JSON.stringify(DB,null,2),'application/json'); flash('✅ Backup exportado','green'); }
 function importarBackup(input){
   const f=input.files[0]; if(!f) return;
-  const r=new FileReader(); r.onload=e=>{ try{ const d=JSON.parse(e.target.result); if(!d.equipamentos) throw 0; if(!confirm('Substituir TODOS os dados atuais pelo backup?')) return; DB=Object.assign(estadoInicial(),d); salvar(); render(); renderNav(); flash('✅ Backup restaurado','green'); }catch(err){ flash('Arquivo de backup inválido','red'); } }; r.readAsText(f); input.value='';
+  const r=new FileReader(); r.onload=async e=>{
+    try{
+      const d=JSON.parse(e.target.result); if(!d.equipamentos) throw 0;
+      if(!confirm('Substituir TODOS os dados atuais pelo backup?')) return;
+      const movsBackup = d.movimentacoes||[];
+      DB=Object.assign(estadoInicial(),d); salvar(); render(); renderNav();
+      flash('Restaurando histórico de movimentações...','green');
+      await limparColecaoMovimentacoes();
+      await gravarMovimentacoesEmLote(movsBackup);
+      flash('✅ Backup restaurado','green');
+    }catch(err){ flash('Arquivo de backup inválido: '+err.message,'red'); }
+  }; r.readAsText(f); input.value='';
+}
+async function gravarMovimentacoesEmLote(lista){
+  for(let i=0;i<lista.length;i+=400){
+    const batch = window.firestoreDB.batch();
+    lista.slice(i,i+400).forEach(m=>batch.set(MOVS_REF.doc(m.id), m));
+    await batch.commit();
+  }
+}
+async function limparColecaoMovimentacoes(){
+  const snap = await MOVS_REF.get();
+  const docs = snap.docs;
+  for(let i=0;i<docs.length;i+=400){
+    const batch = window.firestoreDB.batch();
+    docs.slice(i,i+400).forEach(d=>batch.delete(d.ref));
+    await batch.commit();
+  }
+}
+async function migrarHistoricoParaColecao(){
+  if(!souAdmin()) return flash('Somente administradores podem fazer isso','red');
+  if(!confirm('Isso corrige o erro de "documento muito grande": move todo o histórico de movimentações (que está travado no navegador atual) para um armazenamento sem limite de tamanho. Pode levar alguns segundos. Continuar?')) return;
+  flash('Migrando histórico, aguarde...','green');
+  try{
+    await gravarMovimentacoesEmLote(DB.movimentacoes);
+    await new Promise(r=>setTimeout(r,500));
+    const { movimentacoes, ...semMovs } = DB;
+    await DOC_REF.set(semMovs);
+    flash(`✅ Migração concluída! ${DB.movimentacoes.length} movimentação(ões) migrada(s). Sincronização corrigida.`,'green');
+  }catch(err){
+    flash('⚠️ Erro na migração: '+err.message,'red');
+  }
 }
 function corrigirItensCDO(){
   if(!souAdmin()) return flash('Somente administradores podem fazer isso','red');
@@ -1591,7 +1656,13 @@ function aplicarMinimosOficiais(){
   });
   salvar(); render(); flash('✅ Estoque mínimo aplicado','green');
 }
-function limparTudo(){ if(!confirm('Apagar TODOS os dados (equipamentos, técnicos, movimentações)? Faça backup antes!')) return; if(!confirm('Tem certeza? Esta ação não pode ser desfeita.')) return; DB=estadoInicial(); salvar(); goto('dados'); flash('Todos os dados foram apagados'); }
+async function limparTudo(){
+  if(!confirm('Apagar TODOS os dados (equipamentos, técnicos, movimentações)? Faça backup antes!')) return;
+  if(!confirm('Tem certeza? Esta ação não pode ser desfeita.')) return;
+  DB=estadoInicial(); salvar(); goto('dados'); flash('Apagando histórico da nuvem...','green');
+  try{ await limparColecaoMovimentacoes(); flash('Todos os dados foram apagados'); }
+  catch(err){ flash('⚠️ '+err.message,'red'); }
+}
 
 /* =========================================================
    KARDEX — histórico completo de um item
@@ -1999,7 +2070,7 @@ async function confirmarRegistrarForm(){
       e.status='com_tecnico'; e.tecnicoId=t.id; e.local=tecNome(t.id); e.confirmado=true; e.emTransito=false; e.transitoPara=null; e.transitoDesde=null; e.transitoDe=null;
     }
     e.desde = Date.now();
-    DB.movimentacoes.push({ id:uid(), ts:Date.now(), tipo:'registro_campo', serie, de, para:tecNome(t.id), tecnicoId:t.id, usuario:nomeUsuarioAtual(), obs:[servicoLabel, obs].filter(Boolean).join(' · '), fotos:[], retiradaId:codigoRetirada, temFotosLocais });
+    registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:'registro_campo', serie, de, para:tecNome(t.id), tecnicoId:t.id, usuario:nomeUsuarioAtual(), obs:[servicoLabel, obs].filter(Boolean).join(' · '), fotos:[], retiradaId:codigoRetirada, temFotosLocais });
     n++;
   });
   formFotos.forEach(f=>URL.revokeObjectURL(f.url)); formFotos=[];
@@ -2017,7 +2088,7 @@ function confirmarRecebimento(serie, semConfirm){
   const destinoId = e.transitoPara;
   e.status='com_tecnico'; e.tecnicoId=destinoId; e.local=tecNome(destinoId); e.confirmado=true; e.desde=Date.now();
   e.emTransito=false; e.transitoPara=null; e.transitoDesde=null; e.transitoDe=null; e.transitoUsuario=null;
-  DB.movimentacoes.push({ id:uid(), ts:Date.now(), tipo:'confirmacao', serie, de:'Em trânsito', para:tecNome(destinoId), tecnicoId:destinoId, usuario:nomeUsuarioAtual(), obs:'Recebimento confirmado pelo técnico' });
+  registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:'confirmacao', serie, de:'Em trânsito', para:tecNome(destinoId), tecnicoId:destinoId, usuario:nomeUsuarioAtual(), obs:'Recebimento confirmado pelo técnico' });
   salvar(); render(); flash('✅ Recebimento de '+serie+' confirmado','green');
 }
 function renderMeuHistorico(){
