@@ -1,9 +1,12 @@
 /* =========================================================
    Controle de Estoque & Inventário — App (vanilla JS)
-   Salva tudo em localStorage. Sem servidor, sem instalação.
+   Backend: Firebase (Firestore + Auth). O localStorage é só
+   um cache local para carregar mais rápido / funcionar offline;
+   a fonte de verdade é o Firestore.
    ========================================================= */
 
-const STORE_KEY = 'estoque_a365_v1';
+const STORE_KEY_BASE = 'estoque_a365_v1';
+let STORE_KEY = STORE_KEY_BASE; // isolado por conta assim que o login resolver (ver onAuthStateChanged)
 const DIAS_PARADO = 20; // a partir de quantos dias com técnico um item é considerado "parado"
 const STATUS = { estoque:'Em estoque', com_tecnico:'Com técnico', baixado:'RMA' };
 const TIPO_CORES = ['#2563eb','#7c3aed','#16a34a','#d97706','#dc2626','#0891b2','#db2777','#65a30d'];
@@ -27,7 +30,7 @@ function carregar(){
   try{ const r = localStorage.getItem(STORE_KEY); if(r) return Object.assign(estadoInicial(), JSON.parse(r)); }catch(e){}
   return estadoInicial();
 }
-function salvarLocal(){ localStorage.setItem(STORE_KEY, JSON.stringify(DB)); }
+function salvarLocal(){ try{ localStorage.setItem(STORE_KEY, JSON.stringify(DB)); }catch(e){ console.warn('Falha ao salvar cache local:', e); } }
 
 /* ---------- Login (Firebase Auth) ---------- */
 let loginModo = 'entrar'; // ou 'criar'
@@ -59,6 +62,14 @@ function loginSubmit(){
     : window.firebaseAuth.createUserWithEmailAndPassword(email, senha);
   acao.catch(err=> loginErro(LOGIN_ERROS[err.code] || ('Erro: '+err.message)));
 }
+function loginEsqueciSenha(){
+  const email = $('#loginEmail').value.trim();
+  if(!email) return loginErro('Digite seu e-mail no campo acima e clique em "Esqueci minha senha" de novo.');
+  $('#loginErr').style.display='none';
+  window.firebaseAuth.sendPasswordResetEmail(email)
+    .then(()=> flash('✅ Enviamos um link de redefinição de senha para '+email,'green'))
+    .catch(err=> loginErro(LOGIN_ERROS[err.code] || ('Erro: '+err.message)));
+}
 function logout(){ if(confirm('Sair da sua conta?')) window.firebaseAuth.signOut(); }
 
 /* ---------- Perfis / hierarquia (admin, supervisor, técnico) ---------- */
@@ -83,6 +94,8 @@ window.firebaseAuth.onAuthStateChanged(async user=>{
   if(user){
     $('#loginBg').style.display='none';
     $('#pendingBg').style.display='none';
+    const chaveDoUsuario = STORE_KEY_BASE+'_'+user.uid;
+    if(STORE_KEY!==chaveDoUsuario){ STORE_KEY=chaveDoUsuario; DB=carregar(); }
     const ref = USERS_REF.doc(user.uid);
     const snap = await ref.get().catch(()=>null);
     if(snap && !snap.exists){
@@ -93,7 +106,7 @@ window.firebaseAuth.onAuthStateChanged(async user=>{
       aplicarPerfil(user);
     }, ()=>{ MEU_PERFIL=null; aplicarPerfil(user); });
   } else {
-    MEU_PERFIL = null; syncIniciado=false;
+    MEU_PERFIL = null; syncIniciado=false; STORE_KEY=STORE_KEY_BASE;
     $('#loginBg').style.display='flex';
     $('#pendingBg').style.display='none';
     $('#appRoot').style.display='none';
@@ -199,6 +212,7 @@ function iniciarSyncNuvem(){
       salvarLocal();
       aplicandoRemoto = false;
       renderNav(); render();
+      verificarBackupAutomatico();
       if(data.equipamentos && data.equipamentos.length) migrarEquipamentosParaColecao(data.equipamentos);
     } else {
       const { movimentacoes, auditorias, equipamentos, ...semMovs } = DB;
@@ -209,13 +223,13 @@ function iniciarSyncNuvem(){
     if(foot) foot.innerHTML = '⚠️ Sem conexão com a nuvem<br>Usando dados locais.';
     flash('⚠️ Erro de sincronização: '+err.message,'red');
   });
-  MOVS_REF.orderBy('ts','asc').limitToLast(3000).onSnapshot(snap=>{
+  MOVS_REF.orderBy('ts','asc').onSnapshot(snap=>{
     DB.movimentacoes = snap.docs.map(d=>d.data());
     salvarLocal();
     if(movsCarregadas) render();
     movsCarregadas = true;
   }, err=>{ flash('⚠️ Erro ao carregar histórico: '+err.message,'red'); });
-  AUDS_REF.orderBy('ts','asc').limitToLast(2000).onSnapshot(snap=>{
+  AUDS_REF.orderBy('ts','asc').onSnapshot(snap=>{
     DB.auditorias = snap.docs.map(d=>d.data());
     salvarLocal();
     if(audsCarregadas) render();
@@ -283,6 +297,7 @@ function auditoriasPermitidas(){
 }
 function itensDoTecnico(id){ return DB.equipamentos.filter(e=>e.tecnicoId===id && e.status==='com_tecnico'); }
 function itensDoDeposito(dep){ return DB.equipamentos.filter(e=>e.status==='estoque' && (e.local||e.deposito||'')===dep); }
+function acharEquipPorSerie(serie){ const s=(serie||'').toLowerCase(); return DB.equipamentos.find(e=>e.serie.toLowerCase()===s); }
 
 /* ---------- Modo escuro ---------- */
 function toggleDark(){ document.body.classList.toggle('dark'); localStorage.setItem('estoque_dark', document.body.classList.contains('dark')?'1':'0'); }
@@ -1593,6 +1608,7 @@ function renderDados(){
   </div></div>`:''}
   <div class="panel" style="margin-top:18px"><div class="ph"><h3>💾 Backup & compartilhamento</h3></div><div class="pb">
     <p class="muted" style="margin-bottom:14px">Os dados ficam salvos <b>neste navegador</b>. Para fazer cópia de segurança ou usar em outra máquina/compartilhar via rede, exporte o backup e importe no outro computador.</p>
+    <p class="muted" style="margin-bottom:14px;font-size:12.5px">${DB.config.ultimoBackup?`Último backup: <b>${fmtTS(DB.config.ultimoBackup)}</b>`:'Nenhum backup feito ainda.'} — um admin recebe um backup automático a cada 7 dias, sem precisar clicar em nada.</p>
     <div style="display:flex;gap:10px;flex-wrap:wrap">
       <button class="btn green" onclick="exportarBackup()">⬇️ Exportar backup (.json)</button>
       <label class="btn">⬆️ Importar backup<input type="file" accept=".json" style="display:none" onchange="importarBackup(this)"></label>
@@ -1661,7 +1677,7 @@ function autoDetectarTipoEquip(){
 function salvarEquip(serieEdit){
   const serie = serieEdit || $('#e_serie').value.trim();
   if(!serie) return flash('Informe o nº de série','red');
-  if(!serieEdit && DB.equipamentos.some(e=>e.serie===serie)) return flash('Já existe um item com esse nº de série','red');
+  if(!serieEdit && acharEquipPorSerie(serie)) return flash('Já existe um item com esse nº de série','red');
   let e = serieEdit? DB.equipamentos.find(x=>x.serie===serieEdit) : null;
   const dados={ tipo:$('#e_tipo').value, deposito:limparFilial($('#e_dep').value), status:$('#e_status').value, dataEntrada:$('#e_data').value.trim(), obs:$('#e_obs').value.trim() };
   if(e){ Object.assign(e,dados); }
@@ -1956,18 +1972,22 @@ function acharCol(headers, chaves){
 function parseLinhas(matriz, substituir){
   if(!matriz.length){ flash('Arquivo vazio','red'); return; }
   // acha header
-  let hi=0; for(let i=0;i<Math.min(5,matriz.length);i++){ const row=matriz[i].map(c=>String(c).toLowerCase()); if(row.some(c=>c.includes('série')||c.includes('serie'))){ hi=i; break; } }
+  let hi=0; for(let i=0;i<Math.min(20,matriz.length);i++){ const row=matriz[i].map(c=>String(c).toLowerCase()); if(row.some(c=>c.includes('série')||c.includes('serie'))){ hi=i; break; } }
   const headers=matriz[hi].map(c=>String(c));
   const ci={ serie:acharCol(headers,COL_MAP.serie), produto:acharCol(headers,COL_MAP.produto), deposito:acharCol(headers,COL_MAP.deposito), data:acharCol(headers,COL_MAP.data), origem:acharCol(headers,COL_MAP.origem), familia:acharCol(headers,COL_MAP.familia), derivacao:acharCol(headers,COL_MAP.derivacao), um:acharCol(headers,COL_MAP.um) };
   if(ci.serie<0){ flash('Não encontrei a coluna "Nº Série". Verifique o cabeçalho.','red'); return; }
 
-  if(substituir){ DB.equipamentos=[]; }
-  const idx = {}; DB.equipamentos.forEach((e,i)=>idx[e.serie]=i);
+  if(substituir && !confirm('Isso vai atualizar o ESTOQUE (itens em depósito) com base nesta planilha: itens em estoque que não aparecerem nela serão removidos do sistema. Equipamentos que estão com técnico ou em RMA NÃO serão alterados, mesmo que não apareçam na planilha. Continuar?')) return;
+
+  const idxPorSerie = {}; DB.equipamentos.forEach((e,i)=>{ idxPorSerie[e.serie.toLowerCase()]=i; });
+  const seriesNaPlanilha = new Set();
   let novos=0, atualizados=0;
   for(let i=hi+1;i<matriz.length;i++){
     const row=matriz[i]; if(!row||!row.length) continue;
     const serie=String(row[ci.serie]==null?'':row[ci.serie]).trim(); if(!serie) continue;
-    const tipo = detectarTipoPorSerie(serie) || (ci.produto>=0? String(row[ci.produto]||'').trim() : 'SEM-TIPO');
+    seriesNaPlanilha.add(serie.toLowerCase());
+    const tipoProduto = ci.produto>=0? String(row[ci.produto]||'').trim() : '';
+    const tipo = detectarTipoPorSerie(serie) || tipoProduto || 'SEM-TIPO';
     const reg = {
       serie, tipo,
       deposito: ci.deposito>=0? limparFilial(row[ci.deposito]):'',
@@ -1978,21 +1998,44 @@ function parseLinhas(matriz, substituir){
       um: ci.um>=0?String(row[ci.um]||'').trim():''
     };
     if(tipo && !DB.tipos[tipo]) DB.tipos[tipo]={nome:tipo,cor:''};
-    if(serie in idx){
-      const e=DB.equipamentos[idx[serie]]; Object.assign(e,reg); atualizados++;
+    const idxExistente = idxPorSerie[serie.toLowerCase()];
+    if(idxExistente!==undefined){
+      const e=DB.equipamentos[idxExistente]; Object.assign(e,reg); atualizados++;
     } else {
       DB.equipamentos.push(Object.assign({status:'estoque',tecnicoId:null,local:reg.deposito,obs:''},reg));
-      idx[serie]=DB.equipamentos.length-1; novos++;
+      idxPorSerie[serie.toLowerCase()]=DB.equipamentos.length-1; novos++;
     }
   }
+  let removidos=0;
+  if(substituir){
+    const antes=DB.equipamentos.length;
+    DB.equipamentos = DB.equipamentos.filter(e=> e.status!=='estoque' || seriesNaPlanilha.has(e.serie.toLowerCase()));
+    removidos = antes-DB.equipamentos.length;
+  }
   DB.config.importadoEm=Date.now(); salvar();
-  flash(`✅ Importado: ${novos} novos, ${atualizados} atualizados`,'green');
+  flash(`✅ Importado: ${novos} novos, ${atualizados} atualizados`+(removidos?`, ${removidos} removido(s) do estoque (não estavam na planilha)`:''),'green');
   goto('dashboard');
+}
+function parseCSVLinha(linha, delim){
+  const out=[]; let cur=''; let dentroAspas=false;
+  for(let i=0;i<linha.length;i++){
+    const c=linha[i];
+    if(dentroAspas){
+      if(c==='"'){ if(linha[i+1]==='"'){ cur+='"'; i++; } else dentroAspas=false; }
+      else cur+=c;
+    } else {
+      if(c==='"') dentroAspas=true;
+      else if(c===delim){ out.push(cur); cur=''; }
+      else cur+=c;
+    }
+  }
+  out.push(cur);
+  return out;
 }
 function importarColado(){
   const txt=$('#pasteArea').value; if(!txt.trim()) return flash('Cole os dados primeiro','red');
   const delim = txt.includes('\t')?'\t':(txt.split('\n')[0].includes(';')?';':',');
-  const matriz = txt.replace(/\r/g,'').split('\n').filter(l=>l.trim()).map(l=>l.split(delim));
+  const matriz = txt.replace(/\r/g,'').split('\n').filter(l=>l.trim()).map(l=>parseCSVLinha(l,delim));
   parseLinhas(matriz, $('#pasteSubstituir').checked);
 }
 function importarArquivo(input){
@@ -2000,7 +2043,7 @@ function importarArquivo(input){
   const sub = $('#fileSubstituir').checked;
   const reader=new FileReader();
   if(/\.csv$/i.test(file.name)){
-    reader.onload=e=>{ const txt=e.target.result; const delim=txt.includes('\t')?'\t':(txt.split('\n')[0].includes(';')?';':','); const matriz=txt.replace(/\r/g,'').split('\n').filter(l=>l.trim()).map(l=>l.split(delim)); parseLinhas(matriz,sub); };
+    reader.onload=e=>{ const txt=e.target.result; const delim=txt.includes('\t')?'\t':(txt.split('\n')[0].includes(';')?';':','); const matriz=txt.replace(/\r/g,'').split('\n').filter(l=>l.trim()).map(l=>parseCSVLinha(l,delim)); parseLinhas(matriz,sub); };
     reader.readAsText(file,'utf-8');
   } else {
     if(window.__noXLSX||typeof XLSX==='undefined') return flash('Leitura de Excel indisponível (sem internet). Salve como CSV ou cole os dados.','red');
@@ -2064,12 +2107,26 @@ function relatorioFilial(){
     </body></html>`;
   const w=window.open('','_blank'); if(!w) return flash('Permita pop-ups para gerar o relatório','red'); w.document.write(html); w.document.close();
 }
-function exportarBackup(){ baixar('backup_estoque_'+new Date().toISOString().slice(0,10)+'.json', JSON.stringify(DB,null,2),'application/json'); flash('✅ Backup exportado','green'); }
+function exportarBackup(automatico){
+  baixar('backup_estoque_'+new Date().toISOString().slice(0,10)+'.json', JSON.stringify(DB,null,2),'application/json');
+  DB.config.ultimoBackup = Date.now(); salvar();
+  if(!automatico) flash('✅ Backup exportado','green');
+}
+let backupAutoChecado = false;
+function verificarBackupAutomatico(){
+  if(backupAutoChecado || !souAdmin()) return;
+  backupAutoChecado = true;
+  const dias = (Date.now()-(DB.config.ultimoBackup||0))/86400000;
+  if(dias>=7){
+    exportarBackup(true);
+    flash('💾 Backup automático gerado (já fazia '+Math.floor(dias)+' dia(s) do último). Confira sua pasta de downloads.','green');
+  }
+}
 function importarBackup(input){
   const f=input.files[0]; if(!f) return;
   const r=new FileReader(); r.onload=async e=>{
     try{
-      const d=JSON.parse(e.target.result); if(!d.equipamentos) throw 0;
+      const d=JSON.parse(e.target.result); if(!d.equipamentos) throw new Error('o arquivo não parece ser um backup deste sistema (falta a lista de equipamentos)');
       if(!confirm('Substituir TODOS os dados atuais pelo backup?')) return;
       const movsBackup = d.movimentacoes||[];
       const audsBackup = d.auditorias||[];
@@ -2231,7 +2288,8 @@ function aplicarMinimosOficiais(){
 }
 async function limparTudo(){
   if(!confirm('Apagar TODOS os dados (equipamentos, técnicos, movimentações, auditorias)? Faça backup antes!')) return;
-  if(!confirm('Tem certeza? Esta ação não pode ser desfeita.')) return;
+  const digitado = prompt('Esta ação não pode ser desfeita. Digite APAGAR (em maiúsculas) para confirmar:');
+  if(digitado!=='APAGAR') return flash('Cancelado — nada foi apagado','red');
   DB=estadoInicial(); salvar(); goto('dados'); flash('Apagando histórico da nuvem...','green');
   try{ await limparColecao(MOVS_REF); await limparColecao(AUDS_REF); await limparColecao(EQUIPS_REF); ultimoSyncEquip={}; flash('Todos os dados foram apagados'); }
   catch(err){ flash('⚠️ '+err.message,'red'); }
@@ -2595,7 +2653,7 @@ function abrirRegistrarForm(){
 }
 function desenharRegistrarForm(){
   const tiposOpt = Object.keys(DB.tipos).map(cod=>`<option value="${cod}">${esc(tipoNome(cod))}</option>`).join('');
-  const novos = formSel.filter(s=>!DB.equipamentos.find(e=>e.serie===s));
+  const novos = formSel.filter(s=>!acharEquipPorSerie(s));
   const novosSemDeteccao = novos.filter(s=>!detectarTipoPorSerie(s));
   modal('📝 Registrar retirada em campo', `
     <div class="field"><label>Bipe ou digite o nº de série e Enter</label>
@@ -2647,9 +2705,12 @@ function formAddSerieBusca(){
 }
 function formRemoveSerie(s){ formSel=formSel.filter(x=>x!==s); desenharRegistrarForm(); }
 function renderFormChips(){
+  const t = meuTecnico();
   $('#formChips').innerHTML = formSel.map(s=>{
-    const existe = DB.equipamentos.find(e=>e.serie===s);
-    return `<span class="chip" style="${existe?'':'background:var(--amber-soft);color:var(--amber)'}">${esc(s)}${existe?'':' · novo'} <span class="rm" onclick="formRemoveSerie('${esc(s)}')">×</span></span>`;
+    const existe = acharEquipPorSerie(s);
+    const deOutroTecnico = existe && existe.status==='com_tecnico' && t && existe.tecnicoId!==t.id;
+    const rotulo = !existe? ' · novo' : (deOutroTecnico? ' · atual: '+esc(tecNome(existe.tecnicoId)) : '');
+    return `<span class="chip" style="${(!existe||deOutroTecnico)?'background:var(--amber-soft);color:var(--amber)':''}">${esc(s)}${rotulo} <span class="rm" onclick="formRemoveSerie('${esc(s)}')">×</span></span>`;
   }).join('');
   if($('#formN')) $('#formN').textContent = formSel.length;
 }
@@ -2670,12 +2731,18 @@ async function confirmarRegistrarForm(){
   const servico = $('#formServico').value;
   const servicoLabel = servico==='manutencao'?'Manutenção':'Desinstalação';
   const obs = $('#formObs').value.trim();
-  const novos = formSel.filter(s=>!DB.equipamentos.find(e=>e.serie===s));
+  const novos = formSel.filter(s=>!acharEquipPorSerie(s));
   const novosSemDeteccao = novos.filter(s=>!detectarTipoPorSerie(s));
   let tipoManual = '';
   if(novosSemDeteccao.length){
     tipoManual = $('#formTipo')?$('#formTipo').value:'';
     if(!tipoManual) return flash('Selecione o tipo para os equipamentos sem padrão reconhecido','red');
+  }
+
+  const deOutroTecnico = formSel.map(acharEquipPorSerie).filter(e=>e && e.status==='com_tecnico' && e.tecnicoId!==t.id);
+  if(deOutroTecnico.length){
+    const nomes = [...new Set(deOutroTecnico.map(e=>tecNome(e.tecnicoId)))].join(', ');
+    if(!confirm(`${deOutroTecnico.length} equipamento(s) bipado(s) está(ão) atualmente com outro técnico (${nomes}). Confirmar mesmo assim que esses itens são seus agora?`)) return;
   }
 
   const btn = $('#formBtnRegistrar');
@@ -2687,7 +2754,7 @@ async function confirmarRegistrarForm(){
 
   let n=0;
   formSel.forEach(serie=>{
-    let e = DB.equipamentos.find(x=>x.serie===serie);
+    let e = acharEquipPorSerie(serie);
     const de = e ? (e.status==='com_tecnico'?tecNome(e.tecnicoId):(e.local||e.deposito||'Estoque')) : 'Campo (novo no sistema)';
     if(!e){
       const tipoNovo = detectarTipoPorSerie(serie) || tipoManual;
@@ -2841,8 +2908,19 @@ function renderUsuarios(){
     </div>
   </div>`;
 }
+function contarAdmins(){ return USUARIOS_LISTA.filter(u=>u.papel==='admin').length; }
 function usuarioAtualizarCampo(uid, campo, valor){
-  USERS_REF.doc(uid).update({[campo]:valor}).then(()=>flash('✅ Atualizado','green')).catch(e=>flash('⚠️ '+e.message,'red'));
+  const alvo = USUARIOS_LISTA.find(u=>u.uid===uid);
+  if(campo==='papel' && alvo && alvo.papel==='admin' && valor!=='admin' && contarAdmins()<=1){
+    flash('⚠️ Não é possível rebaixar o único administrador do sistema. Promova outra pessoa a admin antes.','red');
+    return renderUsuarios();
+  }
+  const updates = {[campo]:valor};
+  if(campo==='papel'){
+    if(valor!=='supervisor') updates.regioes=[];
+    if(valor!=='tecnico') updates.tecnicoId=null;
+  }
+  USERS_REF.doc(uid).update(updates).then(()=>flash('✅ Atualizado','green')).catch(e=>flash('⚠️ '+e.message,'red'));
 }
 function abrirEditarFiliaisSupervisor(uid, nome, regioesAtuais){
   const todas = todasFiliaisConhecidas();
@@ -2862,6 +2940,8 @@ function salvarFiliaisSupervisor(uid){
   USERS_REF.doc(uid).update({regioes:vals}).then(()=>{ closeModal(); flash('✅ Filiais atualizadas','green'); }).catch(e=>flash('⚠️ '+e.message,'red'));
 }
 function usuarioRemover(uid, email){
+  const alvo = USUARIOS_LISTA.find(u=>u.uid===uid);
+  if(alvo && alvo.papel==='admin' && contarAdmins()<=1) return flash('⚠️ Não é possível remover o único administrador do sistema. Promova outra pessoa a admin antes.','red');
   if(!confirm('Remover o acesso de '+email+'? A pessoa poderá criar uma conta nova, mas terá que ser aprovada de novo.')) return;
   USERS_REF.doc(uid).delete().then(()=>flash('Usuário removido')).catch(e=>flash('⚠️ '+e.message,'red'));
 }
