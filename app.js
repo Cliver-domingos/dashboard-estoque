@@ -121,15 +121,53 @@ function PAGE_ATUAL_VALIDA(){ return paginasDisponiveis().some(p=>p.id===PAGE); 
 /* ---------- Sincronização em nuvem (Firestore) ---------- */
 const DOC_REF = window.firestoreDB.collection('estoques').doc('dashboard');
 const MOVS_REF = window.firestoreDB.collection('movimentacoes');
+const AUDS_REF = window.firestoreDB.collection('auditorias');
+const EQUIPS_REF = window.firestoreDB.collection('equipamentos');
 let aplicandoRemoto = false;
 let salvarTimeout = null;
 let movsCarregadas = false;
+let audsCarregadas = false;
+let equipsCarregados = false;
+let ultimoSyncEquip = {}; // serie -> JSON string do último estado enviado/recebido da nuvem
 
-// O histórico de movimentações fica numa coleção própria (sem o limite de 1MB do doc único
-// estoques/dashboard). Cada evento vira 1 documento, gravado na hora em que acontece.
+// O histórico de movimentações, as auditorias e os equipamentos ficam em coleções próprias
+// (sem o limite de 1MB do doc único estoques/dashboard). Cada registro vira 1 documento.
 function registrarMovimentacao(m){
   DB.movimentacoes.push(m);
   MOVS_REF.doc(m.id).set(m).catch(e=>flash('⚠️ Falha ao salvar movimentação: '+e.message,'red'));
+}
+function registrarAuditoria(a){
+  DB.auditorias.push(a);
+  AUDS_REF.doc(a.id).set(a).catch(e=>flash('⚠️ Falha ao salvar auditoria: '+e.message,'red'));
+}
+
+function sincronizarEquipamentos(){
+  const seriesAtuais = new Set();
+  const alterados = [];
+  DB.equipamentos.forEach(e=>{
+    seriesAtuais.add(e.serie);
+    const json = JSON.stringify(e);
+    if(ultimoSyncEquip[e.serie]!==json) alterados.push(e);
+  });
+  const removidos = Object.keys(ultimoSyncEquip).filter(serie=>!seriesAtuais.has(serie));
+  if(!alterados.length && !removidos.length) return;
+  const lotes = [];
+  for(let i=0;i<alterados.length;i+=400) lotes.push(alterados.slice(i,i+400));
+  for(let i=0;i<removidos.length;i+=400) lotes.push(removidos.slice(i,i+400).map(serie=>({__remover:serie})));
+  (async()=>{
+    try{
+      for(const lote of lotes){
+        const batch = window.firestoreDB.batch();
+        lote.forEach(item=>{
+          if(item.__remover) batch.delete(EQUIPS_REF.doc(item.__remover));
+          else batch.set(EQUIPS_REF.doc(item.serie), item);
+        });
+        await batch.commit();
+      }
+      alterados.forEach(e=>{ ultimoSyncEquip[e.serie]=JSON.stringify(e); });
+      removidos.forEach(serie=>{ delete ultimoSyncEquip[serie]; });
+    }catch(e){ flash('⚠️ Falha ao sincronizar equipamentos: '+e.message,'red'); }
+  })();
 }
 
 function salvar(){
@@ -137,8 +175,9 @@ function salvar(){
   if(aplicandoRemoto) return;
   clearTimeout(salvarTimeout);
   salvarTimeout = setTimeout(()=>{
-    const { movimentacoes, ...semMovs } = DB;
+    const { movimentacoes, auditorias, equipamentos, ...semMovs } = DB;
     DOC_REF.set(semMovs).catch(e=>flash('⚠️ Falha ao sincronizar: '+e.message,'red'));
+    sincronizarEquipamentos();
   }, 400);
 }
 
@@ -151,14 +190,20 @@ function iniciarSyncNuvem(){
     if(data){
       aplicandoRemoto = true;
       const movsAtual = DB.movimentacoes;
+      const audsAtual = DB.auditorias;
+      const equipsAtual = DB.equipamentos;
       DB = Object.assign(estadoInicial(), data);
       DB.movimentacoes = movsAtual; // histórico é gerenciado pelo listener da coleção própria
+      DB.auditorias = audsAtual;    // idem para auditorias
+      DB.equipamentos = data.equipamentos && data.equipamentos.length ? data.equipamentos : equipsAtual; // migração: usa embutido só se coleção ainda não carregou
       salvarLocal();
       aplicandoRemoto = false;
       renderNav(); render();
+      if(data.equipamentos && data.equipamentos.length) migrarEquipamentosParaColecao(data.equipamentos);
     } else {
-      const { movimentacoes, ...semMovs } = DB;
+      const { movimentacoes, auditorias, equipamentos, ...semMovs } = DB;
       DOC_REF.set(semMovs); // primeira vez: envia os dados locais como base
+      if(DB.equipamentos.length) sincronizarEquipamentos();
     }
   }, err=>{
     if(foot) foot.innerHTML = '⚠️ Sem conexão com a nuvem<br>Usando dados locais.';
@@ -170,6 +215,26 @@ function iniciarSyncNuvem(){
     if(movsCarregadas) render();
     movsCarregadas = true;
   }, err=>{ flash('⚠️ Erro ao carregar histórico: '+err.message,'red'); });
+  AUDS_REF.orderBy('ts','asc').limitToLast(2000).onSnapshot(snap=>{
+    DB.auditorias = snap.docs.map(d=>d.data());
+    salvarLocal();
+    if(audsCarregadas) render();
+    audsCarregadas = true;
+  }, err=>{ flash('⚠️ Erro ao carregar auditorias: '+err.message,'red'); });
+  EQUIPS_REF.onSnapshot(snap=>{
+    if(snap.metadata.hasPendingWrites && equipsCarregados) return; // eco da própria escrita, evita sobrescrever edição em digitação
+    const lista = snap.docs.map(d=>d.data());
+    ultimoSyncEquip = {};
+    lista.forEach(e=>{ ultimoSyncEquip[e.serie]=JSON.stringify(e); });
+    if(lista.length || equipsCarregados){ DB.equipamentos = lista; salvarLocal(); }
+    if(equipsCarregados) render();
+    equipsCarregados = true;
+  }, err=>{ flash('⚠️ Erro ao carregar equipamentos: '+err.message,'red'); });
+}
+async function migrarEquipamentosParaColecao(lista){
+  await gravarEmLote(EQUIPS_REF, lista, e=>e.serie);
+  lista.forEach(e=>{ ultimoSyncEquip[e.serie]=JSON.stringify(e); });
+  DOC_REF.update({ equipamentos: firebase.firestore.FieldValue.delete() }).catch(()=>{});
 }
 function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
 const FILIAL_CORRECOES = { 'SFO':'SOO', 'SF0':'SOO', 'JDA':'JND', 'POA':'PAE', 'RIP':'RBP' };
@@ -208,9 +273,16 @@ function refTS(e){ return e.desde || DB.config.importadoEm || null; }
 function diasEmPosse(e){ const t=refTS(e); if(!t) return null; return Math.floor((Date.now()-t)/86400000); }
 function fmtDias(n){ if(n==null) return '—'; if(n===0) return 'hoje'; if(n===1) return '1 dia'; if(n<30) return n+' dias'; const m=Math.floor(n/30); return m+(m===1?' mês':' meses'); }
 function ultimaAuditoria(alvoTipo, alvoId){ const a=DB.auditorias.filter(x=>x.alvoTipo===alvoTipo&&x.alvoId===alvoId); return a.length?a[a.length-1]:null; }
+function auditoriasPermitidas(){
+  if(!souSupervisor()) return DB.auditorias;
+  return DB.auditorias.filter(a=>{
+    if(a.alvoTipo==='deposito') return regiaoPermitida(a.alvoId);
+    const t=DB.tecnicos.find(x=>x.id===a.alvoId);
+    return t && regiaoPermitida(t.regiao);
+  });
+}
 function itensDoTecnico(id){ return DB.equipamentos.filter(e=>e.tecnicoId===id && e.status==='com_tecnico'); }
 function itensDoDeposito(dep){ return DB.equipamentos.filter(e=>e.status==='estoque' && (e.local||e.deposito||'')===dep); }
-function estoqueMinAlertas(lista){ lista=lista||DB.equipamentos; const r=[]; Object.keys(DB.tipos).forEach(t=>{ const min=DB.tipos[t].min||0; if(min>0){ const n=lista.filter(e=>e.tipo===t&&e.status==='estoque').length; if(n<min) r.push({tipo:t,atual:n,min}); } }); return r; }
 
 /* ---------- Modo escuro ---------- */
 function toggleDark(){ document.body.classList.toggle('dark'); localStorage.setItem('estoque_dark', document.body.classList.contains('dark')?'1':'0'); }
@@ -294,7 +366,7 @@ function renderDashboard(){
   const comTec = eq.filter(e=>e.status==='com_tecnico').length;
   const baixados = eq.filter(e=>e.status==='baixado').length;
   const seriesEq = new Set(eq.map(e=>e.serie));
-  const auditoriasFiltradas = dashFiliais.length ? DB.auditorias.filter(a=>a.alvoTipo==='deposito'&&dashFiliais.includes(a.alvoId)) : DB.auditorias;
+  const auditoriasFiltradas = (dashFiliais.length ? auditoriasPermitidas().filter(a=>a.alvoTipo==='deposito'&&dashFiliais.includes(a.alvoId)) : auditoriasPermitidas());
 
   // por tipo
   const porTipo = {};
@@ -323,18 +395,20 @@ function renderDashboard(){
   const ultimas = DB.movimentacoes.filter(m=>seriesEq.has(m.serie)).slice(-8).reverse();
 
   // alertas
-  const alertasMin = estoqueMinAlertas(eq);
   const parados = eq.filter(e=>e.status==='com_tecnico' && (diasEmPosse(e)||0)>=DIAS_PARADO);
   const tecsSemAud = DB.tecnicos.filter(t=>itensDoTecnico(t.id).some(e=>seriesEq.has(e.serie)) && !ultimaAuditoria('tecnico',t.id));
+  const pendentesConf = pendentesConfirmacaoLista().filter(e=>seriesEq.has(e.serie));
 
   const alertasMinGeral = alertasEstoqueMinPorFilial();
   $('#content').innerHTML = `
-  ${alertasMinGeral.length?`
-  <div class="panel" style="margin-bottom:18px;border-left:4px solid var(--red);cursor:pointer" onclick="goto('estoquemin')">
-    <div class="pb" style="display:flex;align-items:center;gap:12px">
-      <div style="font-size:22px">🎯</div>
-      <div style="flex:1"><b>${alertasMinGeral.length} alerta${alertasMinGeral.length>1?'s':''} de estoque mínimo</b> em ${[...new Set(alertasMinGeral.map(a=>a.filial))].length} filial(is) ${souSupervisor()?'da sua área':''}</div>
-      <span class="btn sm ghost">Ver detalhes →</span>
+  ${(alertasMinGeral.length||parados.length||tecsSemAud.length||pendentesConf.length)?`
+  <div class="panel" style="margin-bottom:18px;border-left:4px solid var(--amber)">
+    <div class="ph"><h3>☀️ Resumo do dia — o que precisa de ação</h3></div>
+    <div class="pb" style="display:flex;flex-wrap:wrap;gap:10px">
+      ${pendentesConf.length?`<button class="badge blue" style="padding:8px 12px;border:0;cursor:pointer" onclick="abrirPendentesConfirmacao()">📥 ${pendentesConf.length} ${pendentesConf.length===1?'item aguardando confirmação':'itens aguardando confirmação'}</button>`:''}
+      ${alertasMinGeral.length?`<button class="badge baixado" style="padding:8px 12px;border:0;cursor:pointer" onclick="goto('estoquemin')">🎯 ${alertasMinGeral.length} ${alertasMinGeral.length===1?'alerta de estoque mínimo':'alertas de estoque mínimo'}</button>`:''}
+      ${parados.length?`<button class="badge com_tecnico" style="padding:8px 12px;border:0;cursor:pointer" onclick="goto('parados')">${parados.length} ${parados.length===1?'item parado':'itens parados'} ${DIAS_PARADO}+ dias com técnico</button>`:''}
+      ${tecsSemAud.length?`<button class="badge gray" style="padding:8px 12px;border:0;cursor:pointer" onclick="goto('auditoria')">${tecsSemAud.length} ${tecsSemAud.length===1?'técnico nunca auditado':'técnicos nunca auditados'}</button>`:''}
     </div>
   </div>`:''}
   <div class="panel" style="margin-bottom:18px"><div class="pb" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
@@ -355,16 +429,6 @@ function renderDashboard(){
     ${kpi('r','♻️','RMA',baixados)}
     ${kpi('v','🔍','Auditorias',auditoriasFiltradas.length)}
   </div>
-
-  ${(alertasMin.length||parados.length||tecsSemAud.length)?`
-  <div class="panel" style="margin-bottom:20px;border-left:4px solid var(--amber)">
-    <div class="ph"><h3>⚠️ Alertas</h3></div>
-    <div class="pb" style="display:flex;flex-wrap:wrap;gap:10px">
-      ${alertasMin.map(a=>`<div class="badge baixado" style="padding:8px 12px">Estoque baixo: <b style="margin-left:4px">${esc(tipoNome(a.tipo))}</b> — ${a.atual}/${a.min}</div>`).join('')}
-      ${parados.length?`<button class="badge com_tecnico" style="padding:8px 12px;border:0;cursor:pointer" onclick="goto('equip')">${parados.length} ${parados.length===1?'item parado':'itens parados'} ${DIAS_PARADO}+ dias com técnico</button>`:''}
-      ${tecsSemAud.length?`<button class="badge gray" style="padding:8px 12px;border:0;cursor:pointer" onclick="goto('auditoria')">${tecsSemAud.length} ${tecsSemAud.length===1?'técnico nunca auditado':'técnicos nunca auditados'}</button>`:''}
-    </div>
-  </div>`:''}
 
   <div class="chart-row" style="margin-bottom:20px">
     <div class="panel">
@@ -418,12 +482,12 @@ function movBadge(t){ const m={entrada:'badge blue',saida:'badge com_tecnico',tr
 
 function donut(data){
   const total = data.reduce((s,d)=>s+d[1],0)||1;
-  let acc=0; const R=58, C=2*Math.PI*R;
-  const segs = data.filter(d=>d[1]>0).map(d=>{ const frac=d[1]/total; const dash=frac*C; const seg=`<circle r="${R}" cx="70" cy="70" fill="none" stroke="${d[2]}" stroke-width="22" stroke-dasharray="${dash} ${C-dash}" stroke-dashoffset="${-acc*C}" transform="rotate(-90 70 70)"/>`; acc+=frac; return seg; }).join('');
-  return `<svg width="140" height="140" viewBox="0 0 140 140">${segs}
-    <text x="70" y="66" text-anchor="middle" font-size="26" font-weight="800" fill="#0f172a">${total}</text>
-    <text x="70" y="84" text-anchor="middle" font-size="11" fill="#64748b">itens</text></svg>
-  <div class="legend">${data.map(d=>`<div class="li"><span class="sw" style="background:${d[2]}"></span>${d[0]} <b style="margin-left:auto">${d[1]}</b></div>`).join('')}</div>`;
+  let acc=0; const R=100, C=2*Math.PI*R;
+  const segs = data.filter(d=>d[1]>0).map(d=>{ const frac=d[1]/total; const dash=Math.max(0,frac*C-3); const seg=`<circle r="${R}" cx="120" cy="120" fill="none" stroke="${d[2]}" stroke-width="34" stroke-linecap="round" stroke-dasharray="${dash} ${C-dash}" stroke-dashoffset="${-acc*C}" transform="rotate(-90 120 120)"/>`; acc+=frac; return seg; }).join('');
+  return `<svg width="240" height="240" viewBox="0 0 240 240" style="flex-shrink:0">${segs}
+    <text x="120" y="115" text-anchor="middle" font-size="40" font-weight="800" fill="#0f172a">${total}</text>
+    <text x="120" y="140" text-anchor="middle" font-size="15" fill="#64748b">itens</text></svg>
+  <div class="legend">${data.map(d=>`<div class="li"><span class="sw" style="background:${d[2]}"></span><span>${d[0]}</span><b style="margin-left:auto">${d[1]}</b><span class="muted" style="width:50px;text-align:right;font-weight:500;font-size:13.5px">${Math.round(d[1]/total*100)}%</span></div>`).join('')}</div>`;
 }
 
 /* =========================================================
@@ -496,7 +560,7 @@ function renderParados(){
   const parados = DB.equipamentos.filter(e=>e.status==='com_tecnico' && (diasEmPosse(e)||0)>=DIAS_PARADO)
     .sort((a,b)=>(diasEmPosse(b)||0)-(diasEmPosse(a)||0));
   $('#content').innerHTML = `
-  <div class="panel"><div class="ph"><h3>⏰ Itens parados com técnicos (${DIAS_PARADO}+ dias)</h3><span class="count-badge">${parados.length}</span></div>
+  <div class="panel"><div class="ph"><h3>⏰ Itens parados com técnicos (${DIAS_PARADO}+ dias)</h3><span class="count-badge">${parados.length}</span><div class="spacer"></div>${parados.length?`<button class="btn sm" onclick="exportarParadosExcel()">📊 Exportar Excel</button><button class="btn sm" onclick="gerarRelatorioParados()">🖨️ Gerar relatório</button>`:''}</div>
   <div class="tbl-wrap">${
     parados.length? `<table><thead><tr><th>Nº Série</th><th>Tipo</th><th>Técnico</th><th>Filial</th><th>Há quanto tempo</th><th class="right">Ações</th></tr></thead><tbody>
       ${parados.map(e=>{ const t=DB.tecnicos.find(x=>x.id===e.tecnicoId); return `<tr>
@@ -513,6 +577,34 @@ function renderParados(){
     : `<div class="empty"><div class="big">✅</div>Nenhum item parado há ${DIAS_PARADO}+ dias. Tudo em dia!</div>`
   }</div></div>`;
 }
+function exportarParadosExcel(){
+  const parados = DB.equipamentos.filter(e=>e.status==='com_tecnico' && (diasEmPosse(e)||0)>=DIAS_PARADO)
+    .sort((a,b)=>(diasEmPosse(b)||0)-(diasEmPosse(a)||0));
+  if(window.__noXLSX||typeof XLSX==='undefined') return flash('Exportação para Excel indisponível (sem internet). Use "Gerar relatório" e imprima como PDF.','red');
+  const linhas = parados.map(e=>({ 'Nº Série':e.serie, 'Tipo':tipoNome(e.tipo), 'Técnico':tecNome(e.tecnicoId), 'Filial':e.deposito||'—', 'Dias parado':diasEmPosse(e)||0 }));
+  const ws = XLSX.utils.json_to_sheet(linhas.length?linhas:[{'Nº Série':'','Tipo':'','Técnico':'','Filial':'','Dias parado':'Nenhum item'}]);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Itens Parados');
+  XLSX.writeFile(wb, 'itens_parados_'+new Date().toISOString().slice(0,10)+'.xlsx');
+}
+function gerarRelatorioParados(){
+  const parados = DB.equipamentos.filter(e=>e.status==='com_tecnico' && (diasEmPosse(e)||0)>=DIAS_PARADO)
+    .sort((a,b)=>(diasEmPosse(b)||0)-(diasEmPosse(a)||0));
+  const hoje = new Date().toLocaleDateString('pt-BR')+' '+new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
+  const html=`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="utf-8"><title>Relatório de Itens Parados</title>
+    <style>body{font-family:Arial,sans-serif;max-width:820px;margin:30px auto;padding:0 24px;color:#111;font-size:13px;line-height:1.5}
+    h1{font-size:20px;margin-bottom:2px}h2{font-size:13px;font-weight:normal;color:#555;margin-bottom:20px}
+    table{width:100%;border-collapse:collapse;margin:8px 0}th,td{border:1px solid #ccc;padding:7px 9px;text-align:left;font-size:12px}th{background:#f0f0f0}
+    @media print{button{display:none}}</style></head><body>
+    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">🖨️ Imprimir / Salvar PDF</button>
+    <h1>Relatório de Itens Parados com Técnicos</h1>
+    <h2>${DIAS_PARADO}+ dias sem movimentação · ${parados.length} item(ns) · gerado em ${hoje}</h2>
+    <table><thead><tr><th>Nº Série</th><th>Tipo</th><th>Técnico</th><th>Filial</th><th>Dias parado</th></tr></thead><tbody>
+      ${parados.length? parados.map(e=>`<tr><td>${esc(e.serie)}</td><td>${esc(tipoNome(e.tipo))}</td><td>${esc(tecNome(e.tecnicoId))}</td><td>${esc(e.deposito||'—')}</td><td>${diasEmPosse(e)||0}</td></tr>`).join('') : '<tr><td colspan="5">Nenhum item parado.</td></tr>'}
+    </tbody></table>
+    </body></html>`;
+  const w=window.open('','_blank'); if(!w) return flash('Permita pop-ups para gerar o relatório','red'); w.document.write(html); w.document.close();
+}
 
 /* =========================================================
    ESTOQUE MÍNIMO POR FILIAL
@@ -522,11 +614,33 @@ function alertasEstoqueMinPorFilial(){
   const alertas = [];
   filiais.forEach(f=>{
     if(souSupervisor() && !regiaoPermitida(f)) return;
+    const idsTecs = DB.tecnicos.filter(t=>t.regiao===f).map(t=>t.id);
+    const nTecs = idsTecs.length;
+    if(!nTecs) return;
     Object.keys(DB.tipos).forEach(t=>{
-      const min = DB.tipos[t].min||0;
-      if(min>0){
-        const atual = DB.equipamentos.filter(e=>e.deposito===f && e.tipo===t && e.status==='estoque').length;
+      const minPorTecnico = DB.tipos[t].min||0;
+      if(minPorTecnico>0){
+        const min = minPorTecnico*nTecs;
+        const noDeposito = DB.equipamentos.filter(e=>e.deposito===f && e.tipo===t && e.status==='estoque').length;
+        const comTecnicos = DB.equipamentos.filter(e=>e.tipo===t && e.status==='com_tecnico' && idsTecs.includes(e.tecnicoId)).length;
+        const atual = noDeposito+comTecnicos;
         if(atual<min) alertas.push({filial:f, tipo:t, atual, min, deficit:min-atual});
+      }
+    });
+  });
+  return alertas.sort((a,b)=>b.deficit-a.deficit);
+}
+function alertasEstoqueMinPorTecnico(){
+  const alertas = [];
+  DB.tecnicos.forEach(t=>{
+    if(souSupervisor() && !regiaoPermitida(t.regiao)) return;
+    const itens = itensDoTecnico(t.id);
+    const porTipo={}; itens.forEach(e=>porTipo[e.tipo]=(porTipo[e.tipo]||0)+1);
+    Object.keys(DB.tipos).forEach(tp=>{
+      const min = DB.tipos[tp].min||0;
+      if(min>0){
+        const atual = porTipo[tp]||0;
+        if(atual<min) alertas.push({tecnico:t, tipo:tp, atual, min, deficit:min-atual});
       }
     });
   });
@@ -553,14 +667,52 @@ function verEstoqueTecnico(tecnicoId){
         <td class="center muted">—</td>
       </tr>`).join('')}
     </tbody></table></div>`,
-    `<button class="btn" onclick="closeModal()">Fechar</button><button class="btn primary" onclick="closeModal();fichaTecnico('${tecnicoId}')">Ver ficha completa →</button>`, 'lg');
+    `<button class="btn" onclick="exportarEstoqueMinTecnicoExcel('${tecnicoId}')">📊 Exportar Excel</button><button class="btn" onclick="gerarRelatorioEstoqueMinTecnico('${tecnicoId}')">🖨️ Gerar relatório</button><button class="btn" onclick="closeModal()">Fechar</button><button class="btn primary" onclick="closeModal();fichaTecnico('${tecnicoId}')">Ver ficha completa →</button>`, 'lg');
+}
+function exportarEstoqueMinTecnicoExcel(tecnicoId){
+  const t = DB.tecnicos.find(x=>x.id===tecnicoId); if(!t) return;
+  if(window.__noXLSX||typeof XLSX==='undefined') return flash('Exportação para Excel indisponível (sem internet). Use "Gerar relatório" e imprima como PDF.','red');
+  const itens = itensDoTecnico(tecnicoId);
+  const porTipo={}; itens.forEach(e=>porTipo[e.tipo]=(porTipo[e.tipo]||0)+1);
+  const tiposComMin = Object.keys(DB.tipos).filter(tp=>(DB.tipos[tp].min||0)>0);
+  const linhas = tiposComMin.map(tp=>{ const atual=porTipo[tp]||0; const min=DB.tipos[tp].min||0; return { 'Tipo':tipoNome(tp), 'Atual':atual, 'Mínimo':min, 'Faltam':Math.max(0,min-atual) }; });
+  const ws = XLSX.utils.json_to_sheet(linhas.length?linhas:[{'Tipo':'','Atual':'','Mínimo':'','Faltam':'Nenhum tipo com mínimo configurado'}]);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Estoque do Técnico');
+  XLSX.writeFile(wb, 'estoque_'+(t.nome||'tecnico').replace(/[^\w-]+/g,'_')+'_'+new Date().toISOString().slice(0,10)+'.xlsx');
+}
+function gerarRelatorioEstoqueMinTecnico(tecnicoId){
+  const t = DB.tecnicos.find(x=>x.id===tecnicoId); if(!t) return;
+  const itens = itensDoTecnico(tecnicoId);
+  const porTipo={}; itens.forEach(e=>porTipo[e.tipo]=(porTipo[e.tipo]||0)+1);
+  const tiposComMin = Object.keys(DB.tipos).filter(tp=>(DB.tipos[tp].min||0)>0);
+  const hoje = new Date().toLocaleDateString('pt-BR')+' '+new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
+  const html=`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="utf-8"><title>Relatório de Estoque do Técnico</title>
+    <style>body{font-family:Arial,sans-serif;max-width:820px;margin:30px auto;padding:0 24px;color:#111;font-size:13px;line-height:1.5}
+    h1{font-size:20px;margin-bottom:2px}h2{font-size:13px;font-weight:normal;color:#555;margin-bottom:20px}
+    table{width:100%;border-collapse:collapse;margin:8px 0}th,td{border:1px solid #ccc;padding:7px 9px;text-align:left;font-size:12px}th{background:#f0f0f0}
+    @media print{button{display:none}}</style></head><body>
+    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">🖨️ Imprimir / Salvar PDF</button>
+    <h1>Relatório de Estoque Mínimo por Técnico</h1>
+    <h2>👷 ${esc(t.nome)} · ${esc(t.regiao||'—')} · gerado em ${hoje}</h2>
+    <table><thead><tr><th>Tipo</th><th>Atual</th><th>Mínimo</th><th>Faltam</th></tr></thead><tbody>
+      ${tiposComMin.length? tiposComMin.map(tp=>{ const atual=porTipo[tp]||0; const min=DB.tipos[tp].min||0; const falta=Math.max(0,min-atual); return `<tr><td>${esc(tipoNome(tp))}</td><td>${atual}</td><td>${min}</td><td>${falta>0?falta:'✓'}</td></tr>`; }).join('') : '<tr><td colspan="4">Nenhum tipo com mínimo configurado.</td></tr>'}
+    </tbody></table>
+    </body></html>`;
+  const w=window.open('','_blank'); if(!w) return flash('Permita pop-ups para gerar o relatório','red'); w.document.write(html); w.document.close();
 }
 let estoqueMinFilial = '';
+let estoqueMinFilialTec = '';
 function renderEstoqueMinimo(){
   const todosAlertas = alertasEstoqueMinPorFilial();
   const filiaisAfetadas = [...new Set(todosAlertas.map(a=>a.filial))].sort();
   const alertas = estoqueMinFilial ? todosAlertas.filter(a=>a.filial===estoqueMinFilial) : todosAlertas;
   const temMinConfigurado = Object.values(DB.tipos).some(t=>(t.min||0)>0);
+  const todosAlertasTec = alertasEstoqueMinPorTecnico();
+  const filiaisAfetadasTec = [...new Set(todosAlertasTec.map(a=>a.tecnico.regiao).filter(Boolean))].sort();
+  if(estoqueMinFilialTec && !filiaisAfetadasTec.includes(estoqueMinFilialTec)) estoqueMinFilialTec='';
+  const alertasTec = estoqueMinFilialTec ? todosAlertasTec.filter(a=>a.tecnico.regiao===estoqueMinFilialTec) : todosAlertasTec;
+  const tecsComDeficit = new Set(todosAlertasTec.map(a=>a.tecnico.id));
   $('#content').innerHTML = `
   ${!temMinConfigurado?`<div class="panel" style="margin-bottom:18px;border-left:4px solid var(--amber)"><div class="pb">Nenhum tipo tem estoque mínimo configurado ainda. ${souAdmin()?'Vá em <b>Dados</b> e clique em "🎯 Aplicar estoque mínimo oficial", ou defina manualmente em <b>Tipos</b>.':'Peça para um administrador configurar.'}</div></div>`:''}
   <div class="grid kpis" style="margin-bottom:20px">
@@ -578,6 +730,8 @@ function renderEstoqueMinimo(){
       ${filiaisAfetadas.map(f=>{ const n=todosAlertas.filter(a=>a.filial===f).length; const on=estoqueMinFilial===f; return `
         <button class="${on?'active':''}" style="background:${on?'var(--brand)':'var(--panel-soft)'};color:${on?'#fff':'var(--txt)'};border-radius:9px" onclick="estoqueMinFilial=(estoqueMinFilial==='${esc(f)}')?'':'${esc(f)}';renderEstoqueMinimo()">${esc(f)} <span class="count-badge" style="background:${on?'rgba(255,255,255,.25)':'#e2e8f0'};color:inherit;margin-left:4px">${n}</span></button>`;}).join('')}
     </div>
+    <div class="spacer"></div>
+    <button class="btn sm" onclick="exportarEstoqueMinExcel()">📊 Exportar Excel</button><button class="btn sm" onclick="gerarRelatorioEstoqueMin()">🖨️ Gerar relatório</button>
   </div></div>`:''}
   ${alertas.length?`
   <div class="chart-row" style="margin-bottom:20px">
@@ -627,24 +781,99 @@ function renderEstoqueMinimo(){
         return `<div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(260px,1fr))">${tecs.map(t=>{
           const itens = itensDoTecnico(t.id);
           const porTipo={}; itens.forEach(e=>porTipo[e.tipo]=(porTipo[e.tipo]||0)+1);
-          return `<div class="panel" style="box-shadow:none;cursor:pointer" onclick="verEstoqueTecnico('${t.id}')"><div class="pb">
-            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px"><b>${esc(t.nome)}</b><span class="count-badge" style="margin-left:auto">${itens.length}</span></div>
+          const abaixoDoMin = tecsComDeficit.has(t.id);
+          return `<div class="panel" style="box-shadow:none;cursor:pointer${abaixoDoMin?';border-color:var(--red)':''}" onclick="verEstoqueTecnico('${t.id}')"><div class="pb">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px"><b>${esc(t.nome)}</b>${abaixoDoMin?'<span class="badge baixado" style="font-size:10px">⚠️ pessoal baixo</span>':''}<span class="count-badge" style="margin-left:auto">${itens.length}</span></div>
             <div style="display:flex;gap:6px;flex-wrap:wrap">${Object.keys(porTipo).length?Object.entries(porTipo).sort((a,b)=>b[1]-a[1]).map(([tp,n])=>`<span class="tag-tipo" style="border-left:3px solid ${tipoCor(tp)};font-size:11px">${esc(tipoNome(tp))}: ${n}</span>`).join(''):'<span class="muted" style="font-size:12px">Nenhum item</span>'}</div>
           </div></div>`;}).join('')}</div>`; })()}
     </div>
   </div>`:''}
-  <div class="panel"><div class="ph"><h3>⚠️ Abaixo do estoque mínimo</h3><span class="count-badge">${alertas.length}</span></div>
-    <div class="tbl-wrap">${
-      alertas.length? `<table><thead><tr><th>Filial</th><th>Tipo</th><th class="center">Atual</th><th class="center">Mínimo</th><th class="center">Faltam</th></tr></thead><tbody>
-        ${alertas.map(a=>`<tr>
-          <td><b>${esc(a.filial)}</b></td>
-          <td><span class="tag-tipo" style="border-left:3px solid ${tipoCor(a.tipo)}">${esc(tipoNome(a.tipo))}</span></td>
-          <td class="center">${a.atual}</td>
-          <td class="center muted">${a.min}</td>
-          <td class="center"><b style="color:var(--red)">${a.deficit}</b></td>
-        </tr>`).join('')}</tbody></table>`
-      : `<div class="empty"><div class="big">✅</div>Nenhuma filial abaixo do mínimo. Tudo em dia!</div>`
-    }</div></div>`;
+  ${todosAlertasTec.length?`
+  <div class="panel" style="margin-bottom:18px;border-left:4px solid var(--red)"><div class="ph"><h3>👷⚠️ Técnicos abaixo do mínimo pessoal</h3><span class="count-badge">${new Set(alertasTec.map(a=>a.tecnico.id)).size}</span><div class="spacer"></div>${alertasTec.length?`<button class="btn sm" onclick="exportarEstoqueMinTecExcel()">📊 Exportar Excel</button><button class="btn sm" onclick="gerarRelatorioEstoqueMinTec()">🖨️ Gerar relatório</button>`:''}</div>
+    <p class="muted" style="margin:0 12px 8px">Mesmo quando a filial no total está OK, um técnico específico pode estar com menos do que devia carregar.</p>
+    <div class="pb" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding-top:0">
+      <span style="font-weight:700;font-size:12.5px;color:var(--txt-soft)">🏢 FILTRAR POR FILIAL</span>
+      <div class="pill-tabs" style="flex-wrap:wrap;background:transparent;padding:0;gap:8px">
+        <button class="${!estoqueMinFilialTec?'active':''}" style="background:${!estoqueMinFilialTec?'var(--brand)':'var(--panel-soft)'};color:${!estoqueMinFilialTec?'#fff':'var(--txt)'};border-radius:9px" onclick="estoqueMinFilialTec='';renderEstoqueMinimo()">Todas <span class="count-badge" style="background:rgba(255,255,255,.25);color:inherit;margin-left:4px">${new Set(todosAlertasTec.map(a=>a.tecnico.id)).size}</span></button>
+        ${filiaisAfetadasTec.map(f=>{ const n=new Set(todosAlertasTec.filter(a=>a.tecnico.regiao===f).map(a=>a.tecnico.id)).size; const on=estoqueMinFilialTec===f; return `
+          <button class="${on?'active':''}" style="background:${on?'var(--brand)':'var(--panel-soft)'};color:${on?'#fff':'var(--txt)'};border-radius:9px" onclick="estoqueMinFilialTec=(estoqueMinFilialTec==='${esc(f)}')?'':'${esc(f)}';renderEstoqueMinimo()">${esc(f)} <span class="count-badge" style="background:${on?'rgba(255,255,255,.25)':'#e2e8f0'};color:inherit;margin-left:4px">${n}</span></button>`;}).join('')}
+      </div>
+    </div>
+    <div class="tbl-wrap"><table><thead><tr><th>Técnico</th><th>Filial</th><th>O que falta</th><th class="center">Itens faltando</th></tr></thead><tbody>${(()=>{
+      const porTec = {};
+      alertasTec.forEach(a=>{ (porTec[a.tecnico.id]=porTec[a.tecnico.id]||{tecnico:a.tecnico, itens:[]}).itens.push(a); });
+      const linhas = Object.values(porTec).sort((a,b)=>b.itens.reduce((s,i)=>s+i.deficit,0)-a.itens.reduce((s,i)=>s+i.deficit,0));
+      return linhas.map(l=>`<tr style="cursor:pointer" onclick="verEstoqueTecnico('${l.tecnico.id}')">
+        <td><b>${esc(l.tecnico.nome)}</b></td>
+        <td>${esc(l.tecnico.regiao||'—')}</td>
+        <td><div style="display:flex;gap:6px;flex-wrap:wrap">${l.itens.map(a=>`<span class="tag-tipo" style="border-left:3px solid ${tipoCor(a.tipo)}">${esc(tipoNome(a.tipo))}: faltam ${a.deficit}</span>`).join('')}</div></td>
+        <td class="center"><b style="color:var(--red)">${l.itens.reduce((s,i)=>s+i.deficit,0)}</b></td>
+      </tr>`).join('');
+    })()}</tbody></table></div>
+  </div>`:''}`;
+}
+function exportarEstoqueMinExcel(){
+  const todosAlertas = alertasEstoqueMinPorFilial();
+  const alertas = estoqueMinFilial ? todosAlertas.filter(a=>a.filial===estoqueMinFilial) : todosAlertas;
+  if(window.__noXLSX||typeof XLSX==='undefined') return flash('Exportação para Excel indisponível (sem internet). Use "Gerar relatório" e imprima como PDF.','red');
+  const linhas = alertas.map(a=>({ 'Filial':a.filial, 'Tipo':tipoNome(a.tipo), 'Atual':a.atual, 'Mínimo':a.min, 'Faltam':a.deficit }));
+  const ws = XLSX.utils.json_to_sheet(linhas.length?linhas:[{'Filial':'','Tipo':'','Atual':'','Mínimo':'','Faltam':'Nenhum item'}]);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Estoque Mínimo');
+  XLSX.writeFile(wb, 'estoque_minimo_'+(estoqueMinFilial||'todas_filiais').replace(/[^\w-]+/g,'_')+'_'+new Date().toISOString().slice(0,10)+'.xlsx');
+}
+function gerarRelatorioEstoqueMin(){
+  const todosAlertas = alertasEstoqueMinPorFilial();
+  const alertas = estoqueMinFilial ? todosAlertas.filter(a=>a.filial===estoqueMinFilial) : todosAlertas;
+  const titulo = estoqueMinFilial ? 'Filial '+estoqueMinFilial : 'Todas as filiais afetadas';
+  const hoje = new Date().toLocaleDateString('pt-BR')+' '+new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
+  const html=`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="utf-8"><title>Relatório de Estoque Mínimo</title>
+    <style>body{font-family:Arial,sans-serif;max-width:820px;margin:30px auto;padding:0 24px;color:#111;font-size:13px;line-height:1.5}
+    h1{font-size:20px;margin-bottom:2px}h2{font-size:13px;font-weight:normal;color:#555;margin-bottom:20px}
+    table{width:100%;border-collapse:collapse;margin:8px 0}th,td{border:1px solid #ccc;padding:7px 9px;text-align:left;font-size:12px}th{background:#f0f0f0}
+    @media print{button{display:none}}</style></head><body>
+    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">🖨️ Imprimir / Salvar PDF</button>
+    <h1>Relatório de Estoque Mínimo por Filial</h1>
+    <h2>${esc(titulo)} · ${alertas.length} item(ns) em falta · gerado em ${hoje}</h2>
+    <table><thead><tr><th>Filial</th><th>Tipo</th><th>Atual</th><th>Mínimo</th><th>Faltam</th></tr></thead><tbody>
+      ${alertas.length? alertas.map(a=>`<tr><td>${esc(a.filial)}</td><td>${esc(tipoNome(a.tipo))}</td><td>${a.atual}</td><td>${a.min}</td><td>${a.deficit}</td></tr>`).join('') : '<tr><td colspan="5">Nenhuma filial abaixo do mínimo.</td></tr>'}
+    </tbody></table>
+    </body></html>`;
+  const w=window.open('','_blank'); if(!w) return flash('Permita pop-ups para gerar o relatório','red'); w.document.write(html); w.document.close();
+}
+function exportarEstoqueMinTecExcel(){
+  const todosAlertasTec = alertasEstoqueMinPorTecnico();
+  const alertasTec = estoqueMinFilialTec ? todosAlertasTec.filter(a=>a.tecnico.regiao===estoqueMinFilialTec) : todosAlertasTec;
+  if(window.__noXLSX||typeof XLSX==='undefined') return flash('Exportação para Excel indisponível (sem internet). Use "Gerar relatório" e imprima como PDF.','red');
+  const linhas = alertasTec.map(a=>({ 'Técnico':a.tecnico.nome, 'Filial':a.tecnico.regiao||'—', 'Tipo':tipoNome(a.tipo), 'Atual':a.atual, 'Mínimo':a.min, 'Faltam':a.deficit }));
+  const ws = XLSX.utils.json_to_sheet(linhas.length?linhas:[{'Técnico':'','Filial':'','Tipo':'','Atual':'','Mínimo':'','Faltam':'Nenhum item'}]);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Mínimo por Técnico');
+  XLSX.writeFile(wb, 'estoque_minimo_tecnicos_'+(estoqueMinFilialTec||'todas_filiais').replace(/[^\w-]+/g,'_')+'_'+new Date().toISOString().slice(0,10)+'.xlsx');
+}
+function gerarRelatorioEstoqueMinTec(){
+  const todosAlertasTec = alertasEstoqueMinPorTecnico();
+  const alertasTec = estoqueMinFilialTec ? todosAlertasTec.filter(a=>a.tecnico.regiao===estoqueMinFilialTec) : todosAlertasTec;
+  const titulo = estoqueMinFilialTec ? 'Filial '+estoqueMinFilialTec : 'Todas as filiais afetadas';
+  const hoje = new Date().toLocaleDateString('pt-BR')+' '+new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
+  const porTec = {}; alertasTec.forEach(a=>{ (porTec[a.tecnico.id]=porTec[a.tecnico.id]||{tecnico:a.tecnico, itens:[]}).itens.push(a); });
+  const linhas = Object.values(porTec).sort((a,b)=>b.itens.reduce((s,i)=>s+i.deficit,0)-a.itens.reduce((s,i)=>s+i.deficit,0));
+  const html=`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="utf-8"><title>Relatório de Técnicos Abaixo do Mínimo</title>
+    <style>body{font-family:Arial,sans-serif;max-width:820px;margin:30px auto;padding:0 24px;color:#111;font-size:13px;line-height:1.5}
+    h1{font-size:20px;margin-bottom:2px}h2{font-size:13px;font-weight:normal;color:#555;margin-bottom:20px}
+    h3{font-size:14px;margin:22px 0 8px;border-bottom:2px solid #dc2626;padding-bottom:4px}
+    table{width:100%;border-collapse:collapse;margin:8px 0}th,td{border:1px solid #ccc;padding:7px 9px;text-align:left;font-size:12px}th{background:#f0f0f0}
+    @media print{button{display:none}}</style></head><body>
+    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">🖨️ Imprimir / Salvar PDF</button>
+    <h1>Relatório de Técnicos Abaixo do Mínimo Pessoal</h1>
+    <h2>${esc(titulo)} · ${linhas.length} técnico(s) · gerado em ${hoje}</h2>
+    ${linhas.length? linhas.map(l=>`
+      <h3>👷 ${esc(l.tecnico.nome)} — ${esc(l.tecnico.regiao||'—')}</h3>
+      <table><thead><tr><th>Tipo</th><th>Atual</th><th>Mínimo</th><th>Faltam</th></tr></thead><tbody>
+        ${l.itens.map(a=>`<tr><td>${esc(tipoNome(a.tipo))}</td><td>${a.atual}</td><td>${a.min}</td><td>${a.deficit}</td></tr>`).join('')}
+      </tbody></table>`).join('') : '<p>Nenhum técnico abaixo do mínimo.</p>'}
+    </body></html>`;
+  const w=window.open('','_blank'); if(!w) return flash('Permita pop-ups para gerar o relatório','red'); w.document.write(html); w.document.close();
 }
 
 /* =========================================================
@@ -910,20 +1139,33 @@ function abrirPendentesConfirmacao(){
   modal('⏳ Aguardando confirmação do técnico', `<div id="pendConfBody"></div>`, `<button class="btn" onclick="gerarRelatorioPendentes()">🖨️ Gerar relatório</button><button class="btn" onclick="closeModal()">Fechar</button>`, 'lg');
   renderPendentesConfirmacaoBody();
 }
-function gruposPendentesFiltrados(){
-  const pendentes = pendentesConfirmacaoLista();
-  const porDestino = {};
-  pendentes.forEach(e=>{ (porDestino[e.transitoPara]=porDestino[e.transitoPara]||[]).push(e); });
+function sincronizarFiltrosPendentes(porDestino){
   const filiaisComPendencia = [...new Set(Object.keys(porDestino).map(id=>{ const t=DB.tecnicos.find(x=>x.id===id); return t?t.regiao:null; }).filter(Boolean))].sort();
   if(pendConfFilial && !filiaisComPendencia.includes(pendConfFilial)) pendConfFilial='';
   const tecsComPendencia = Object.keys(porDestino).map(id=>DB.tecnicos.find(x=>x.id===id)).filter(Boolean)
     .filter(t=>!pendConfFilial||t.regiao===pendConfFilial);
   if(pendConfTec && !tecsComPendencia.some(t=>t.id===pendConfTec)) pendConfTec='';
+  return { filiaisComPendencia, tecsComPendencia };
+}
+function calcularGruposPendentes(){
+  const pendentes = pendentesConfirmacaoLista();
+  const porDestino = {};
+  pendentes.forEach(e=>{ (porDestino[e.transitoPara]=porDestino[e.transitoPara]||[]).push(e); });
+  const filiaisComPendencia = [...new Set(Object.keys(porDestino).map(id=>{ const t=DB.tecnicos.find(x=>x.id===id); return t?t.regiao:null; }).filter(Boolean))].sort();
+  const tecsComPendencia = Object.keys(porDestino).map(id=>DB.tecnicos.find(x=>x.id===id)).filter(Boolean)
+    .filter(t=>!pendConfFilial||t.regiao===pendConfFilial);
   let grupos = Object.entries(porDestino);
   if(pendConfTec) grupos = grupos.filter(([id])=>id===pendConfTec);
   else if(pendConfFilial) grupos = grupos.filter(([id])=>{ const t=DB.tecnicos.find(x=>x.id===id); return t&&t.regiao===pendConfFilial; });
   grupos = grupos.sort((a,b)=>b[1].length-a[1].length);
-  return { grupos, filiaisComPendencia, tecsComPendencia };
+  return { grupos, porDestino, filiaisComPendencia, tecsComPendencia };
+}
+// Só a tela de confirmação (dono dos filtros pendConfFilial/pendConfTec) pode corrigi-los;
+// outros leitores (ex.: relatório) usam calcularGruposPendentes() sem alterar o filtro global.
+function gruposPendentesFiltrados(){
+  const { porDestino } = calcularGruposPendentes();
+  sincronizarFiltrosPendentes(porDestino);
+  return calcularGruposPendentes();
 }
 function renderPendentesConfirmacaoBody(){
   const { grupos, filiaisComPendencia, tecsComPendencia } = gruposPendentesFiltrados();
@@ -962,7 +1204,7 @@ function renderPendentesConfirmacaoBody(){
     }</div>`;
 }
 function gerarRelatorioPendentes(){
-  const { grupos } = gruposPendentesFiltrados();
+  const { grupos } = calcularGruposPendentes();
   const totalItens = grupos.reduce((s,[,l])=>s+l.length,0);
   const titulo = pendConfTec ? tecNome(pendConfTec) : (pendConfFilial ? 'Filial '+pendConfFilial : 'Todas as pendências');
   const hoje = new Date().toLocaleDateString('pt-BR')+' '+new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
@@ -1190,11 +1432,10 @@ function renderTipos(){
   <div class="pb">
     <p class="muted" style="margin-bottom:16px">Dê um nome amigável a cada código (ex.: <b>UBI.0001 → "Sirene"</b>). Os nomes aparecem em todo o dashboard.</p>
     ${cods.length? `<div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(260px,1fr))">
-      ${cods.map(c=>{ const n=DB.equipamentos.filter(e=>e.tipo===c).length; const emEst=DB.equipamentos.filter(e=>e.tipo===c&&e.status==='estoque').length; const min=DB.tipos[c].min||0; const baixo=min>0&&emEst<min; return `
-        <div class="panel" style="box-shadow:none;${baixo?'border-color:var(--red)':''}"><div class="pb" style="display:flex;align-items:center;gap:12px">
+      ${cods.map(c=>{ const n=DB.equipamentos.filter(e=>e.tipo===c).length; const emEst=DB.equipamentos.filter(e=>e.tipo===c&&e.status==='estoque').length; const min=DB.tipos[c].min||0; return `
+        <div class="panel" style="box-shadow:none"><div class="pb" style="display:flex;align-items:center;gap:12px">
           <span style="width:14px;height:14px;border-radius:4px;background:${tipoCor(c)};flex-shrink:0"></span>
-          <div style="flex:1"><div style="font-weight:700">${esc(tipoNome(c))}</div><div class="mono muted" style="font-size:12px">${esc(c)} · ${n} itens · ${emEst} em estoque${min>0?` · mín ${min}`:''}</div></div>
-          ${baixo?'<span class="badge baixado" style="font-size:10px">baixo</span>':''}
+          <div style="flex:1"><div style="font-weight:700">${esc(tipoNome(c))}</div><div class="mono muted" style="font-size:12px">${esc(c)} · ${n} itens · ${emEst} em estoque${min>0?` · mín/técnico ${min}`:''}</div></div>
           <button class="btn sm ghost" onclick="openTipo('${esc(c)}')">✏️</button>
         </div></div>`;}).join('')}
     </div>`: `<div class="empty">Nenhum tipo. Importe dados ou adicione manualmente.</div>`}
@@ -1206,12 +1447,15 @@ function renderTipos(){
    ========================================================= */
 function renderFiliais(){
   const filiais = todasFiliaisConhecidas();
+  const todosAlertasMin = alertasEstoqueMinPorFilial();
+  const alertasPorFilial = {};
+  todosAlertasMin.forEach(a=>{ alertasPorFilial[a.filial]=(alertasPorFilial[a.filial]||0)+1; });
   $('#content').innerHTML = `
   <div class="panel"><div class="ph"><h3>🏢 Filiais / Depósitos</h3><div class="spacer"></div><button class="btn sm primary" onclick="openFilial()">＋ Adicionar filial</button></div>
   <div class="pb">
     <p class="muted" style="margin-bottom:16px">Cadastre uma filial mesmo antes dela ter equipamentos ou técnicos — assim ela já aparece nos filtros e telas do sistema.</p>
     ${filiais.length? `<div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(220px,1fr))">
-      ${filiais.map(f=>{ const n=DB.equipamentos.filter(e=>e.deposito===f).length; const tecs=DB.tecnicos.filter(t=>t.regiao===f).length; const alertas=alertasEstoqueMinPorFilial().filter(a=>a.filial===f).length; return `
+      ${filiais.map(f=>{ const n=DB.equipamentos.filter(e=>e.deposito===f).length; const tecs=DB.tecnicos.filter(t=>t.regiao===f).length; const alertas=alertasPorFilial[f]||0; return `
       <div class="panel" style="box-shadow:none;cursor:pointer" onclick="abrirFilial('${esc(f)}')"><div class="pb">
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px"><div style="font-weight:700;font-size:15px">${esc(f)}</div>${alertas?`<span class="badge baixado" style="font-size:10px;margin-left:auto">⚠️ ${alertas}</span>`:''}</div>
         <div class="muted" style="font-size:12px">${n} equipamento(s) · ${tecs} técnico(s)</div>
@@ -1287,7 +1531,7 @@ function renderDados(){
 
   ${souAdmin()?`<div class="panel" style="margin-top:18px;border-left:4px solid var(--red)"><div class="pb">
     <b>🚑 Correção urgente de sincronização</b>
-    <p class="muted" style="margin:6px 0 12px">Se aparecer erro de "documento muito grande" ao movimentar itens, clique aqui uma vez para migrar o histórico de movimentações para um armazenamento sem limite de tamanho.</p>
+    <p class="muted" style="margin:6px 0 12px">Se aparecer erro de "documento muito grande" ao movimentar itens, clique aqui uma vez para migrar o histórico de movimentações, auditorias e os equipamentos para um armazenamento sem limite de tamanho.</p>
     <button class="btn red" onclick="migrarHistoricoParaColecao()">🚑 Corrigir armazenamento (migrar histórico)</button>
   </div></div>`:''}
   <div class="panel" style="margin-top:18px"><div class="ph"><h3>💾 Backup & compartilhamento</h3></div><div class="pb">
@@ -1300,6 +1544,8 @@ function renderDados(){
       ${souAdmin()?`<button class="btn" onclick="corrigirTiposPorSerie()">🔎 Corrigir tipos pelo padrão do código</button>`:''}
       ${souAdmin()?`<button class="btn" onclick="aplicarMinimosOficiais()">🎯 Aplicar estoque mínimo oficial</button>`:''}
       ${souAdmin()?`<button class="btn" onclick="distribuirEquipamentosTeste()">🧪 Distribuir equipamentos entre técnicos (teste)</button>`:''}
+      ${souAdmin()?`<button class="btn" onclick="gerarCenarioTesteCompleto()">🎲 Gerar cenário de teste completo</button>`:''}
+      ${souAdmin()?`<button class="btn" onclick="reverterCenarioTeste()">↩️ Devolver tudo ao estoque</button>`:''}
       <button class="btn red" onclick="limparTudo()">🗑️ Apagar tudo</button>
     </div>
     <div class="field" style="margin-top:18px;max-width:340px"><label>Seu nome (registrado nas movimentações)</label>
@@ -1528,7 +1774,8 @@ function desenharMov(){
         <input id="movOS" inputmode="numeric" maxlength="6" placeholder="Ex.: 123456" oninput="this.value=this.value.replace(/\\D/g,'').slice(0,6)">
         <div class="hint">Exatamente 6 números.</div>
       </div>`:''}
-    ${movTipo==='entrada'? `<div class="field"><label>Depósito de destino</label><input id="movDep" list="listaFiliais" placeholder="Ex.: CAS"><datalist id="listaFiliais">${todasFiliaisConhecidas().map(f=>`<option value="${esc(f)}">`).join('')}</datalist></div>`:''}
+    ${movTipo==='entrada'? `<div class="field"><label>Depósito de destino</label><input id="movDep" list="listaFiliais" placeholder="Ex.: CAS"><datalist id="listaFiliais">${todasFiliaisConhecidas().map(f=>`<option value="${esc(f)}">`).join('')}</datalist>
+      <div class="hint">Só funciona para equipamento que <b>já existe</b> no sistema (com técnico ou baixado, retornando ao estoque). Pra cadastrar um equipamento novo, use <b>Equipamentos → ＋ Adicionar</b>.</div></div>`:''}
     ${movTipo==='baixa'? `<div class="field"><label>Motivo do envio para RMA</label><input id="movMotivo" placeholder="Ex.: Defeito, garantia, devolução ao fabricante..."></div>`:''}
 
     <div class="field"><label>Observação${movTipo==='transferencia'?' *':''}</label><input id="movObs" placeholder="${movTipo==='transferencia'?'Obrigatório':'Opcional'}"></div>
@@ -1563,7 +1810,7 @@ function filtrarPickMov(q){
       <input type="checkbox" style="pointer-events:none">
       <div style="flex:1"><span class="mono"><b>${esc(e.serie)}</b></span> <span class="tag-tipo" style="font-size:11px">${esc(tipoNome(e.tipo))}</span></div>
       <span class="badge ${e.status}" style="font-size:10.5px">${e.status==='com_tecnico'?esc(tecNome(e.tecnicoId)):STATUS[e.status]}</span>
-    </div>`).join('') : `<div class="muted center" style="padding:18px">Nenhum item disponível para esta movimentação.</div>`;
+    </div>`).join('') : `<div class="muted center" style="padding:18px">${movTipo==='entrada'?'Nenhum equipamento com técnico ou baixado encontrado. Equipamento genuinamente novo deve ser cadastrado em Equipamentos → ＋ Adicionar.':'Nenhum item disponível para esta movimentação.'}</div>`;
 }
 function addMovSerie(serie){ if(!movSel.includes(serie)){ movSel.push(serie); renderMovChips(); filtrarPickMov($('#movBusca').value);} }
 function addMovSerieBusca(){
@@ -1625,9 +1872,10 @@ function confirmarMov(){
     e.desde = Date.now();
     const motivo = movTipo==='baixa' && $('#movMotivo')? $('#movMotivo').value.trim() : '';
     const tecIdMov = movTipo==='baixa' ? tecnicoAnterior : tecId;
+    const tecnicoIdOrigem = movTipo==='transferencia' ? (tecnicoAnterior||null) : null;
     const paraTxt = (movTipo==='saida'||movTipo==='transferencia') ? destinoTxt+' (aguardando confirmação)' : destinoTxt;
     const obsFinal = movTipo==='baixa' ? ['OS '+numeroOS,obs,motivo].filter(Boolean).join(' · ') : [obs,motivo].filter(Boolean).join(' · ');
-    registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:movTipo, serie, de, para:paraTxt, tecnicoId:tecIdMov, usuario, obs:obsFinal, os:numeroOS });
+    registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:movTipo, serie, de, para:paraTxt, tecnicoId:tecIdMov, tecnicoIdOrigem, usuario, obs:obsFinal, os:numeroOS });
     n++;
   });
   salvar(); closeModal(); render(); flash(`✅ ${n} ${n===1?'movimentação registrada':'movimentações registradas'}`+((movTipo==='saida'||movTipo==='transferencia')?' — aguardando confirmação do técnico':''),'green');
@@ -1726,7 +1974,7 @@ function relatorioFilial(){
   const porTipo={}; eq.forEach(e=>porTipo[e.tipo]=(porTipo[e.tipo]||0)+1);
   const porTec={}; eq.filter(e=>e.status==='com_tecnico').forEach(e=>{ const n=tecNome(e.tecnicoId); porTec[n]=(porTec[n]||0)+1; });
   const parados = eq.filter(e=>e.status==='com_tecnico'&&(diasEmPosse(e)||0)>=DIAS_PARADO);
-  const alertasMin = estoqueMinAlertas(eq);
+  const alertasMin = dashFiliais.length ? alertasEstoqueMinPorFilial().filter(a=>dashFiliais.includes(a.filial)) : alertasEstoqueMinPorFilial();
   const hoje = new Date().toLocaleDateString('pt-BR')+' '+new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
   const linha=(l,v,cor)=>`<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #eee"><span>${l}</span><b style="color:${cor||'#111'}">${v}</b></div>`;
   const html=`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="utf-8"><title>Relatório — ${esc(titulo)}</title>
@@ -1752,7 +2000,7 @@ function relatorioFilial(){
     ${Object.keys(porTipo).length?Object.entries(porTipo).sort((a,b)=>b[1]-a[1]).map(([t,n])=>linha(esc(tipoNome(t)),n)).join(''):'<i>Sem dados.</i>'}
     <h3>Itens por técnico (em posse)</h3>
     ${Object.keys(porTec).length?Object.entries(porTec).sort((a,b)=>b[1]-a[1]).map(([t,n])=>linha(esc(t),n)).join(''):'<i>Nenhum item com técnico.</i>'}
-    ${alertasMin.length?`<h3>⚠️ Alertas de estoque mínimo</h3>${alertasMin.map(a=>linha(esc(tipoNome(a.tipo)),a.atual+' / mín. '+a.min,'#dc2626')).join('')}`:''}
+    ${alertasMin.length?`<h3>⚠️ Alertas de estoque mínimo</h3>${alertasMin.map(a=>linha(esc(a.filial)+' — '+esc(tipoNome(a.tipo)),a.atual+' / mín. '+a.min,'#dc2626')).join('')}`:''}
     ${parados.length?`<h3>⏰ Itens parados (${DIAS_PARADO}+ dias)</h3><table><thead><tr><th>Nº Série</th><th>Tipo</th><th>Técnico</th><th>Dias</th></tr></thead><tbody>
       ${parados.map(e=>`<tr><td>${esc(e.serie)}</td><td>${esc(tipoNome(e.tipo))}</td><td>${esc(tecNome(e.tecnicoId))}</td><td>${diasEmPosse(e)}</td></tr>`).join('')}
     </tbody></table>`:''}
@@ -1767,23 +2015,27 @@ function importarBackup(input){
       const d=JSON.parse(e.target.result); if(!d.equipamentos) throw 0;
       if(!confirm('Substituir TODOS os dados atuais pelo backup?')) return;
       const movsBackup = d.movimentacoes||[];
+      const audsBackup = d.auditorias||[];
       DB=Object.assign(estadoInicial(),d); salvar(); render(); renderNav();
-      flash('Restaurando histórico de movimentações...','green');
-      await limparColecaoMovimentacoes();
-      await gravarMovimentacoesEmLote(movsBackup);
+      flash('Restaurando histórico, auditorias e equipamentos...','green');
+      await limparColecao(MOVS_REF);
+      await gravarEmLote(MOVS_REF, movsBackup);
+      await limparColecao(AUDS_REF);
+      await gravarEmLote(AUDS_REF, audsBackup);
       flash('✅ Backup restaurado','green');
     }catch(err){ flash('Arquivo de backup inválido: '+err.message,'red'); }
   }; r.readAsText(f); input.value='';
 }
-async function gravarMovimentacoesEmLote(lista){
+async function gravarEmLote(ref, lista, chave){
+  chave = chave || (m=>m.id);
   for(let i=0;i<lista.length;i+=400){
     const batch = window.firestoreDB.batch();
-    lista.slice(i,i+400).forEach(m=>batch.set(MOVS_REF.doc(m.id), m));
+    lista.slice(i,i+400).forEach(m=>batch.set(ref.doc(chave(m)), m));
     await batch.commit();
   }
 }
-async function limparColecaoMovimentacoes(){
-  const snap = await MOVS_REF.get();
+async function limparColecao(ref){
+  const snap = await ref.get();
   const docs = snap.docs;
   for(let i=0;i<docs.length;i+=400){
     const batch = window.firestoreDB.batch();
@@ -1793,14 +2045,17 @@ async function limparColecaoMovimentacoes(){
 }
 async function migrarHistoricoParaColecao(){
   if(!souAdmin()) return flash('Somente administradores podem fazer isso','red');
-  if(!confirm('Isso corrige o erro de "documento muito grande": move todo o histórico de movimentações (que está travado no navegador atual) para um armazenamento sem limite de tamanho. Pode levar alguns segundos. Continuar?')) return;
+  if(!confirm('Isso corrige o erro de "documento muito grande": move todo o histórico de movimentações, auditorias e os equipamentos (que estão travados no navegador atual) para um armazenamento sem limite de tamanho. Pode levar alguns segundos. Continuar?')) return;
   flash('Migrando histórico, aguarde...','green');
   try{
-    await gravarMovimentacoesEmLote(DB.movimentacoes);
+    await gravarEmLote(MOVS_REF, DB.movimentacoes);
+    await gravarEmLote(AUDS_REF, DB.auditorias);
+    await gravarEmLote(EQUIPS_REF, DB.equipamentos, e=>e.serie);
+    DB.equipamentos.forEach(e=>{ ultimoSyncEquip[e.serie]=JSON.stringify(e); });
     await new Promise(r=>setTimeout(r,500));
-    const { movimentacoes, ...semMovs } = DB;
+    const { movimentacoes, auditorias, equipamentos, ...semMovs } = DB;
     await DOC_REF.set(semMovs);
-    flash(`✅ Migração concluída! ${DB.movimentacoes.length} movimentação(ões) migrada(s). Sincronização corrigida.`,'green');
+    flash(`✅ Migração concluída! ${DB.movimentacoes.length} movimentação(ões), ${DB.auditorias.length} auditoria(s) e ${DB.equipamentos.length} equipamento(s) migrado(s). Sincronização corrigida.`,'green');
   }catch(err){
     flash('⚠️ Erro na migração: '+err.message,'red');
   }
@@ -1862,10 +2117,55 @@ function distribuirEquipamentosTeste(){
   });
   salvar(); render(); flash(`✅ ${n} equipamento(s) distribuído(s) entre técnicos (dados de teste)`,'green');
 }
+function gerarCenarioTesteCompleto(){
+  if(!souAdmin()) return flash('Somente administradores podem fazer isso','red');
+  if(!confirm('Isso vai MEXER nos equipamentos reais cadastrados (só nos tipos com mínimo: Controle, Magnetico, Sirene, Foto, Modulo): vai distribuir quantidades aleatórias entre os técnicos, deixar algumas filiais de propósito abaixo do mínimo, e mandar uma parte pra RMA — só para você visualizar as telas. Depois dá pra desfazer no botão "↩️ Devolver tudo ao estoque". Continuar?')) return;
+  const tiposComMin = Object.keys(DB.tipos).filter(tp=>(DB.tipos[tp].min||0)>0);
+  const filiais = todasFiliaisConhecidas();
+  let nTec=0, nRma=0;
+  filiais.forEach(f=>{
+    const tecs = DB.tecnicos.filter(t=>t.regiao===f);
+    if(!tecs.length) return;
+    const deixarBaixo = Math.random()<0.4;
+    tiposComMin.forEach(tp=>{
+      let itens = DB.equipamentos.filter(e=>e.deposito===f && e.tipo===tp && e.status==='estoque');
+      if(!itens.length) return;
+      itens = itens.slice().sort(()=>Math.random()-0.5);
+      const qtdRma = Math.min(itens.length, Math.floor(Math.random()*3));
+      for(let i=0;i<qtdRma;i++){
+        const e = itens.pop();
+        e.status='baixado'; e.tecnicoId=null; e.local='RMA'; e.confirmado=true; e.emTransito=false;
+        e.rmaTecnicoId=null; e.rmaDeposito=e.deposito||null; e.rmaDesde=Date.now(); e.rmaOS='TESTE';
+        e.cenarioTeste=true; nRma++;
+      }
+      const maxDistribuir = deixarBaixo ? Math.floor(itens.length*0.3) : itens.length;
+      const qtdDistribuir = Math.floor(Math.random()*(maxDistribuir+1));
+      for(let i=0;i<qtdDistribuir;i++){
+        const e = itens[i];
+        const tec = tecs[Math.floor(Math.random()*tecs.length)];
+        e.status='com_tecnico'; e.tecnicoId=tec.id; e.local=tecNome(tec.id); e.confirmado=true; e.emTransito=false; e.desde=Date.now();
+        e.cenarioTeste=true; nTec++;
+      }
+    });
+  });
+  salvar(); render(); flash(`✅ Cenário de teste gerado: ${nTec} equipamento(s) com técnicos, ${nRma} em RMA`,'green');
+}
+function reverterCenarioTeste(){
+  if(!souAdmin()) return flash('Somente administradores podem fazer isso','red');
+  const afetados = DB.equipamentos.filter(e=>e.cenarioTeste);
+  if(!afetados.length) return flash('Nenhum equipamento de teste para reverter','red');
+  if(!confirm(`Devolver ${afetados.length} equipamento(s) do cenário de teste de volta ao estoque?`)) return;
+  afetados.forEach(e=>{
+    e.status='estoque'; e.tecnicoId=null; e.local=e.deposito; e.confirmado=true; e.emTransito=false;
+    e.rmaTecnicoId=null; e.rmaDeposito=null; e.rmaDesde=null; e.rmaOS=null;
+    delete e.cenarioTeste;
+  });
+  salvar(); render(); flash(`✅ ${afetados.length} equipamento(s) devolvido(s) ao estoque`,'green');
+}
 function aplicarMinimosOficiais(){
   if(!souAdmin()) return flash('Somente administradores podem fazer isso','red');
-  const MINIMOS = { Controle:20, Magnetico:16, Sirene:8, Foto:30, Modulo:8 };
-  if(!confirm('Aplicar o estoque mínimo oficial por tipo (Controle=20, Magnetico=16, Sirene=8, Foto=30, Modulo=8) para todas as filiais? Isso substitui o mínimo atual desses tipos.')) return;
+  const MINIMOS = { Controle:25, Magnetico:16, Sirene:8, Foto:30, Modulo:8 };
+  if(!confirm('Aplicar o estoque mínimo oficial POR TÉCNICO (Controle=25, Magnetico=16, Sirene=8, Foto=30, Modulo=8)? O mínimo de cada filial passa a ser esse valor multiplicado pela quantidade de técnicos nela. Isso substitui o mínimo atual desses tipos.')) return;
   Object.entries(MINIMOS).forEach(([t,min])=>{
     if(!DB.tipos[t]) DB.tipos[t]={nome:t,cor:''};
     DB.tipos[t].min = min;
@@ -1873,10 +2173,10 @@ function aplicarMinimosOficiais(){
   salvar(); render(); flash('✅ Estoque mínimo aplicado','green');
 }
 async function limparTudo(){
-  if(!confirm('Apagar TODOS os dados (equipamentos, técnicos, movimentações)? Faça backup antes!')) return;
+  if(!confirm('Apagar TODOS os dados (equipamentos, técnicos, movimentações, auditorias)? Faça backup antes!')) return;
   if(!confirm('Tem certeza? Esta ação não pode ser desfeita.')) return;
   DB=estadoInicial(); salvar(); goto('dados'); flash('Apagando histórico da nuvem...','green');
-  try{ await limparColecaoMovimentacoes(); flash('Todos os dados foram apagados'); }
+  try{ await limparColecao(MOVS_REF); await limparColecao(AUDS_REF); await limparColecao(EQUIPS_REF); ultimoSyncEquip={}; flash('Todos os dados foram apagados'); }
   catch(err){ flash('⚠️ '+err.message,'red'); }
 }
 
@@ -1985,8 +2285,11 @@ let AUD = null; // auditoria em andamento { alvoTipo, alvoId, alvoNome, esperado
 
 function renderAuditoria(){
   if(AUD) return renderAuditoriaEmAndamento();
-  const tecsComItens=DB.tecnicos.filter(t=>itensDoTecnico(t.id).length>0);
-  const deps=[...new Set(DB.equipamentos.filter(e=>e.status==='estoque').map(e=>e.local||e.deposito).filter(Boolean))].sort();
+  let tecsComItens=DB.tecnicos.filter(t=>itensDoTecnico(t.id).length>0);
+  if(souSupervisor()) tecsComItens=tecsComItens.filter(t=>regiaoPermitida(t.regiao));
+  let deps=[...new Set(DB.equipamentos.filter(e=>e.status==='estoque').map(e=>e.local||e.deposito).filter(Boolean))].sort();
+  if(souSupervisor()) deps=deps.filter(regiaoPermitida);
+  const audsPerm = auditoriasPermitidas();
   $('#content').innerHTML=`
   <div class="grid" style="grid-template-columns:1fr 1fr;margin-bottom:20px">
     <div class="panel"><div class="ph"><h3>🔍 Auditar técnico</h3></div><div class="pb">
@@ -2004,21 +2307,21 @@ function renderAuditoria(){
           <span>📍 ${esc(d)} <span class="count-badge">${itensDoDeposito(d).length}</span></span></button>`).join('')}</div>` : '<div class="empty">Nenhum depósito com itens.</div>'}
     </div></div>
   </div>
-  ${DB.auditorias.length?`<div class="panel" style="margin-bottom:20px"><div class="ph"><h3>📈 Evolução das divergências</h3><span class="muted" style="font-size:11.5px;margin-left:6px">(clique numa barra para ver o laudo)</span></div>
+  ${audsPerm.length?`<div class="panel" style="margin-bottom:20px"><div class="ph"><h3>📈 Evolução das divergências</h3><span class="muted" style="font-size:11.5px;margin-left:6px">(clique numa barra para ver o laudo)</span></div>
     <div class="pb">
-      ${[...DB.auditorias].sort((a,b)=>a.ts-b.ts).map(a=>{
+      ${[...audsPerm].sort((a,b)=>a.ts-b.ts).map(a=>{
         const div=a.faltando.length+a.sobrando.length;
-        const max=Math.max(1,...DB.auditorias.map(x=>x.faltando.length+x.sobrando.length));
+        const max=Math.max(1,...audsPerm.map(x=>x.faltando.length+x.sobrando.length));
         return `<div class="bar-row" style="cursor:pointer" onclick="verLaudo('${a.id}')">
           <div class="bl" style="width:190px;font-size:12px">${new Date(a.ts).toLocaleDateString('pt-BR')} · ${a.alvoTipo==='tecnico'?'👷':'📍'} ${esc(a.alvoNome)}</div>
           <div class="bar-track"><div class="bar-fill" style="width:${Math.max(6,div/max*100)}%;background:${div?'var(--red)':'var(--green)'}">${div}</div></div>
         </div>`;}).join('')}
     </div>
   </div>`:''}
-  <div class="panel"><div class="ph"><h3>📋 Auditorias realizadas</h3><span class="count-badge">${DB.auditorias.length}</span></div>
+  <div class="panel"><div class="ph"><h3>📋 Auditorias realizadas</h3><span class="count-badge">${audsPerm.length}</span></div>
     <div class="tbl-wrap">${
-      DB.auditorias.length? `<table><thead><tr><th>Data</th><th>Alvo</th><th>Auditor</th><th class="center">Esperado</th><th class="center">Conferido</th><th class="center">Faltando</th><th class="center">Sobrando</th><th></th></tr></thead><tbody>
-        ${[...DB.auditorias].reverse().map(a=>`<tr>
+      audsPerm.length? `<table><thead><tr><th>Data</th><th>Alvo</th><th>Auditor</th><th class="center">Esperado</th><th class="center">Conferido</th><th class="center">Faltando</th><th class="center">Sobrando</th><th></th></tr></thead><tbody>
+        ${[...audsPerm].reverse().map(a=>`<tr>
           <td class="muted">${fmtTS(a.ts)}</td>
           <td>${a.alvoTipo==='tecnico'?'👷':'📍'} ${esc(a.alvoNome)}</td>
           <td class="muted">${esc(a.auditor||'—')}</td>
@@ -2099,7 +2402,7 @@ function audRemSobra(s){ AUD.sobra=AUD.sobra.filter(x=>x!==s); renderAuditoriaEm
 function finalizarAuditoria(){
   const conferidos=[...AUD.conf]; const faltando=AUD.esperados.filter(s=>!AUD.conf.has(s));
   const reg={ id:uid(), ts:Date.now(), alvoTipo:AUD.alvoTipo, alvoId:AUD.alvoId, alvoNome:AUD.alvoNome, auditor:nomeUsuarioAtual(), esperados:AUD.esperados.slice(), conferidos, faltando, sobrando:AUD.sobra.slice(), obs:'' };
-  DB.auditorias.push(reg); salvar();
+  registrarAuditoria(reg); salvar();
   const divergencias=faltando.length+AUD.sobra.length;
   AUD=null; goto('auditoria');
   flash(divergencias? `Auditoria salva — ${divergencias} divergência(s)`:'✅ Auditoria salva — tudo conferido!', divergencias?'red':'green');
@@ -2118,7 +2421,55 @@ function verLaudo(id){
     ${sec('✅ Conferidos',a.conferidos,'var(--green)','—')}
     ${sec('❌ Faltando (esperado, não encontrado)',a.faltando,'var(--red)','Nenhum item faltando.')}
     ${sec('⚠️ Sobrando (encontrado, não esperado)',a.sobrando,'var(--amber)','Nenhum item a mais.')}`,
-    `<button class="btn" onclick="closeModal()">Fechar</button>`, 'lg');
+    `<button class="btn" onclick="exportarLaudoExcel('${a.id}')">📊 Exportar Excel</button><button class="btn" onclick="gerarRelatorioLaudo('${a.id}')">🖨️ Gerar relatório</button><button class="btn" onclick="closeModal()">Fechar</button>`, 'lg');
+}
+function exportarLaudoExcel(id){
+  const a=DB.auditorias.find(x=>x.id===id); if(!a) return;
+  if(window.__noXLSX||typeof XLSX==='undefined') return flash('Exportação para Excel indisponível (sem internet). Use "Gerar relatório" e imprima como PDF.','red');
+  const linhas = [
+    ...a.conferidos.map(s=>({situacao:'Conferido', serie:s})),
+    ...a.faltando.map(s=>({situacao:'Faltando', serie:s})),
+    ...a.sobrando.map(s=>({situacao:'Sobrando (não esperado)', serie:s}))
+  ].map(l=>{ const e=DB.equipamentos.find(x=>x.serie===l.serie); return { 'Nº Série':l.serie, 'Tipo':e?tipoNome(e.tipo):'—', 'Situação':l.situacao }; });
+  const ws = XLSX.utils.json_to_sheet(linhas.length?linhas:[{'Nº Série':'','Tipo':'','Situação':'Nenhum item'}]);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Laudo');
+  const nomeArquivo = 'laudo_'+(a.alvoNome||'auditoria').replace(/[^\w-]+/g,'_')+'_'+new Date(a.ts).toISOString().slice(0,10)+'.xlsx';
+  XLSX.writeFile(wb, nomeArquivo);
+}
+function gerarRelatorioLaudo(id){
+  const a=DB.auditorias.find(x=>x.id===id); if(!a) return;
+  const linhaSerie=(s,statusTxt,cor)=>{ const e=DB.equipamentos.find(x=>x.serie===s); return `<tr><td>${esc(s)}</td><td>${e?esc(tipoNome(e.tipo)):'—'}</td><td style="color:${cor}">${statusTxt}</td></tr>`; };
+  const linhas = [
+    ...a.conferidos.map(s=>linhaSerie(s,'Conferido','#16a34a')),
+    ...a.faltando.map(s=>linhaSerie(s,'Faltando','#dc2626')),
+    ...a.sobrando.map(s=>linhaSerie(s,'Sobrando (não esperado)','#d97706'))
+  ];
+  const hoje = new Date().toLocaleDateString('pt-BR')+' '+new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
+  const divergencias = a.faltando.length+a.sobrando.length;
+  const html=`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="utf-8"><title>Laudo de Auditoria</title>
+    <style>body{font-family:Arial,sans-serif;max-width:820px;margin:30px auto;padding:0 24px;color:#111;font-size:13px;line-height:1.5}
+    h1{font-size:20px;margin-bottom:2px}h2{font-size:13px;font-weight:normal;color:#555;margin-bottom:20px}
+    table{width:100%;border-collapse:collapse;margin:8px 0}th,td{border:1px solid #ccc;padding:7px 9px;text-align:left;font-size:12px}th{background:#f0f0f0}
+    .kpis{display:flex;gap:14px;flex-wrap:wrap;margin:14px 0}
+    .kpi{flex:1;min-width:110px;border:1px solid #ddd;border-radius:8px;padding:12px 14px}
+    .kpi b{display:block;font-size:22px;margin-top:4px}
+    @media print{button{display:none}}</style></head><body>
+    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">🖨️ Imprimir / Salvar PDF</button>
+    <h1>Laudo de Auditoria</h1>
+    <h2>${a.alvoTipo==='tecnico'?'👷':'📍'} ${esc(a.alvoNome)} · auditor: ${esc(a.auditor||'—')} · ${fmtTS(a.ts)} · gerado em ${hoje}</h2>
+    <div class="kpis">
+      <div class="kpi">Esperado<b>${a.esperados.length}</b></div>
+      <div class="kpi">Conferido<b style="color:#16a34a">${a.conferidos.length}</b></div>
+      <div class="kpi">Faltando<b style="color:#dc2626">${a.faltando.length}</b></div>
+      <div class="kpi">Sobrando<b style="color:#d97706">${a.sobrando.length}</b></div>
+    </div>
+    <table><thead><tr><th>Nº Série</th><th>Tipo</th><th>Situação</th></tr></thead><tbody>
+      ${linhas.length?linhas.join(''):'<tr><td colspan="3">Nenhum item.</td></tr>'}
+    </tbody></table>
+    <p style="margin-top:20px">${divergencias?`⚠️ ${divergencias} divergência(s) encontrada(s).`:'✅ Tudo conferido, sem divergências.'}</p>
+    </body></html>`;
+  const w=window.open('','_blank'); if(!w) return flash('Permita pop-ups para gerar o relatório','red'); w.document.write(html); w.document.close();
 }
 
 /* =========================================================
@@ -2306,15 +2657,16 @@ function confirmarRecebimento(serie, semConfirm){
   const e = DB.equipamentos.find(x=>x.serie===serie); if(!e || !e.emTransito) return;
   if(!semConfirm && !confirm('Confirmar o recebimento do equipamento '+serie+'?')) return;
   const destinoId = e.transitoPara;
+  const origemTecId = e.transitoDeTecnicoId||null;
   e.status='com_tecnico'; e.tecnicoId=destinoId; e.local=tecNome(destinoId); e.confirmado=true; e.desde=Date.now();
   e.emTransito=false; e.transitoPara=null; e.transitoDesde=null; e.transitoDe=null; e.transitoUsuario=null; e.transitoDeTecnicoId=null;
-  registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:'confirmacao', serie, de:'Em trânsito', para:tecNome(destinoId), tecnicoId:destinoId, usuario:nomeUsuarioAtual(), obs:'Recebimento confirmado pelo técnico' });
+  registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:'confirmacao', serie, de:'Em trânsito', para:tecNome(destinoId), tecnicoId:destinoId, tecnicoIdOrigem:origemTecId, usuario:nomeUsuarioAtual(), obs:'Recebimento confirmado pelo técnico' });
   salvar(); render(); flash('✅ Recebimento de '+serie+' confirmado','green');
 }
 function renderMeuHistorico(){
   const t = meuTecnico();
   if(!t) return $('#content').innerHTML = semVinculoHtml();
-  const movs = DB.movimentacoes.filter(m=>m.tecnicoId===t.id).slice().reverse();
+  const movs = DB.movimentacoes.filter(m=>m.tecnicoId===t.id || m.tecnicoIdOrigem===t.id).sort((a,b)=>b.ts-a.ts);
   $('#content').innerHTML = `
   <div class="panel"><div class="ph"><h3>🕓 Meu histórico</h3><span class="count-badge">${movs.length}</span></div>
     <div class="tbl-wrap">${movs.length?tabelaMov(movs.slice(0,300)):'<div class="empty">Nenhuma movimentação ainda.</div>'}</div>
@@ -2394,7 +2746,7 @@ function renderUsuarios(){
     });
     return; // vai re-renderizar assim que o snapshot chegar
   }
-  const regioesConhecidas = [...new Set(DB.tecnicos.map(t=>t.regiao).filter(Boolean))].sort();
+  const regioesConhecidas = todasFiliaisConhecidas();
   const ordenados = [...USUARIOS_LISTA].sort((a,b)=>(a.papel==='pendente'?0:1)-(b.papel==='pendente'?0:1) || (a.criadoEm||0)-(b.criadoEm||0));
   $('#content').innerHTML = `
   <div class="panel"><div class="ph"><h3>🔐 Usuários e permissões</h3><span class="count-badge">${USUARIOS_LISTA.length}</span></div>
@@ -2416,9 +2768,9 @@ function renderUsuarios(){
           </div>
           ${u.papel==='supervisor'?`
           <div class="field" style="margin:0;min-width:220px"><label>Filiais permitidas</label>
-            <select multiple size="4" style="min-height:80px" onchange="usuarioAtualizarRegioes('${u.uid}',this)">
-              ${regioesConhecidas.map(r=>`<option value="${esc(r)}" ${(u.regioes||[]).includes(r)?'selected':''}>${esc(r)}</option>`).join('')}
-            </select>
+            <button class="btn sm" onclick='abrirEditarFiliaisSupervisor(${JSON.stringify(u.uid)},${JSON.stringify(u.nome||u.email)},${JSON.stringify(u.regioes||[])})'>
+              🏢 ${(u.regioes||[]).length? (u.regioes||[]).length+' filial(is) — editar' : 'Nenhuma filial — editar'}
+            </button>
           </div>`:''}
           ${u.papel==='tecnico'?`
           <div class="field" style="margin:0;min-width:220px"><label>Vincular ao técnico cadastrado</label>
@@ -2435,9 +2787,22 @@ function renderUsuarios(){
 function usuarioAtualizarCampo(uid, campo, valor){
   USERS_REF.doc(uid).update({[campo]:valor}).then(()=>flash('✅ Atualizado','green')).catch(e=>flash('⚠️ '+e.message,'red'));
 }
-function usuarioAtualizarRegioes(uid, select){
-  const vals = Array.from(select.selectedOptions).map(o=>o.value);
-  USERS_REF.doc(uid).update({regioes:vals}).then(()=>flash('✅ Filiais atualizadas','green')).catch(e=>flash('⚠️ '+e.message,'red'));
+function abrirEditarFiliaisSupervisor(uid, nome, regioesAtuais){
+  const todas = todasFiliaisConhecidas();
+  modal('🏢 Filiais de '+esc(nome), `
+    <p class="muted" style="margin-bottom:12px">Marque as filiais que esse supervisor pode acessar.</p>
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:8px;max-height:340px;overflow:auto">
+      ${todas.length? todas.map(f=>`
+        <label class="checkbox" style="background:var(--panel-soft);padding:8px 10px;border-radius:9px">
+          <input type="checkbox" class="filialChk" value="${esc(f)}" ${regioesAtuais.includes(f)?'checked':''}> ${esc(f)}
+        </label>`).join('') : '<div class="empty">Nenhuma filial cadastrada ainda.</div>'}
+    </div>`,
+    `<button class="btn" onclick="closeModal()">Cancelar</button>
+     <button class="btn primary" onclick="salvarFiliaisSupervisor('${uid}')">Salvar</button>`, 'lg');
+}
+function salvarFiliaisSupervisor(uid){
+  const vals = Array.from(document.querySelectorAll('.filialChk:checked')).map(c=>c.value);
+  USERS_REF.doc(uid).update({regioes:vals}).then(()=>{ closeModal(); flash('✅ Filiais atualizadas','green'); }).catch(e=>flash('⚠️ '+e.message,'red'));
 }
 function usuarioRemover(uid, email){
   if(!confirm('Remover o acesso de '+email+'? A pessoa poderá criar uma conta nova, mas terá que ser aprovada de novo.')) return;
