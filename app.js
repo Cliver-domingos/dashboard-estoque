@@ -908,6 +908,8 @@ function renderRMA(){
       ${todasFiliais.map(d=>{ const n=baseRma.filter(e=>(e.rmaDeposito||e.deposito)===d).length; const on=rmaFiliais.includes(d); return `
         <button class="${on?'active':''}" style="background:${on?'var(--brand)':'var(--panel-soft)'};color:${on?'#fff':'var(--txt)'};border-radius:9px" onclick="rmaToggleFilial('${esc(d)}')">${on?'✓ ':''}${esc(d)} <span class="count-badge" style="background:${on?'rgba(255,255,255,.25)':'#e2e8f0'};color:inherit;margin-left:4px">${n}</span></button>`;}).join('')}
     </div>
+    <div class="spacer"></div>
+    ${rma.length?`<button class="btn sm" onclick="exportarRMAExcel()">📊 Exportar Excel</button><button class="btn sm" onclick="gerarRelatorioRMA()">🖨️ Gerar relatório</button>`:''}
   </div></div>
 
   <div class="grid kpis" style="margin-bottom:20px">
@@ -959,6 +961,33 @@ function renderRMA(){
       </div>
     </div>
   </div>`;
+}
+function exportarRMAExcel(){
+  const rma = DB.equipamentos.filter(e=>e.status==='baixado' && (!souSupervisor()||regiaoPermitida(e.rmaDeposito||e.deposito)) && (!rmaFiliais.length||rmaFiliais.includes(e.rmaDeposito||e.deposito)));
+  if(window.__noXLSX||typeof XLSX==='undefined') return flash('Exportação para Excel indisponível (sem internet). Use "Gerar relatório" e imprima como PDF.','red');
+  const linhas = rma.map(e=>({ 'Nº Série':e.serie, 'Tipo':tipoNome(e.tipo), 'Filial':e.rmaDeposito||e.deposito||'—', 'Técnico':e.rmaTecnicoId?tecNome(e.rmaTecnicoId):'—', 'Desde':e.rmaDesde?fmtTS(e.rmaDesde):'—' }));
+  const ws = XLSX.utils.json_to_sheet(linhas.length?linhas:[{'Nº Série':'','Tipo':'','Filial':'','Técnico':'','Desde':'Nenhum item'}]);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Estoque RMA');
+  XLSX.writeFile(wb, 'estoque_rma_'+(rmaFiliais.length?rmaFiliais.join('_'):'todas_filiais').replace(/[^\w-]+/g,'_')+'_'+new Date().toISOString().slice(0,10)+'.xlsx');
+}
+function gerarRelatorioRMA(){
+  const rma = DB.equipamentos.filter(e=>e.status==='baixado' && (!souSupervisor()||regiaoPermitida(e.rmaDeposito||e.deposito)) && (!rmaFiliais.length||rmaFiliais.includes(e.rmaDeposito||e.deposito)));
+  const titulo = rmaFiliais.length ? rmaFiliais.join(', ') : 'Todas as filiais';
+  const hoje = new Date().toLocaleDateString('pt-BR')+' '+new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
+  const html=`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="utf-8"><title>Relatório de Estoque RMA</title>
+    <style>body{font-family:Arial,sans-serif;max-width:820px;margin:30px auto;padding:0 24px;color:#111;font-size:13px;line-height:1.5}
+    h1{font-size:20px;margin-bottom:2px}h2{font-size:13px;font-weight:normal;color:#555;margin-bottom:20px}
+    table{width:100%;border-collapse:collapse;margin:8px 0}th,td{border:1px solid #ccc;padding:7px 9px;text-align:left;font-size:12px}th{background:#f0f0f0}
+    @media print{button{display:none}}</style></head><body>
+    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">🖨️ Imprimir / Salvar PDF</button>
+    <h1>Relatório de Estoque RMA</h1>
+    <h2>${esc(titulo)} · ${rma.length} item(ns) · gerado em ${hoje}</h2>
+    <table><thead><tr><th>Nº Série</th><th>Tipo</th><th>Filial</th><th>Técnico</th><th>Desde</th></tr></thead><tbody>
+      ${rma.length? rma.map(e=>`<tr><td>${esc(e.serie)}</td><td>${esc(tipoNome(e.tipo))}</td><td>${esc(e.rmaDeposito||e.deposito||'—')}</td><td>${e.rmaTecnicoId?esc(tecNome(e.rmaTecnicoId)):'—'}</td><td>${e.rmaDesde?fmtTS(e.rmaDesde):'—'}</td></tr>`).join('') : '<tr><td colspan="5">Nenhum item em RMA.</td></tr>'}
+    </tbody></table>
+    </body></html>`;
+  const w=window.open('','_blank'); if(!w) return flash('Permita pop-ups para gerar o relatório','red'); w.document.write(html); w.document.close();
 }
 function verTodosRMA(){
   const rma = DB.equipamentos.filter(e=>e.status==='baixado' && (!souSupervisor()||regiaoPermitida(e.rmaDeposito||e.deposito)) && (!rmaFiliais.length||rmaFiliais.includes(e.rmaDeposito||e.deposito)))
@@ -1021,7 +1050,35 @@ function rmaFichaTecnico(tecnicoId){
           ${souAdmin()?`<td class="right"><button class="btn sm ghost" onclick="retornarDoRMA('${esc(e.serie)}');closeModal();rmaFichaTecnico('${tecnicoId||''}')">↩️ Retornar</button></td>`:''}
         </tr>`).join('')}</tbody></table>`
       : '<div class="empty">Nenhum item.</div>'
-    }</div>`, `<button class="btn" onclick="closeModal()">Fechar</button>`, 'lg');
+    }</div>`, `<button class="btn" onclick="exportarRMATecnicoExcel('${tecnicoId||''}')">📊 Exportar Excel</button><button class="btn" onclick="gerarRelatorioRMATecnico('${tecnicoId||''}')">🖨️ Gerar relatório</button><button class="btn" onclick="closeModal()">Fechar</button>`, 'lg');
+}
+function exportarRMATecnicoExcel(tecnicoId){
+  const itens = DB.equipamentos.filter(e=>e.status==='baixado' && (e.rmaTecnicoId||null)===(tecnicoId||null) && (!souSupervisor()||regiaoPermitida(e.rmaDeposito||e.deposito)));
+  if(window.__noXLSX||typeof XLSX==='undefined') return flash('Exportação para Excel indisponível (sem internet). Use "Gerar relatório" e imprima como PDF.','red');
+  const nomeRef = tecnicoId? tecNome(tecnicoId) : 'sem_tecnico';
+  const linhas = itens.map(e=>({ 'Nº Série':e.serie, 'Tipo':tipoNome(e.tipo), 'Filial':e.rmaDeposito||e.deposito||'—', 'Desde':e.rmaDesde?fmtTS(e.rmaDesde):'—' }));
+  const ws = XLSX.utils.json_to_sheet(linhas.length?linhas:[{'Nº Série':'','Tipo':'','Filial':'','Desde':'Nenhum item'}]);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'RMA');
+  XLSX.writeFile(wb, 'rma_'+nomeRef.replace(/[^\w-]+/g,'_')+'_'+new Date().toISOString().slice(0,10)+'.xlsx');
+}
+function gerarRelatorioRMATecnico(tecnicoId){
+  const itens = DB.equipamentos.filter(e=>e.status==='baixado' && (e.rmaTecnicoId||null)===(tecnicoId||null) && (!souSupervisor()||regiaoPermitida(e.rmaDeposito||e.deposito)));
+  const titulo = tecnicoId? 'RMA enviado por '+tecNome(tecnicoId) : 'RMA enviado direto do estoque (sem técnico)';
+  const hoje = new Date().toLocaleDateString('pt-BR')+' '+new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
+  const html=`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="utf-8"><title>Relatório de RMA</title>
+    <style>body{font-family:Arial,sans-serif;max-width:820px;margin:30px auto;padding:0 24px;color:#111;font-size:13px;line-height:1.5}
+    h1{font-size:20px;margin-bottom:2px}h2{font-size:13px;font-weight:normal;color:#555;margin-bottom:20px}
+    table{width:100%;border-collapse:collapse;margin:8px 0}th,td{border:1px solid #ccc;padding:7px 9px;text-align:left;font-size:12px}th{background:#f0f0f0}
+    @media print{button{display:none}}</style></head><body>
+    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">🖨️ Imprimir / Salvar PDF</button>
+    <h1>Relatório de RMA</h1>
+    <h2>${esc(titulo)} · ${itens.length} item(ns) · gerado em ${hoje}</h2>
+    <table><thead><tr><th>Nº Série</th><th>Tipo</th><th>Filial</th><th>Desde</th></tr></thead><tbody>
+      ${itens.length? itens.map(e=>`<tr><td>${esc(e.serie)}</td><td>${esc(tipoNome(e.tipo))}</td><td>${esc(e.rmaDeposito||e.deposito||'—')}</td><td>${e.rmaDesde?fmtTS(e.rmaDesde):'—'}</td></tr>`).join('') : '<tr><td colspan="4">Nenhum item.</td></tr>'}
+    </tbody></table>
+    </body></html>`;
+  const w=window.open('','_blank'); if(!w) return flash('Permita pop-ups para gerar o relatório','red'); w.document.write(html); w.document.close();
 }
 function retornarSelecionadosRMA(tecnicoId){
   if(!souAdmin()) return flash('Somente administradores podem retornar itens do RMA','red');
