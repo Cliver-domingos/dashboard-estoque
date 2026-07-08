@@ -1843,7 +1843,10 @@ function desenharMov(){
     </div>
 
     <div class="field"><label>Equipamentos (nº de série)</label>
-      <div class="search"><span class="si">🔎</span><input id="movBusca" placeholder="Digite/scan o nº de série e Enter para adicionar..." onkeydown="if(event.key==='Enter'){addMovSerieBusca();event.preventDefault()}" oninput="filtrarPickMov(this.value)"></div>
+      <div style="display:flex;gap:8px;align-items:stretch">
+        <div class="search" style="flex:1"><span class="si">🔎</span><input id="movBusca" placeholder="Digite/scan o nº de série e Enter para adicionar..." onkeydown="if(event.key==='Enter'){addMovSerieBusca();event.preventDefault()}" oninput="filtrarPickMov(this.value)"></div>
+        <button class="btn primary" onclick="addMovSerieBusca()">+ Adicionar</button>
+      </div>
       <div class="chips" id="movChips"></div>
       <div class="pick-list" id="movPick" style="margin-top:8px"></div>
     </div>
@@ -2531,7 +2534,10 @@ function renderAuditoriaEmAndamento(){
 
   <div class="panel" style="margin-bottom:18px"><div class="pb">
     <div class="field" style="margin-bottom:0"><label>Escaneie ou digite o nº de série e tecle Enter</label>
-      <div class="search"><span class="si">📷</span><input id="audInput" autofocus placeholder="Bipe o código do equipamento..." onkeydown="if(event.key==='Enter'){audBipar();event.preventDefault()}"></div>
+      <div style="display:flex;gap:8px;align-items:stretch">
+        <div class="search" style="flex:1"><span class="si">📷</span><input id="audInput" autofocus placeholder="Bipe o código do equipamento..." onkeydown="if(event.key==='Enter'){audBipar();event.preventDefault()}"></div>
+        <button class="btn primary" onclick="audBipar()">+ Adicionar</button>
+      </div>
       <div class="hint">Item esperado → marca como conferido. Item não esperado → registrado como "sobrando" (divergência).</div>
     </div>
   </div></div>
@@ -2672,7 +2678,10 @@ function renderMeusItens(){
     <div class="pb">
       ${pendentes.length?`
       <div class="field" style="margin-bottom:16px"><label>Bipe ou digite o nº de série e Enter para confirmar</label>
-        <div class="search"><span class="si">📷</span><input id="recInput" autofocus placeholder="Bipe o código do equipamento..." onkeydown="if(event.key==='Enter'){recBipar();event.preventDefault()}"></div>
+        <div style="display:flex;gap:8px;align-items:stretch">
+          <div class="search" style="flex:1"><span class="si">📷</span><input id="recInput" autofocus placeholder="Bipe o código do equipamento..." onkeydown="if(event.key==='Enter'){recBipar();event.preventDefault()}"></div>
+          <button class="btn primary" onclick="recBipar()">+ Adicionar</button>
+        </div>
       </div>
       <div style="display:flex;flex-direction:column;gap:10px">
         ${pendentes.map(e=>`
@@ -2706,18 +2715,25 @@ function recBipar(){
 /* ---- Registro de retirada em campo (manutenção/desinstalação) ---- */
 let formSel = [];
 let formFotos = []; // { file, url } - url é local (blob) até o envio
+// Como o técnico agora só carrega localmente os itens dele, esse cache guarda o resultado
+// de consultas ao servidor pra reconhecer itens de OUTROS técnicos (pro aviso funcionar de novo).
+let formLookupCache = {};
+function acharEquipParaForm(serie){ return formLookupCache[serie] || acharEquipPorSerie(serie); }
 function abrirRegistrarForm(){
   if(!meuTecnico()) return flash('Seu acesso ainda não foi vinculado a um técnico','red');
-  formSel = []; formFotos = [];
+  formSel = []; formFotos = []; formLookupCache = {};
   desenharRegistrarForm();
 }
 function desenharRegistrarForm(){
   const tiposOpt = Object.keys(DB.tipos).map(cod=>`<option value="${cod}">${esc(tipoNome(cod))}</option>`).join('');
-  const novos = formSel.filter(s=>!acharEquipPorSerie(s));
+  const novos = formSel.filter(s=>!acharEquipParaForm(s));
   const novosSemDeteccao = novos.filter(s=>!detectarTipoPorSerie(s));
   modal('📝 Registrar retirada em campo', `
     <div class="field"><label>Bipe ou digite o nº de série e Enter</label>
-      <div class="search"><span class="si">📷</span><input id="formBusca" autofocus placeholder="Nº de série do equipamento..." onkeydown="if(event.key==='Enter'){formAddSerieBusca();event.preventDefault()}"></div>
+      <div style="display:flex;gap:8px;align-items:stretch">
+        <div class="search" style="flex:1"><span class="si">📷</span><input id="formBusca" autofocus placeholder="Nº de série do equipamento..." onkeydown="if(event.key==='Enter'){formAddSerieBusca();event.preventDefault()}"></div>
+        <button class="btn primary" onclick="formAddSerieBusca()">+ Adicionar</button>
+      </div>
       <div class="chips" id="formChips" style="margin-top:8px"></div>
       <div class="hint">Equipamentos novos têm o tipo detectado automaticamente pelo padrão do código.</div>
     </div>
@@ -2754,20 +2770,28 @@ function renderFormFotosPreview(){
       <button onclick="formRemoveFoto(${i})" style="position:absolute;top:-7px;right:-7px;width:22px;height:22px;border-radius:50%;background:var(--red);color:#fff;font-weight:700;font-size:13px;line-height:1;cursor:pointer">×</button>
     </div>`).join('');
 }
-function formAddSerieBusca(){
+async function formAddSerieBusca(){
   const bruto=$('#formBusca').value.trim(); if(!bruto) return;
   const tokens=[...new Set(bruto.split(/[\s,;]+/).map(s=>s.trim()).filter(Boolean))];
   let add=0, dup=0;
-  tokens.forEach(v=>{ if(formSel.includes(v)) dup++; else { formSel.push(v); add++; } });
+  const novosTokens=[];
+  tokens.forEach(v=>{ if(formSel.includes(v)) dup++; else { formSel.push(v); add++; novosTokens.push(v); } });
   desenharRegistrarForm();
   if(tokens.length>1) flash(`✅ ${add} adicionado(s)`+(dup?` — ${dup} já bipado(s)`:''), 'green');
   else if(dup) flash('Esse item já foi bipado','red');
+  // consulta o servidor em segundo plano pra reconhecer itens de outros técnicos (não estão no recorte local)
+  for(const v of novosTokens){
+    if(!acharEquipParaForm(v)){
+      const achado = await acharEquipPorSerieAsync(v);
+      if(achado){ formLookupCache[v]=achado; if($('#formChips')) renderFormChips(); }
+    }
+  }
 }
 function formRemoveSerie(s){ formSel=formSel.filter(x=>x!==s); desenharRegistrarForm(); }
 function renderFormChips(){
   const t = meuTecnico();
   $('#formChips').innerHTML = formSel.map(s=>{
-    const existe = acharEquipPorSerie(s);
+    const existe = acharEquipParaForm(s);
     const deOutroTecnico = existe && existe.status==='com_tecnico' && t && existe.tecnicoId!==t.id;
     const rotulo = !existe? ' · novo' : (deOutroTecnico? ' · atual: '+esc(tecNome(existe.tecnicoId)) : '');
     return `<span class="chip" style="${(!existe||deOutroTecnico)?'background:var(--amber-soft);color:var(--amber)':''}">${esc(s)}${rotulo} <span class="rm" onclick="formRemoveSerie('${esc(s)}')">×</span></span>`;
@@ -2791,7 +2815,7 @@ async function confirmarRegistrarForm(){
   const servico = $('#formServico').value;
   const servicoLabel = servico==='manutencao'?'Manutenção':'Desinstalação';
   const obs = $('#formObs').value.trim();
-  const novos = formSel.filter(s=>!acharEquipPorSerie(s));
+  const novos = formSel.filter(s=>!acharEquipParaForm(s));
   const novosSemDeteccao = novos.filter(s=>!detectarTipoPorSerie(s));
   let tipoManual = '';
   if(novosSemDeteccao.length){
@@ -2799,7 +2823,7 @@ async function confirmarRegistrarForm(){
     if(!tipoManual) return flash('Selecione o tipo para os equipamentos sem padrão reconhecido','red');
   }
 
-  const deOutroTecnico = formSel.map(acharEquipPorSerie).filter(e=>e && e.status==='com_tecnico' && e.tecnicoId!==t.id);
+  const deOutroTecnico = formSel.map(acharEquipParaForm).filter(e=>e && e.status==='com_tecnico' && e.tecnicoId!==t.id);
   if(deOutroTecnico.length){
     const nomes = [...new Set(deOutroTecnico.map(e=>tecNome(e.tecnicoId)))].join(', ');
     if(!confirm(`${deOutroTecnico.length} equipamento(s) bipado(s) está(ão) atualmente com outro técnico (${nomes}). Confirmar mesmo assim que esses itens são seus agora?`)) return;
@@ -2829,6 +2853,7 @@ async function confirmarRegistrarForm(){
       e.status='com_tecnico'; e.tecnicoId=t.id; e.local=tecNome(t.id); e.confirmado=true; e.emTransito=false; e.transitoPara=null; e.transitoDesde=null; e.transitoDe=null;
     }
     e.desde = Date.now();
+    if(souTecnico()){ delete equipsIncomingMap[e.serie]; equipsOwnMap[e.serie]=e; } // já é meu agora, atualiza os mapas na hora
     registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:'registro_campo', serie, de, para:tecNome(t.id), tecnicoId:t.id, usuario:nomeUsuarioAtual(), obs:[servicoLabel, obs].filter(Boolean).join(' · '), fotos:[], retiradaId:codigoRetirada, temFotosLocais });
     n++;
   }
@@ -2848,6 +2873,9 @@ function confirmarRecebimento(serie, semConfirm){
   const origemTecId = e.transitoDeTecnicoId||null;
   e.status='com_tecnico'; e.tecnicoId=destinoId; e.local=tecNome(destinoId); e.confirmado=true; e.desde=Date.now();
   e.emTransito=false; e.transitoPara=null; e.transitoDesde=null; e.transitoDe=null; e.transitoUsuario=null; e.transitoDeTecnicoId=null;
+  // O item muda de categoria (de "a caminho" pra "meu"); atualiza os mapas na hora, sem
+  // esperar os dois listeners do Firestore confirmarem — evita ele sumir da tela por um instante.
+  if(souTecnico()){ delete equipsIncomingMap[e.serie]; equipsOwnMap[e.serie]=e; }
   registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:'confirmacao', serie, de:'Em trânsito', para:tecNome(destinoId), tecnicoId:destinoId, tecnicoIdOrigem:origemTecId, usuario:nomeUsuarioAtual(), obs:'Recebimento confirmado pelo técnico' });
   salvar(); render(); flash('✅ Recebimento de '+serie+' confirmado','green');
 }
