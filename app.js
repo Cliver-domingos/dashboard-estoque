@@ -1608,7 +1608,7 @@ function renderDados(){
   </div></div>`:''}
   <div class="panel" style="margin-top:18px"><div class="ph"><h3>💾 Backup & compartilhamento</h3></div><div class="pb">
     <p class="muted" style="margin-bottom:14px">Os dados ficam salvos <b>neste navegador</b>. Para fazer cópia de segurança ou usar em outra máquina/compartilhar via rede, exporte o backup e importe no outro computador.</p>
-    <p class="muted" style="margin-bottom:14px;font-size:12.5px">${DB.config.ultimoBackup?`Último backup: <b>${fmtTS(DB.config.ultimoBackup)}</b>`:'Nenhum backup feito ainda.'} — um admin recebe um backup automático a cada 7 dias, sem precisar clicar em nada.</p>
+    <p class="muted" style="margin-bottom:14px;font-size:12.5px">${DB.config.ultimoBackup?`Último backup: <b>${fmtTS(DB.config.ultimoBackup)}</b>`:'Nenhum backup feito ainda.'} — o responsável pelo sistema recebe um backup automático a cada 7 dias ao logar, sem precisar clicar em nada.</p>
     <div style="display:flex;gap:10px;flex-wrap:wrap">
       <button class="btn green" onclick="exportarBackup()">⬇️ Exportar backup (.json)</button>
       <label class="btn">⬆️ Importar backup<input type="file" accept=".json" style="display:none" onchange="importarBackup(this)"></label>
@@ -2112,9 +2112,10 @@ function exportarBackup(automatico){
   DB.config.ultimoBackup = Date.now(); salvar();
   if(!automatico) flash('✅ Backup exportado','green');
 }
+const RESPONSAVEL_BACKUP_EMAIL = 'cliver.guisolphi@orsegups.com.br';
 let backupAutoChecado = false;
 function verificarBackupAutomatico(){
-  if(backupAutoChecado || !souAdmin()) return;
+  if(backupAutoChecado || !MEU_PERFIL || MEU_PERFIL.email!==RESPONSAVEL_BACKUP_EMAIL) return;
   backupAutoChecado = true;
   const dias = (Date.now()-(DB.config.ultimoBackup||0))/86400000;
   if(dias>=7){
