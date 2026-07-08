@@ -281,6 +281,9 @@
   window.firestoreDB = firebase.firestore();
   window.firebaseAuth = firebase.auth();
   window.firebaseStorage = firebase.storage();
+  window.firestoreDB.enablePersistence({synchronizeTabs:true}).catch(err=>{
+    console.warn('Persistência offline indisponível neste navegador:', err.code);
+  });
 </script>
 <script src="app.js"></script>
 </body>
