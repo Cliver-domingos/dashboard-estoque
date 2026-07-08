@@ -182,6 +182,33 @@ function sincronizarEquipamentos(){
     }catch(e){ flash('⚠️ Falha ao sincronizar equipamentos: '+e.message,'red'); }
   })();
 }
+// Técnico só carrega um recorte (itens dele + a caminho dele), então "sumiu do array local"
+// não significa "foi excluído do sistema" — por isso essa versão nunca apaga documentos,
+// só grava o que mudou. Quem apaga de verdade (excluirEquip, admin) sempre vê a coleção inteira.
+function sincronizarEquipamentosTecnico(){
+  const alterados = DB.equipamentos.filter(e=>ultimoSyncEquip[e.serie]!==JSON.stringify(e));
+  if(!alterados.length) return;
+  (async()=>{
+    try{
+      for(let i=0;i<alterados.length;i+=400){
+        const batch = window.firestoreDB.batch();
+        alterados.slice(i,i+400).forEach(item=>batch.set(EQUIPS_REF.doc(item.serie), item));
+        await batch.commit();
+      }
+      alterados.forEach(e=>{ ultimoSyncEquip[e.serie]=JSON.stringify(e); });
+    }catch(e){ flash('⚠️ Falha ao sincronizar equipamentos: '+e.message,'red'); }
+  })();
+}
+function persistirEquipamentos(){
+  if(souTecnico()) sincronizarEquipamentosTecnico();
+  else sincronizarEquipamentos();
+}
+async function acharEquipPorSerieAsync(serie){
+  const local = acharEquipPorSerie(serie);
+  if(local) return local;
+  try{ const doc = await EQUIPS_REF.doc(serie).get(); return doc.exists ? doc.data() : null; }
+  catch(e){ return null; }
+}
 
 function salvar(){
   salvarLocal();
@@ -190,7 +217,7 @@ function salvar(){
   salvarTimeout = setTimeout(()=>{
     const { movimentacoes, auditorias, equipamentos, ...semMovs } = DB;
     DOC_REF.set(semMovs).catch(e=>flash('⚠️ Falha ao sincronizar: '+e.message,'red'));
-    sincronizarEquipamentos();
+    persistirEquipamentos();
   }, 400);
 }
 
@@ -217,7 +244,7 @@ function iniciarSyncNuvem(){
     } else {
       const { movimentacoes, auditorias, equipamentos, ...semMovs } = DB;
       DOC_REF.set(semMovs); // primeira vez: envia os dados locais como base
-      if(DB.equipamentos.length) sincronizarEquipamentos();
+      if(DB.equipamentos.length) persistirEquipamentos();
     }
   }, err=>{
     if(foot) foot.innerHTML = '⚠️ Sem conexão com a nuvem<br>Usando dados locais.';
@@ -235,15 +262,47 @@ function iniciarSyncNuvem(){
     if(audsCarregadas) render();
     audsCarregadas = true;
   }, err=>{ flash('⚠️ Erro ao carregar auditorias: '+err.message,'red'); });
-  EQUIPS_REF.onSnapshot(snap=>{
-    if(snap.metadata.hasPendingWrites && equipsCarregados) return; // eco da própria escrita, evita sobrescrever edição em digitação
-    const lista = snap.docs.map(d=>d.data());
-    ultimoSyncEquip = {};
-    lista.forEach(e=>{ ultimoSyncEquip[e.serie]=JSON.stringify(e); });
-    if(lista.length || equipsCarregados){ DB.equipamentos = lista; salvarLocal(); }
-    if(equipsCarregados) render();
-    equipsCarregados = true;
-  }, err=>{ flash('⚠️ Erro ao carregar equipamentos: '+err.message,'red'); });
+  iniciarListenerEquipamentos();
+}
+let equipsOwnMap = {}, equipsIncomingMap = {};
+function mesclarEquipamentosTecnico(){
+  const combinados = Object.assign({}, equipsOwnMap, equipsIncomingMap);
+  const lista = Object.values(combinados);
+  ultimoSyncEquip = {};
+  lista.forEach(e=>{ ultimoSyncEquip[e.serie]=JSON.stringify(e); });
+  if(lista.length || equipsCarregados){ DB.equipamentos = lista; salvarLocal(); }
+  if(equipsCarregados) render();
+  equipsCarregados = true;
+}
+function iniciarListenerEquipamentos(){
+  // Técnico só precisa dos itens que já são dele + os que estão a caminho pra ele —
+  // isso evita que cada um dos ~50 técnicos baixe o inventário inteiro da empresa
+  // toda vez que abre o app (o que já estourou a cota gratuita do Firestore num dia de testes).
+  // Admin e supervisor continuam vendo a coleção inteira (é o papel deles).
+  if(souTecnico()){
+    const meuId = MEU_PERFIL.tecnicoId;
+    if(!meuId){ equipsCarregados=true; render(); return; }
+    EQUIPS_REF.where('tecnicoId','==',meuId).onSnapshot(snap=>{
+      if(snap.metadata.hasPendingWrites && equipsCarregados) return;
+      equipsOwnMap = {}; snap.docs.forEach(d=>{ equipsOwnMap[d.id]=d.data(); });
+      mesclarEquipamentosTecnico();
+    }, err=>{ flash('⚠️ Erro ao carregar equipamentos: '+err.message,'red'); });
+    EQUIPS_REF.where('transitoPara','==',meuId).onSnapshot(snap=>{
+      if(snap.metadata.hasPendingWrites && equipsCarregados) return;
+      equipsIncomingMap = {}; snap.docs.forEach(d=>{ equipsIncomingMap[d.id]=d.data(); });
+      mesclarEquipamentosTecnico();
+    }, err=>{ flash('⚠️ Erro ao carregar equipamentos: '+err.message,'red'); });
+  } else {
+    EQUIPS_REF.onSnapshot(snap=>{
+      if(snap.metadata.hasPendingWrites && equipsCarregados) return; // eco da própria escrita, evita sobrescrever edição em digitação
+      const lista = snap.docs.map(d=>d.data());
+      ultimoSyncEquip = {};
+      lista.forEach(e=>{ ultimoSyncEquip[e.serie]=JSON.stringify(e); });
+      if(lista.length || equipsCarregados){ DB.equipamentos = lista; salvarLocal(); }
+      if(equipsCarregados) render();
+      equipsCarregados = true;
+    }, err=>{ flash('⚠️ Erro ao carregar equipamentos: '+err.message,'red'); });
+  }
 }
 async function migrarEquipamentosParaColecao(lista){
   await gravarEmLote(EQUIPS_REF, lista, e=>e.serie);
@@ -2754,8 +2813,11 @@ async function confirmarRegistrarForm(){
   catch(err){ if(btn){ btn.disabled=false; btn.textContent='Registrar ('+formSel.length+')'; } return flash('⚠️ Falha ao gerar código: '+err.message,'red'); }
 
   let n=0;
-  formSel.forEach(serie=>{
-    let e = acharEquipPorSerie(serie);
+  for(const serie of formSel){
+    // Busca autoritativa no servidor (não só no array local, que pro técnico agora é um recorte)
+    // — evita criar um equipamento duplicado por cima de um que já existe com outro técnico.
+    let e = await acharEquipPorSerieAsync(serie);
+    const jaEstavaLocal = !!acharEquipPorSerie(serie);
     const de = e ? (e.status==='com_tecnico'?tecNome(e.tecnicoId):(e.local||e.deposito||'Estoque')) : 'Campo (novo no sistema)';
     if(!e){
       const tipoNovo = detectarTipoPorSerie(serie) || tipoManual;
@@ -2763,12 +2825,13 @@ async function confirmarRegistrarForm(){
       DB.equipamentos.push(e);
       if(!DB.tipos[tipoNovo]) DB.tipos[tipoNovo]={nome:tipoNovo,cor:''};
     } else {
+      if(!jaEstavaLocal) DB.equipamentos.push(e); // achado só no servidor (era de outro técnico) — traz pro array local pra sincronizar
       e.status='com_tecnico'; e.tecnicoId=t.id; e.local=tecNome(t.id); e.confirmado=true; e.emTransito=false; e.transitoPara=null; e.transitoDesde=null; e.transitoDe=null;
     }
     e.desde = Date.now();
     registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:'registro_campo', serie, de, para:tecNome(t.id), tecnicoId:t.id, usuario:nomeUsuarioAtual(), obs:[servicoLabel, obs].filter(Boolean).join(' · '), fotos:[], retiradaId:codigoRetirada, temFotosLocais });
     n++;
-  });
+  }
   formFotos.forEach(f=>URL.revokeObjectURL(f.url)); formFotos=[];
   salvar(); render();
   modal('✅ Retirada registrada', `
