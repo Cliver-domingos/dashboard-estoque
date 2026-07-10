@@ -30,7 +30,21 @@ function carregar(){
   try{ const r = localStorage.getItem(STORE_KEY); if(r) return Object.assign(estadoInicial(), JSON.parse(r)); }catch(e){}
   return estadoInicial();
 }
-function salvarLocal(){ try{ localStorage.setItem(STORE_KEY, JSON.stringify(DB)); }catch(e){ console.warn('Falha ao salvar cache local:', e); } }
+function salvarLocal(){
+  try{
+    localStorage.setItem(STORE_KEY, JSON.stringify(DB));
+    // Persiste também o rastro de "o que já está no servidor" (ultimoSyncEquip) — sem
+    // isso ele começa VAZIO toda vez que o app abre, e offline (PWA) isso fazia o app
+    // tratar TODOS os equipamentos como "alterados" e tentar reenviar todos via upsert,
+    // inclusive itens em trânsito, que a RLS do técnico rejeita, derrubando o lote
+    // inteiro (BUG-043). typeof guarda contra a TDZ do `let ultimoSyncEquip` (declarado
+    // mais abaixo) caso salvarLocal rode antes daquela linha executar.
+    if(typeof ultimoSyncEquip!=='undefined') localStorage.setItem(STORE_KEY+'_syncequip', JSON.stringify(ultimoSyncEquip));
+  }catch(e){ console.warn('Falha ao salvar cache local:', e); }
+}
+function carregarUltimoSyncEquip(){
+  try{ const r = localStorage.getItem(STORE_KEY+'_syncequip'); return r ? JSON.parse(r) : {}; }catch(e){ return {}; }
+}
 
 // Cache local do PERFIL do usuário (papel/nome/regiões/técnico), separado do cache de
 // dados (DB) acima — usado só pra abrir o app offline com uma sessão já salva, quando a
@@ -206,7 +220,7 @@ sb.auth.onAuthStateChange((event, session)=>{
     $('#loginBg').style.display='none';
     $('#pendingBg').style.display='none';
     const chaveDoUsuario = STORE_KEY_BASE+'_'+user.id;
-    if(STORE_KEY!==chaveDoUsuario){ STORE_KEY=chaveDoUsuario; DB=carregar(); }
+    if(STORE_KEY!==chaveDoUsuario){ STORE_KEY=chaveDoUsuario; DB=carregar(); ultimoSyncEquip=carregarUltimoSyncEquip(); }
     carregarPerfil(user);
   } else {
     if(perfilCanalAtivo){ sb.removeChannel(perfilCanalAtivo); perfilCanalAtivo=null; }
@@ -391,7 +405,18 @@ function registrarAuditoria(a){
 // (excluirEquipamentosNoBanco, chamada por excluirEquip/importação com substituição/
 // restauração de backup) — a sincronização só grava criações e alterações.
 async function sincronizarEquipamentos(){
-  const alterados = DB.equipamentos.filter(e=>ultimoSyncEquip[e.serie]!==JSON.stringify(e));
+  let alterados = DB.equipamentos.filter(e=>ultimoSyncEquip[e.serie]!==JSON.stringify(e));
+  // Defense-in-depth (BUG-043): o técnico só pode GRAVAR equipamentos que já são dele
+  // (tecnico_id=meu) ou que ele mesmo mandou pra RMA (baixado + rma_tecnico_id=meu) — a
+  // política de INSERT do banco rejeita qualquer outro caso. Um item apenas EM TRÂNSITO
+  // pra ele (transito_para=meu, mas ainda não confirmado) NÃO é gravável pelo técnico
+  // (o item ainda "pertence" ao remetente até a confirmação, que é um UPDATE legítimo à
+  // parte). Sem este filtro, se um item em trânsito entrasse no lote (ex.: ultimoSyncEquip
+  // vazio ao abrir offline), o upsert do lote inteiro violava a RLS e NADA era salvo.
+  if(souTecnico()){
+    const meuId = MEU_PERFIL.tecnicoId;
+    alterados = alterados.filter(e=> e.tecnicoId===meuId || (e.status==='baixado' && e.rmaTecnicoId===meuId));
+  }
   if(!alterados.length) return;
   try{
     for(let i=0;i<alterados.length;i+=500){
@@ -400,6 +425,7 @@ async function sincronizarEquipamentos(){
       if(error) throw error;
     }
     alterados.forEach(e=>{ ultimoSyncEquip[e.serie]=JSON.stringify(e); });
+    salvarLocal(); // persiste o rastro atualizado (ver salvarLocal/BUG-043)
   }catch(e){
     // Não marcamos nada como sincronizado acima quando falha, então a própria
     // próxima chamada (por ação do usuário, pelo listener 'online' ou pelo timer
