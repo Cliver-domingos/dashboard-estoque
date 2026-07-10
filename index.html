@@ -313,6 +313,39 @@
 </style>
 </head>
 <body>
+<!-- PAINEL DE DIAGNÓSTICO TEMPORÁRIO (09/07/2026) — investigando tela em branco no modo
+     offline do PWA. Fica sempre por cima de tudo, independente de qualquer outro CSS/JS.
+     REMOVER depois que o problema for identificado e corrigido. -->
+<div id="debugPanel" style="position:fixed;top:0;left:0;right:0;z-index:999999;background:#000;color:#0f0;font:11px/1.4 monospace;padding:8px;max-height:45vh;overflow:auto;white-space:pre-wrap;display:none"></div>
+<script>
+(function(){
+  var p = document.getElementById('debugPanel');
+  function log(msg){ p.style.display='block'; p.textContent += msg + '\n'; }
+  window.addEventListener('error', function(e){ log('ERRO: '+e.message+' @ '+e.filename+':'+e.lineno+':'+e.colno); });
+  window.addEventListener('unhandledrejection', function(e){ var r=e.reason; log('PROMISE REJEITADA: '+(r&&r.message?r.message:String(r))); });
+  log('pagina carregou: '+new Date().toISOString());
+  log('navigator.onLine: '+navigator.onLine);
+  if('serviceWorker' in navigator){
+    navigator.serviceWorker.getRegistrations().then(function(regs){
+      log('SW registrations encontradas: '+regs.length);
+      regs.forEach(function(r){ log('  scope='+r.scope+' active='+(r.active?r.active.state:'NENHUM')); });
+    }).catch(function(err){ log('erro ao consultar SW: '+err.message); });
+  } else {
+    log('serviceWorker NAO suportado neste navegador');
+  }
+  if(window.caches){
+    caches.keys().then(function(nomes){
+      log('caches existentes: '+JSON.stringify(nomes));
+      if(nomes.length){
+        caches.open(nomes[0]).then(function(c){ return c.keys(); }).then(function(reqs){
+          log('itens no cache "'+nomes[0]+'": '+reqs.length);
+          reqs.forEach(function(r){ log('  - '+r.url); });
+        });
+      }
+    });
+  }
+})();
+</script>
 <div class="login-bg" id="loginBg">
   <div class="login-box">
     <!-- SVG bruto (ICONS.package) porque esta tela renderiza antes do app.js carregar — manter em sincronia com o mapa ICONS em app.js -->
