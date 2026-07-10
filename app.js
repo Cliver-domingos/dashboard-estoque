@@ -1,15 +1,15 @@
 /* =========================================================
    Controle de Estoque & Inventário — App (vanilla JS)
-   Backend: Firebase (Firestore + Auth). O localStorage é só
+   Backend: Supabase (Postgres + Auth + Realtime). O localStorage é só
    um cache local para carregar mais rápido / funcionar offline;
-   a fonte de verdade é o Firestore.
+   a fonte de verdade é o banco Postgres.
    ========================================================= */
 
 const STORE_KEY_BASE = 'estoque_a365_v1';
 let STORE_KEY = STORE_KEY_BASE; // isolado por conta assim que o login resolver (ver onAuthStateChanged)
 const DIAS_PARADO = 20; // a partir de quantos dias com técnico um item é considerado "parado"
 const STATUS = { estoque:'Em estoque', com_tecnico:'Com técnico', baixado:'RMA' };
-const TIPO_CORES = ['#2563eb','#7c3aed','#16a34a','#d97706','#dc2626','#0891b2','#db2777','#65a30d'];
+const CHART_VARS = ['--chart-1','--chart-2','--chart-3','--chart-4','--chart-5','--chart-6','--chart-7','--chart-8'];
 const MOV_LABEL = { entrada:'Entrada', saida:'Saída p/ técnico', transferencia:'Transferência', baixa:'Envio p/ RMA', retorno_rma:'Retorno de RMA', confirmacao:'Confirmação de recebimento', exclusao:'Exclusão definitiva', cancelamento:'Envio cancelado', registro_campo:'Registro em campo' };
 
 /* ---------- Estado ---------- */
@@ -32,7 +32,69 @@ function carregar(){
 }
 function salvarLocal(){ try{ localStorage.setItem(STORE_KEY, JSON.stringify(DB)); }catch(e){ console.warn('Falha ao salvar cache local:', e); } }
 
-/* ---------- Login (Firebase Auth) ---------- */
+/* ---------- Supabase: cliente e conversão de campos ----------
+   Postgres usa snake_case e timestamptz; o resto do app (renderização,
+   regras de negócio) continua 100% em camelCase e timestamps em ms
+   (Date.now()) como sempre foi — a conversão fica isolada aqui, então
+   nenhuma outra função do arquivo precisou mudar por causa disso. */
+const sb = window.sb;
+function tsToMs(v){ return v==null ? null : new Date(v).getTime(); }
+function msToTs(v){ return v==null ? null : new Date(v).toISOString(); }
+
+function equipamentoParaCamel(r){
+  return {
+    serie:r.serie, tipo:r.tipo, deposito:r.deposito, status:r.status,
+    tecnicoId:r.tecnico_id, local:r.local, desde:tsToMs(r.desde),
+    dataEntrada:r.data_entrada, origem:r.origem, familia:r.familia,
+    derivacao:r.derivacao, um:r.um, obs:r.obs, confirmado:r.confirmado,
+    emTransito:r.em_transito, transitoPara:r.transito_para,
+    transitoDesde:tsToMs(r.transito_desde), transitoDe:r.transito_de,
+    transitoUsuario:r.transito_usuario, transitoDeTecnicoId:r.transito_de_tecnico_id,
+    rmaTecnicoId:r.rma_tecnico_id, rmaDeposito:r.rma_deposito,
+    rmaDesde:tsToMs(r.rma_desde), rmaOS:r.rma_os, cenarioTeste:r.cenario_teste
+  };
+}
+function equipamentoParaSnake(e){
+  return {
+    serie:e.serie, tipo:e.tipo, deposito:e.deposito||null, status:e.status,
+    tecnico_id:e.tecnicoId||null, local:e.local||null, desde:msToTs(e.desde),
+    data_entrada:e.dataEntrada||null, origem:e.origem||null, familia:e.familia||null,
+    derivacao:e.derivacao||null, um:e.um||null, obs:e.obs||null, confirmado:!!e.confirmado,
+    em_transito:!!e.emTransito, transito_para:e.transitoPara||null,
+    transito_desde:msToTs(e.transitoDesde), transito_de:e.transitoDe||null,
+    transito_usuario:e.transitoUsuario||null, transito_de_tecnico_id:e.transitoDeTecnicoId||null,
+    rma_tecnico_id:e.rmaTecnicoId||null, rma_deposito:e.rmaDeposito||null,
+    rma_desde:msToTs(e.rmaDesde), rma_os:e.rmaOS||null, cenario_teste:!!e.cenarioTeste
+  };
+}
+function movimentacaoParaCamel(r){
+  return { id:r.id, ts:tsToMs(r.ts), tipo:r.tipo, serie:r.serie, de:r.de, para:r.para,
+    tecnicoId:r.tecnico_id, tecnicoIdOrigem:r.tecnico_id_origem, usuario:r.usuario,
+    obs:r.obs, os:r.os, retiradaId:r.retirada_id, fotos:r.fotos||[], temFotosLocais:r.tem_fotos_locais };
+}
+function movimentacaoParaSnake(m){
+  return { id:m.id, ts:msToTs(m.ts), tipo:m.tipo, serie:m.serie, de:m.de||null, para:m.para||null,
+    tecnico_id:m.tecnicoId||null, tecnico_id_origem:m.tecnicoIdOrigem||null, usuario:m.usuario||null,
+    obs:m.obs||null, os:m.os||null, retirada_id:m.retiradaId||null, fotos:m.fotos||[], tem_fotos_locais:!!m.temFotosLocais };
+}
+function auditoriaParaCamel(r){
+  return { id:r.id, ts:tsToMs(r.ts), alvoTipo:r.alvo_tipo, alvoId:r.alvo_id, alvoNome:r.alvo_nome,
+    auditor:r.auditor, esperados:r.esperados||[], conferidos:r.conferidos||[], faltando:r.faltando||[],
+    sobrando:r.sobrando||[], obs:r.obs };
+}
+function auditoriaParaSnake(a){
+  return { id:a.id, ts:msToTs(a.ts), alvo_tipo:a.alvoTipo, alvo_id:a.alvoId, alvo_nome:a.alvoNome||null,
+    auditor:a.auditor||null, esperados:a.esperados||[], conferidos:a.conferidos||[], faltando:a.faltando||[],
+    sobrando:a.sobrando||[], obs:a.obs||null };
+}
+function tecnicoParaSnake(t){ return { id:t.id, nome:t.nome, regiao:t.regiao||null, matricula:t.matricula||null }; }
+function tipoParaSnake(codigo, t){ return { codigo, nome:t.nome, cor:t.cor||null, min_por_tecnico:t.min||0 }; }
+function tiposArrayParaObjeto(rows){ const o={}; rows.forEach(r=>{ o[r.codigo]={nome:r.nome,cor:r.cor,min:r.min_por_tecnico}; }); return o; }
+function configParaCamel(r){ return { usuario:r.usuario||'', importadoEm:tsToMs(r.importado_em), empresa:r.empresa||'A365', ultimoBackup:tsToMs(r.ultimo_backup) }; }
+function configParaSnake(c){ return { usuario:c.usuario||null, importado_em:msToTs(c.importadoEm), empresa:c.empresa||'A365', ultimo_backup:msToTs(c.ultimoBackup) }; }
+function usuarioParaCamel(r){ return { uid:r.id, email:r.email, nome:r.nome, papel:r.papel, regioes:r.regioes||[], tecnicoId:r.tecnico_id, criadoEm:tsToMs(r.criado_em) }; }
+
+/* ---------- Login (Supabase Auth) ---------- */
 let loginModo = 'entrar'; // ou 'criar'
 function loginAlternar(){
   loginModo = loginModo==='entrar' ? 'criar' : 'entrar';
@@ -42,41 +104,43 @@ function loginAlternar(){
   $('#loginErr').style.display='none';
 }
 function loginErro(msg){ const e=$('#loginErr'); e.textContent=msg; e.style.display='block'; }
-const LOGIN_ERROS = {
-  'auth/invalid-email':'E-mail inválido.',
-  'auth/missing-password':'Informe a senha.',
-  'auth/weak-password':'A senha precisa ter ao menos 6 caracteres.',
-  'auth/email-already-in-use':'Já existe uma conta com esse e-mail. Clique em "Já tenho conta".',
-  'auth/invalid-credential':'E-mail ou senha incorretos.',
-  'auth/wrong-password':'E-mail ou senha incorretos.',
-  'auth/user-not-found':'Não existe conta com esse e-mail. Clique em "Criar conta".',
-  'auth/too-many-requests':'Muitas tentativas. Aguarde um pouco e tente de novo.'
-};
+function traduzirErroAuth(err){
+  const code = (err&&err.code)||'';
+  const msg = ((err&&err.message)||'').toLowerCase();
+  if(code==='invalid_credentials'||msg.includes('invalid login credentials')) return 'E-mail ou senha incorretos.';
+  if(code==='user_already_exists'||msg.includes('already registered')||msg.includes('already been registered')) return 'Já existe uma conta com esse e-mail. Clique em "Já tenho conta".';
+  if(code==='weak_password'||msg.includes('password should be at least')) return 'A senha precisa ter ao menos 6 caracteres.';
+  if(code==='validation_failed'||msg.includes('invalid format')||msg.includes('unable to validate email')) return 'E-mail inválido.';
+  if(code==='over_email_send_rate_limit'||code==='over_request_rate_limit'||msg.includes('rate limit')) return 'Muitas tentativas. Aguarde um pouco e tente de novo.';
+  if(msg.includes('email not confirmed')) return 'Confirme seu e-mail antes de entrar (verifique sua caixa de entrada).';
+  if(!msg) return 'Erro desconhecido.';
+  return 'Erro: '+(err&&err.message);
+}
 function loginSubmit(){
   const email = $('#loginEmail').value.trim();
   const senha = $('#loginSenha').value;
   if(!email||!senha) return loginErro('Preencha e-mail e senha.');
   $('#loginErr').style.display='none';
   const acao = loginModo==='entrar'
-    ? window.firebaseAuth.signInWithEmailAndPassword(email, senha)
-    : window.firebaseAuth.createUserWithEmailAndPassword(email, senha);
-  acao.catch(err=> loginErro(LOGIN_ERROS[err.code] || ('Erro: '+err.message)));
+    ? sb.auth.signInWithPassword({ email, password:senha })
+    : sb.auth.signUp({ email, password:senha });
+  acao.then(({error})=>{ if(error) loginErro(traduzirErroAuth(error)); });
 }
 function loginEsqueciSenha(){
   const email = $('#loginEmail').value.trim();
   if(!email) return loginErro('Digite seu e-mail no campo acima e clique em "Esqueci minha senha" de novo.');
   $('#loginErr').style.display='none';
-  window.firebaseAuth.sendPasswordResetEmail(email)
-    .then(()=> flash('✅ Enviamos um link de redefinição de senha para '+email,'green'))
-    .catch(err=> loginErro(LOGIN_ERROS[err.code] || ('Erro: '+err.message)));
+  sb.auth.resetPasswordForEmail(email).then(({error})=>{
+    if(error) loginErro(traduzirErroAuth(error));
+    else flash('Enviamos um link de redefinição de senha para '+email,'green');
+  });
 }
-function logout(){ if(confirm('Sair da sua conta?')) window.firebaseAuth.signOut(); }
+function logout(){ if(confirm('Sair da sua conta?')) sb.auth.signOut(); }
 
 /* ---------- Perfis / hierarquia (admin, supervisor, técnico) ---------- */
-const USERS_REF = window.firestoreDB.collection('usuarios');
 let MEU_PERFIL = null; // {uid, email, nome, papel:'pendente'|'admin'|'supervisor'|'tecnico', regioes:[], tecnicoId}
 let syncIniciado = false;
-let perfilListenerAtivo = null;
+let perfilCanalAtivo = null;
 
 function souAdmin(){ return !!MEU_PERFIL && MEU_PERFIL.papel==='admin'; }
 function souSupervisor(){ return !!MEU_PERFIL && MEU_PERFIL.papel==='supervisor'; }
@@ -89,24 +153,47 @@ function regiaoPermitida(dep){
   return false;
 }
 
-window.firebaseAuth.onAuthStateChanged(async user=>{
-  if(perfilListenerAtivo){ perfilListenerAtivo(); perfilListenerAtivo=null; }
+async function carregarPerfil(user){
+  const { data, error } = await sb.from('usuarios').select('*').eq('id', user.id).maybeSingle();
+  if(error){
+    // Falha de rede/servidor ao consultar o perfil — MUITO diferente de "o perfil não
+    // existe ainda". Achado ao vivo (BUG-033): sem essa checagem, uma instabilidade
+    // momentânea de conexão (ex.: wi-fi voltando) fazia até uma conta de ADMIN já
+    // aprovada cair na tela "Aguardando aprovação", porque o código tratava "não
+    // consegui perguntar ao banco" como "esse usuário é novo". Não mexe no MEU_PERFIL
+    // atual (mantém a tela como estava) e só tenta de novo em alguns segundos.
+    setTimeout(()=>carregarPerfil(user), 3000);
+    return;
+  }
+  let linha = data;
+  if(!linha){
+    const ins = await sb.from('usuarios').insert({ id:user.id, email:user.email, nome:(user.email||'').split('@')[0], papel:'pendente' }).select().maybeSingle();
+    if(ins.error){ setTimeout(()=>carregarPerfil(user), 3000); return; }
+    linha = ins.data;
+  }
+  MEU_PERFIL = linha ? usuarioParaCamel(linha) : MEU_PERFIL;
+  aplicarPerfil(user);
+  if(perfilCanalAtivo) sb.removeChannel(perfilCanalAtivo);
+  perfilCanalAtivo = sb.channel('perfil-'+user.id)
+    .on('postgres_changes', { event:'*', schema:'public', table:'usuarios', filter:`id=eq.${user.id}` }, payload=>{
+      MEU_PERFIL = payload.eventType==='DELETE' ? null : usuarioParaCamel(payload.new);
+      aplicarPerfil(user);
+    }).subscribe();
+}
+
+sb.auth.onAuthStateChange((event, session)=>{
+  const user = session && session.user;
   if(user){
     $('#loginBg').style.display='none';
     $('#pendingBg').style.display='none';
-    const chaveDoUsuario = STORE_KEY_BASE+'_'+user.uid;
+    const chaveDoUsuario = STORE_KEY_BASE+'_'+user.id;
     if(STORE_KEY!==chaveDoUsuario){ STORE_KEY=chaveDoUsuario; DB=carregar(); }
-    const ref = USERS_REF.doc(user.uid);
-    const snap = await ref.get().catch(()=>null);
-    if(snap && !snap.exists){
-      await ref.set({ email:user.email, nome:(user.email||'').split('@')[0], papel:'pendente', regioes:[], tecnicoId:null, criadoEm:Date.now() }).catch(()=>{});
-    }
-    perfilListenerAtivo = ref.onSnapshot(s=>{
-      MEU_PERFIL = s.exists ? Object.assign({uid:user.uid}, s.data()) : null;
-      aplicarPerfil(user);
-    }, ()=>{ MEU_PERFIL=null; aplicarPerfil(user); });
+    carregarPerfil(user);
   } else {
+    if(perfilCanalAtivo){ sb.removeChannel(perfilCanalAtivo); perfilCanalAtivo=null; }
+    if(cadastrosCanalAtivo){ sb.removeChannel(cadastrosCanalAtivo); cadastrosCanalAtivo=null; }
     MEU_PERFIL = null; syncIniciado=false; STORE_KEY=STORE_KEY_BASE;
+    equipsCarregados=false; movsCarregadas=false; audsCarregadas=false;
     $('#loginBg').style.display='flex';
     $('#pendingBg').style.display='none';
     $('#appRoot').style.display='none';
@@ -131,138 +218,400 @@ const PAPEL_LABEL = { admin:'Administrador', supervisor:'Supervisor', tecnico:'T
 function PAGINA_INICIAL(){ return souTecnico() ? 'meusItens' : 'dashboard'; }
 function PAGE_ATUAL_VALIDA(){ return paginasDisponiveis().some(p=>p.id===PAGE); }
 
-/* ---------- Sincronização em nuvem (Firestore) ---------- */
-const DOC_REF = window.firestoreDB.collection('estoques').doc('dashboard');
-const MOVS_REF = window.firestoreDB.collection('movimentacoes');
-const AUDS_REF = window.firestoreDB.collection('auditorias');
-const EQUIPS_REF = window.firestoreDB.collection('equipamentos');
+/* ---------- Sincronização em nuvem (Supabase: Postgres + Realtime) ---------- */
 let aplicandoRemoto = false;
 let salvarTimeout = null;
 let movsCarregadas = false;
 let audsCarregadas = false;
 let equipsCarregados = false;
-let ultimoSyncEquip = {}; // serie -> JSON string do último estado enviado/recebido da nuvem
+let ultimoSyncEquip = {};   // serie -> JSON string do último estado enviado/recebido da nuvem
+let ultimoSyncTipos = {};   // codigo -> JSON string
+let ultimoSyncFiliais = new Set();
+let ultimoSyncTecnicos = {}; // id -> JSON string
+let ultimoSyncConfigJson = null;
+let cadastrosCanalAtivo = null; // canal único de tipos/filiais/técnicos/config/movimentações/auditorias/equipamentos
 
-// O histórico de movimentações, as auditorias e os equipamentos ficam em coleções próprias
-// (sem o limite de 1MB do doc único estoques/dashboard). Cada registro vira 1 documento.
+/* ---------- Fila de escrita offline ----------
+   O Supabase não tem persistência/fila offline embutida como o
+   enablePersistence() do Firestore. Decisão confirmada: fila própria
+   no localStorage, só para o que não tem retry automático hoje —
+   movimentações e auditorias são um INSERT puro, sem o mecanismo de
+   diff que tipos/filiais/técnicos/equipamentos já têm (esses só marcam
+   como "sincronizado" depois de confirmar sucesso — se falhar, a
+   próxima chamada de salvar() já tenta de novo sozinha, sem precisar
+   de fila; por isso não entram nessa fila, só precisam ser cutucados
+   de novo quando a conexão voltar, o que já é feito abaixo). */
+function filaOfflineKey(){ return STORE_KEY+'_fila_offline'; }
+function lerFilaOffline(){
+  try{ return JSON.parse(localStorage.getItem(filaOfflineKey())||'[]'); }catch(e){ return []; }
+}
+function gravarFilaOffline(fila){
+  try{ localStorage.setItem(filaOfflineKey(), JSON.stringify(fila)); }catch(e){}
+  atualizarIndicadorFilaOffline(fila.length);
+}
+function enfileirarOffline(tipo, payload){
+  const fila = lerFilaOffline();
+  fila.push({ id:uid(), tipo, payload, criadoEm:Date.now() });
+  gravarFilaOffline(fila);
+}
+// Distingue "sem conexão" (vale a pena guardar e tentar de novo depois) de um erro
+// real do servidor (RLS, validação, chave estrangeira etc. — não adianta insistir).
+// Erro de rede de verdade não vem com {code} do Postgres/PostgREST.
+function pareceFalhaDeConexao(error){
+  if(!navigator.onLine) return true;
+  if(!error) return false;
+  if(error.code) return false; // erro estruturado do Postgres/PostgREST — é real, não é rede
+  const msg = (error.message||'').toLowerCase();
+  return msg.includes('fetch')||msg.includes('network')||msg.includes('load failed')||!msg;
+}
+function atualizarIndicadorFilaOffline(n){
+  const el = document.getElementById('footSync');
+  if(!el) return;
+  if(n>0) el.innerHTML = `${ic('alert-triangle')} ${n} alteração${n>1?'ões':''} salva${n>1?'s':''} só neste aparelho<br>Reconectando automaticamente...`;
+}
+async function tentarEsvaziarFilaOffline(){
+  // Guarda pra não tentar sincronizar nada antes do login resolver, ou com conta
+  // ainda pendente — o listener 'online' e o timer rodam o tempo todo, inclusive
+  // na tela de login/aguardando aprovação, onde não há sessão válida pra escrever.
+  if(!navigator.onLine || !MEU_PERFIL || MEU_PERFIL.papel==='pendente') return;
+  const fila = lerFilaOffline();
+  if(fila.length){
+    const restantes = [];
+    for(const item of fila){
+      try{
+        let error = null;
+        if(item.tipo==='movimentacao') ({error} = await sb.from('movimentacoes').insert(item.payload));
+        else if(item.tipo==='auditoria') ({error} = await sb.from('auditorias').insert(item.payload));
+        if(error){
+          if(pareceFalhaDeConexao(error)) restantes.push(item);
+          else flash('Um item da fila offline falhou de vez (não é falta de conexão): '+error.message,'red');
+        }
+      }catch(e){ restantes.push(item); }
+    }
+    gravarFilaOffline(restantes);
+    if(!restantes.length) flash(''+fila.length+' alteração(ões) pendente(s) sincronizada(s)','green');
+  }
+  // aproveita a conexão de volta pra também re-tentar tipos/filiais/técnicos/config/
+  // equipamentos — o próprio mecanismo de diff dessas funções só reenvia o que ainda
+  // não foi confirmado, então chamar de novo aqui é seguro mesmo sem nada pendente.
+  sincronizarTipos().catch(()=>{});
+  sincronizarFiliais().catch(()=>{});
+  sincronizarTecnicos().catch(()=>{});
+  sincronizarConfig().catch(()=>{});
+  persistirEquipamentos();
+  if(!lerFilaOffline().length){
+    const foot = document.getElementById('footSync');
+    if(foot) foot.innerHTML = 'Sincronizado com a nuvem '+ic('cloud')+'<br>Faça backup em <b>Dados</b>.';
+  }
+}
+window.addEventListener('online', tentarEsvaziarFilaOffline);
+setInterval(()=>{ if(navigator.onLine) tentarEsvaziarFilaOffline(); }, 30000);
+
+/* =========================================================
+   TELEMETRIA DE ERROS — window.onerror/unhandledrejection gravam num log
+   no Supabase (tabela erros, só admin lê). Existe porque um técnico em campo,
+   ao ver um erro, normalmente só fecha o app e tenta de novo — sem isso, o
+   problema fica invisível pra quem mantém o sistema.
+   ========================================================= */
+const ERROS_JA_ENVIADOS = new Set(); // mesma mensagem+origem só é enviada 1x por sessão (evita floodar em loop)
+const ERROS_LIMITE_POR_SESSAO = 20;  // teto de segurança pra sessão que erra em massa não virar spam de INSERT
+let errosEnviadosNestaSessao = 0;
+function registrarErroCliente(mensagem, origem, stack){
+  try{
+    if(!window.sb || errosEnviadosNestaSessao>=ERROS_LIMITE_POR_SESSAO) return;
+    const chave = (mensagem||'')+'|'+(origem||'');
+    if(ERROS_JA_ENVIADOS.has(chave)) return;
+    ERROS_JA_ENVIADOS.add(chave); errosEnviadosNestaSessao++;
+    sb.from('erros').insert({
+      mensagem: String(mensagem||'').slice(0,2000),
+      origem: origem? String(origem).slice(0,500) : null,
+      stack: stack? String(stack).slice(0,4000) : null,
+      tela: typeof PAGE!=='undefined'? PAGE : null,
+      usuario_id: MEU_PERFIL? MEU_PERFIL.uid : null,
+      usuario_email: MEU_PERFIL? MEU_PERFIL.email : null,
+      papel: MEU_PERFIL? MEU_PERFIL.papel : null,
+      tecnico_id: MEU_PERFIL? (MEU_PERFIL.tecnicoId||null) : null,
+      user_agent: navigator.userAgent,
+    }).then(()=>{}).catch(()=>{}); // best-effort — sem fila offline aqui, é telemetria, não dado de negócio
+  }catch(e){ /* telemetria nunca pode gerar outro erro nem quebrar o app */ }
+}
+window.addEventListener('error', e=>{
+  registrarErroCliente(e.message, (e.filename||'')+':'+(e.lineno||'')+':'+(e.colno||''), e.error&&e.error.stack);
+});
+window.addEventListener('unhandledrejection', e=>{
+  const r = e.reason;
+  registrarErroCliente(r&&r.message? r.message : String(r), 'promise', r&&r.stack);
+});
+
 function registrarMovimentacao(m){
   DB.movimentacoes.push(m);
-  MOVS_REF.doc(m.id).set(m).catch(e=>flash('⚠️ Falha ao salvar movimentação: '+e.message,'red'));
+  const payload = movimentacaoParaSnake(m);
+  sb.from('movimentacoes').insert(payload).then(({error})=>{
+    if(!error) return;
+    if(pareceFalhaDeConexao(error)) enfileirarOffline('movimentacao', payload);
+    else flash('Falha ao salvar movimentação: '+error.message,'red');
+  }).catch(()=>{ enfileirarOffline('movimentacao', payload); });
 }
 function registrarAuditoria(a){
   DB.auditorias.push(a);
-  AUDS_REF.doc(a.id).set(a).catch(e=>flash('⚠️ Falha ao salvar auditoria: '+e.message,'red'));
+  const payload = auditoriaParaSnake(a);
+  sb.from('auditorias').insert(payload).then(({error})=>{
+    if(!error) return;
+    if(pareceFalhaDeConexao(error)) enfileirarOffline('auditoria', payload);
+    else flash('Falha ao salvar auditoria: '+error.message,'red');
+  }).catch(()=>{ enfileirarOffline('auditoria', payload); });
 }
 
-function sincronizarEquipamentos(){
-  const seriesAtuais = new Set();
-  const alterados = [];
-  DB.equipamentos.forEach(e=>{
-    seriesAtuais.add(e.serie);
-    const json = JSON.stringify(e);
-    if(ultimoSyncEquip[e.serie]!==json) alterados.push(e);
-  });
-  const removidos = Object.keys(ultimoSyncEquip).filter(serie=>!seriesAtuais.has(serie));
-  if(!alterados.length && !removidos.length) return;
-  const lotes = [];
-  for(let i=0;i<alterados.length;i+=400) lotes.push(alterados.slice(i,i+400));
-  for(let i=0;i<removidos.length;i+=400) lotes.push(removidos.slice(i,i+400).map(serie=>({__remover:serie})));
-  (async()=>{
-    try{
-      for(const lote of lotes){
-        const batch = window.firestoreDB.batch();
-        lote.forEach(item=>{
-          if(item.__remover) batch.delete(EQUIPS_REF.doc(item.__remover));
-          else batch.set(EQUIPS_REF.doc(item.serie), item);
-        });
-        await batch.commit();
-      }
-      alterados.forEach(e=>{ ultimoSyncEquip[e.serie]=JSON.stringify(e); });
-      removidos.forEach(serie=>{ delete ultimoSyncEquip[serie]; });
-    }catch(e){ flash('⚠️ Falha ao sincronizar equipamentos: '+e.message,'red'); }
-  })();
-}
-// Técnico só carrega um recorte (itens dele + a caminho dele), então "sumiu do array local"
-// não significa "foi excluído do sistema" — por isso essa versão nunca apaga documentos,
-// só grava o que mudou. Quem apaga de verdade (excluirEquip, admin) sempre vê a coleção inteira.
-function sincronizarEquipamentosTecnico(){
+// IMPORTANTE (endurecimento pós-BUG-034): esta função NUNCA apaga linha no banco.
+// A versão anterior tratava "série sumiu do array local" como "usuário excluiu de
+// propósito" e mandava DELETE da diferença — foi exatamente esse mecanismo que, com
+// um array truncado pelo limite de 1000 linhas do PostgREST, apagou ~1000 equipamentos
+// reais em silêncio (BUG-034). A paginação corrigiu aquele gatilho, mas o mecanismo em
+// si continuava armado: QUALQUER bug futuro que encurtasse o array local viraria
+// exclusão em massa no banco. Agora exclusão só acontece por ação explícita
+// (excluirEquipamentosNoBanco, chamada por excluirEquip/importação com substituição/
+// restauração de backup) — a sincronização só grava criações e alterações.
+async function sincronizarEquipamentos(){
   const alterados = DB.equipamentos.filter(e=>ultimoSyncEquip[e.serie]!==JSON.stringify(e));
   if(!alterados.length) return;
-  (async()=>{
-    try{
-      for(let i=0;i<alterados.length;i+=400){
-        const batch = window.firestoreDB.batch();
-        alterados.slice(i,i+400).forEach(item=>batch.set(EQUIPS_REF.doc(item.serie), item));
-        await batch.commit();
-      }
-      alterados.forEach(e=>{ ultimoSyncEquip[e.serie]=JSON.stringify(e); });
-    }catch(e){ flash('⚠️ Falha ao sincronizar equipamentos: '+e.message,'red'); }
-  })();
+  try{
+    for(let i=0;i<alterados.length;i+=500){
+      const lote = alterados.slice(i,i+500).map(equipamentoParaSnake);
+      const { error } = await sb.from('equipamentos').upsert(lote, { onConflict:'serie' });
+      if(error) throw error;
+    }
+    alterados.forEach(e=>{ ultimoSyncEquip[e.serie]=JSON.stringify(e); });
+  }catch(e){
+    // Não marcamos nada como sincronizado acima quando falha, então a própria
+    // próxima chamada (por ação do usuário, pelo listener 'online' ou pelo timer
+    // de 30s) já tenta reenviar sozinha — não precisa de fila explícita aqui.
+    if(pareceFalhaDeConexao(e)) atualizarIndicadorFilaOffline(1);
+    else flash('Falha ao sincronizar equipamentos: '+e.message,'red');
+  }
+}
+// Exclusão EXPLÍCITA de equipamentos no banco — o único caminho que apaga linhas.
+// Usada por: excluirEquip() (1 item), importação com "substituir" (lote) e
+// importarBackup() (substituição total usa delete direto). Remove também do
+// rastro de sincronização (ultimoSyncEquip) pra não deixar entrada órfã.
+async function excluirEquipamentosNoBanco(series){
+  for(let i=0;i<series.length;i+=500){
+    const { error } = await sb.from('equipamentos').delete().in('serie', series.slice(i,i+500));
+    if(error) throw error;
+  }
+  series.forEach(s=>{ delete ultimoSyncEquip[s]; });
 }
 function persistirEquipamentos(){
-  if(souTecnico()) sincronizarEquipamentosTecnico();
-  else sincronizarEquipamentos();
+  // Nunca sincroniza antes da carga inicial de equipamentos terminar de verdade —
+  // sem essa guarda, um salvar() disparado logo no início (ex.: verificarBackupAutomatico())
+  // usaria o DB.equipamentos ainda desatualizado do localStorage (de antes da página
+  // carregar) contra um ultimoSyncEquip vazio, e trataria tudo como "alterado", causando
+  // um upsert em massa desnecessário logo na carga da página (risco irmão do BUG-034).
+  // (A antiga sincronizarEquipamentosTecnico() foi fundida na sincronizarEquipamentos():
+  // as duas ficaram idênticas quando a versão geral também deixou de inferir exclusões.)
+  if(!equipsCarregados) return;
+  sincronizarEquipamentos();
 }
 async function acharEquipPorSerieAsync(serie){
   const local = acharEquipPorSerie(serie);
   if(local) return local;
-  try{ const doc = await EQUIPS_REF.doc(serie).get(); return doc.exists ? doc.data() : null; }
-  catch(e){ return null; }
+  try{
+    const { data } = await sb.from('equipamentos').select('*').eq('serie', serie).maybeSingle();
+    return data ? equipamentoParaCamel(data) : null;
+  }catch(e){ return null; }
+}
+// O PostgREST limita a 1000 linhas por padrão numa única resposta — uma consulta
+// "select tudo" sem paginação vinha TRUNCADA em silêncio (sem erro, sem aviso),
+// e pra equipamentos isso é catastrófico: sincronizarEquipamentos() trata "sumiu
+// do array local" como "foi excluído de propósito" e apaga a diferença no banco de
+// verdade. Achado ao vivo com ~5 mil equipamentos de teste — apagou ~1000 itens
+// reais sem nenhum erro visível (ver BUG-034). Toda consulta que pode passar de
+// 1000 linhas tem que usar esta função, nunca um select('*') direto.
+async function selecionarTudo(tabela, configurar){
+  // Usa count:'exact' (o total real, via Content-Range do PostgREST) pra decidir
+  // quando parar — em vez de só comparar "voltou menos que 1000 = acabou", que
+  // seria frágil se o servidor um dia limitar menos que 1000 por página: nesse
+  // caso uma página parcial NÃO significa "isso é tudo", e comparar só o tamanho
+  // reintroduziria exatamente o mesmo risco do BUG-034.
+  const PAGINA = 1000;
+  let todos = [];
+  let offset = 0;
+  while(true){
+    let q = sb.from(tabela).select('*', { count:'exact' });
+    if(configurar) q = configurar(q);
+    const { data, error, count } = await q.range(offset, offset+PAGINA-1);
+    if(error) throw error;
+    if(!data || !data.length) break;
+    todos = todos.concat(data);
+    offset += data.length;
+    if(count!=null && todos.length>=count) break;
+  }
+  return todos;
+}
+
+async function sincronizarTipos(){
+  const codigos = Object.keys(DB.tipos);
+  const alterados = [];
+  codigos.forEach(cod=>{
+    const row = tipoParaSnake(cod, DB.tipos[cod]);
+    const json = JSON.stringify(row);
+    if(ultimoSyncTipos[cod]!==json) alterados.push(row);
+  });
+  const removidos = Object.keys(ultimoSyncTipos).filter(c=>!codigos.includes(c));
+  if(alterados.length){
+    const { error } = await sb.from('tipos').upsert(alterados, { onConflict:'codigo' });
+    if(error) throw error;
+  }
+  if(removidos.length){
+    const { error } = await sb.from('tipos').delete().in('codigo', removidos);
+    if(error) throw error;
+  }
+  alterados.forEach(r=>{ ultimoSyncTipos[r.codigo]=JSON.stringify(r); });
+  removidos.forEach(c=>{ delete ultimoSyncTipos[c]; });
+}
+async function sincronizarFiliais(){
+  // Usa todasFiliaisConhecidas() (DB.filiais + deposito de equipamentos + regiao de
+  // técnicos), não só DB.filiais — o app sempre permitiu referenciar uma filial só por
+  // ela aparecer num equipamento/técnico importado, sem precisar "cadastrar" antes.
+  // Sem isso, importar equipamento com depósito novo falha por causa da FK (ver BUG-030).
+  const atuais = new Set(todasFiliaisConhecidas());
+  const novas = [...atuais].filter(f=>!ultimoSyncFiliais.has(f));
+  const removidas = [...ultimoSyncFiliais].filter(f=>!atuais.has(f));
+  if(novas.length){
+    const { error } = await sb.from('filiais').upsert(novas.map(sigla=>({sigla})), { onConflict:'sigla' });
+    if(error) throw error;
+  }
+  if(removidas.length){
+    const { error } = await sb.from('filiais').delete().in('sigla', removidas);
+    if(error) throw error;
+  }
+  ultimoSyncFiliais = atuais;
+}
+async function sincronizarTecnicos(){
+  const idsAtuais = new Set(DB.tecnicos.map(t=>t.id));
+  const alterados = DB.tecnicos.filter(t=>ultimoSyncTecnicos[t.id]!==JSON.stringify(t));
+  const removidos = Object.keys(ultimoSyncTecnicos).filter(id=>!idsAtuais.has(id));
+  if(alterados.length){
+    const { error } = await sb.from('tecnicos').upsert(alterados.map(tecnicoParaSnake), { onConflict:'id' });
+    if(error) throw error;
+  }
+  if(removidos.length){
+    const { error } = await sb.from('tecnicos').delete().in('id', removidos);
+    if(error) throw error;
+  }
+  alterados.forEach(t=>{ ultimoSyncTecnicos[t.id]=JSON.stringify(t); });
+  removidos.forEach(id=>{ delete ultimoSyncTecnicos[id]; });
+}
+async function sincronizarConfig(){
+  const json = JSON.stringify(DB.config);
+  if(ultimoSyncConfigJson===json) return;
+  const { error } = await sb.from('config').update(configParaSnake(DB.config)).eq('id', true);
+  if(error) throw error;
+  ultimoSyncConfigJson = json;
 }
 
 function salvar(){
   salvarLocal();
   if(aplicandoRemoto) return;
   clearTimeout(salvarTimeout);
-  salvarTimeout = setTimeout(()=>{
-    const { movimentacoes, auditorias, equipamentos, ...semMovs } = DB;
-    DOC_REF.set(semMovs).catch(e=>flash('⚠️ Falha ao sincronizar: '+e.message,'red'));
+  salvarTimeout = setTimeout(async ()=>{
+    // tipos/filiais/tecnicos precisam terminar ANTES de mexer em equipamentos: a tabela
+    // equipamentos tem chave estrangeira pra tipos.codigo/filiais.sigla/tecnicos.id, então
+    // gravar um equipamento com um tipo/filial/técnico novo antes desses existirem no banco
+    // falha com "violates foreign key constraint" (achado ao vivo, ver BUG-030).
+    const resultados = await Promise.allSettled([
+      sincronizarTipos(), sincronizarFiliais(), sincronizarTecnicos(), sincronizarConfig()
+    ]);
+    let semConexao = false;
+    resultados.forEach(r=>{
+      if(r.status!=='rejected') return;
+      if(pareceFalhaDeConexao(r.reason)) semConexao = true;
+      else flash('Falha ao sincronizar: '+r.reason.message,'red');
+    });
+    if(semConexao) atualizarIndicadorFilaOffline(1); // sem fila explícita aqui — a próxima chamada (ação, 'online' ou timer) já reenvia sozinha
     persistirEquipamentos();
   }, 400);
 }
 
-function iniciarSyncNuvem(){
+async function iniciarSyncNuvem(){
   const foot = document.getElementById('footSync');
-  DOC_REF.onSnapshot(snap=>{
-    if(foot) foot.innerHTML = 'Sincronizado com a nuvem ☁️<br>Faça backup em <b>Dados</b>.';
-    if(snap.metadata.hasPendingWrites) return; // eco da própria escrita
-    const data = snap.data();
-    if(data){
-      aplicandoRemoto = true;
-      const movsAtual = DB.movimentacoes;
-      const audsAtual = DB.auditorias;
-      const equipsAtual = DB.equipamentos;
-      DB = Object.assign(estadoInicial(), data);
-      DB.movimentacoes = movsAtual; // histórico é gerenciado pelo listener da coleção própria
-      DB.auditorias = audsAtual;    // idem para auditorias
-      DB.equipamentos = data.equipamentos && data.equipamentos.length ? data.equipamentos : equipsAtual; // migração: usa embutido só se coleção ainda não carregou
-      salvarLocal();
-      aplicandoRemoto = false;
-      renderNav(); render();
-      verificarBackupAutomatico();
-      if(data.equipamentos && data.equipamentos.length) migrarEquipamentosParaColecao(data.equipamentos);
-    } else {
-      const { movimentacoes, auditorias, equipamentos, ...semMovs } = DB;
-      DOC_REF.set(semMovs); // primeira vez: envia os dados locais como base
-      if(DB.equipamentos.length) persistirEquipamentos();
-    }
-  }, err=>{
-    if(foot) foot.innerHTML = '⚠️ Sem conexão com a nuvem<br>Usando dados locais.';
-    flash('⚠️ Erro de sincronização: '+err.message,'red');
-  });
-  MOVS_REF.orderBy('ts','asc').onSnapshot(snap=>{
-    DB.movimentacoes = snap.docs.map(d=>d.data());
+  try{
+    const [tiposLista, filiaisLista, tecnicosLista, configRes] = await Promise.all([
+      selecionarTudo('tipos'),
+      selecionarTudo('filiais'),
+      selecionarTudo('tecnicos'),
+      sb.from('config').select('*').eq('id', true).maybeSingle()
+    ]);
+    aplicandoRemoto = true;
+    DB.tipos = tiposArrayParaObjeto(tiposLista);
+    DB.filiais = filiaisLista.map(r=>r.sigla);
+    DB.tecnicos = tecnicosLista.map(r=>({ id:r.id, nome:r.nome, regiao:r.regiao, matricula:r.matricula }));
+    DB.config = configRes.data ? configParaCamel(configRes.data) : DB.config;
+    ultimoSyncTipos = {}; tiposLista.forEach(r=>{ ultimoSyncTipos[r.codigo]=JSON.stringify(r); });
+    ultimoSyncFiliais = new Set(DB.filiais);
+    ultimoSyncTecnicos = {}; DB.tecnicos.forEach(t=>{ ultimoSyncTecnicos[t.id]=JSON.stringify(t); });
+    ultimoSyncConfigJson = JSON.stringify(DB.config);
     salvarLocal();
-    if(movsCarregadas) render();
-    movsCarregadas = true;
-  }, err=>{ flash('⚠️ Erro ao carregar histórico: '+err.message,'red'); });
-  AUDS_REF.orderBy('ts','asc').onSnapshot(snap=>{
-    DB.auditorias = snap.docs.map(d=>d.data());
-    salvarLocal();
-    if(audsCarregadas) render();
-    audsCarregadas = true;
-  }, err=>{ flash('⚠️ Erro ao carregar auditorias: '+err.message,'red'); });
-  iniciarListenerEquipamentos();
+    aplicandoRemoto = false;
+    if(foot) foot.innerHTML = 'Sincronizado com a nuvem '+ic('cloud')+'<br>Faça backup em <b>Dados</b>.';
+    renderNav(); render();
+    verificarBackupAutomatico();
+  }catch(err){
+    if(foot) foot.innerHTML = ic('alert-triangle')+' Sem conexão com a nuvem<br>Usando dados locais.';
+    flash('Erro de sincronização: '+err.message,'red');
+  }
+  // mostra na hora se sobrou algo da fila offline de uma sessão anterior, e já tenta
+  // esvaziar (não faz nada se ainda estiver sem conexão).
+  atualizarIndicadorFilaOffline(lerFilaOffline().length);
+  tentarEsvaziarFilaOffline();
+
+  // movimentações/auditorias: log append-only — carga inicial ordenada + só acrescenta no INSERT
+  DB.movimentacoes = (await selecionarTudo('movimentacoes', q=>q.order('ts',{ascending:true}))).map(movimentacaoParaCamel);
+  salvarLocal(); movsCarregadas = true; render();
+  DB.auditorias = (await selecionarTudo('auditorias', q=>q.order('ts',{ascending:true}))).map(auditoriaParaCamel);
+  salvarLocal(); audsCarregadas = true; render();
+
+  // Tempo real: tipos/filiais/técnicos/config/movimentações/auditorias iam cada um num
+  // canal (WebSocket) próprio — com 63 usuários isso sozinho já chegava perto do limite
+  // de 200 conexões simultâneas do plano gratuito do Supabase. Um único canal aceita
+  // vários `.on('postgres_changes', ...)` encadeados (cada um com seu próprio filtro de
+  // tabela/evento), então as 6 assinaturas abaixo agora dividem 1 conexão só.
+  if(cadastrosCanalAtivo) sb.removeChannel(cadastrosCanalAtivo);
+  cadastrosCanalAtivo = sb.channel('cadastros-rt')
+    .on('postgres_changes', {event:'*',schema:'public',table:'tipos'}, async()=>{
+      const data = await selecionarTudo('tipos');
+      DB.tipos = tiposArrayParaObjeto(data);
+      ultimoSyncTipos = {}; data.forEach(r=>{ ultimoSyncTipos[r.codigo]=JSON.stringify(r); });
+      salvarLocal(); render();
+    })
+    .on('postgres_changes', {event:'*',schema:'public',table:'filiais'}, async()=>{
+      const data = await selecionarTudo('filiais');
+      DB.filiais = data.map(r=>r.sigla);
+      ultimoSyncFiliais = new Set(DB.filiais);
+      salvarLocal(); render();
+    })
+    .on('postgres_changes', {event:'*',schema:'public',table:'tecnicos'}, async()=>{
+      const data = await selecionarTudo('tecnicos');
+      DB.tecnicos = data.map(r=>({ id:r.id, nome:r.nome, regiao:r.regiao, matricula:r.matricula }));
+      ultimoSyncTecnicos = {}; DB.tecnicos.forEach(t=>{ ultimoSyncTecnicos[t.id]=JSON.stringify(t); });
+      salvarLocal(); render();
+    })
+    .on('postgres_changes', {event:'*',schema:'public',table:'config'}, async()=>{
+      const { data } = await sb.from('config').select('*').eq('id', true).maybeSingle();
+      if(data){ DB.config = configParaCamel(data); ultimoSyncConfigJson = JSON.stringify(DB.config); salvarLocal(); render(); }
+    })
+    .on('postgres_changes', {event:'INSERT',schema:'public',table:'movimentacoes'}, payload=>{
+      const m = movimentacaoParaCamel(payload.new);
+      if(!DB.movimentacoes.some(x=>x.id===m.id)){ DB.movimentacoes.push(m); salvarLocal(); if(movsCarregadas) render(); }
+    })
+    .on('postgres_changes', {event:'INSERT',schema:'public',table:'auditorias'}, payload=>{
+      const a = auditoriaParaCamel(payload.new);
+      if(!DB.auditorias.some(x=>x.id===a.id)){ DB.auditorias.push(a); salvarLocal(); if(audsCarregadas) render(); }
+    });
+  // iniciarListenerEquipamentos() encadeia mais 1-2 .on() no MESMO cadastrosCanalAtivo
+  // (equipamentos também divide essa conexão) — por isso o .subscribe() só acontece
+  // depois dela, nunca antes: todo listener precisa estar registrado antes de assinar.
+  iniciarListenerEquipamentos(cadastrosCanalAtivo);
+  cadastrosCanalAtivo.subscribe();
 }
 let equipsOwnMap = {}, equipsIncomingMap = {};
 function mesclarEquipamentosTecnico(){
@@ -270,46 +619,81 @@ function mesclarEquipamentosTecnico(){
   const lista = Object.values(combinados);
   ultimoSyncEquip = {};
   lista.forEach(e=>{ ultimoSyncEquip[e.serie]=JSON.stringify(e); });
-  if(lista.length || equipsCarregados){ DB.equipamentos = lista; salvarLocal(); }
-  if(equipsCarregados) render();
+  DB.equipamentos = lista; salvarLocal();
+  // Sempre atualiza equipsCarregados ANTES de render() e sempre renderiza (mesmo na
+  // primeira carga) — a versão anterior só renderizava a partir da SEGUNDA chamada,
+  // então um técnico sem nenhum evento de tempo real logo após o login ficava vendo
+  // a tela desatualizada indefinidamente (achado ao preparar a tela de "carregando").
   equipsCarregados = true;
+  render();
 }
-function iniciarListenerEquipamentos(){
+function aplicarEventoEquipTecnico(payload, mapa){
+  if(payload.eventType==='DELETE'){ delete mapa[payload.old.serie]; }
+  else { const e = equipamentoParaCamel(payload.new); mapa[e.serie]=e; }
+  mesclarEquipamentosTecnico();
+}
+function aplicarEventoEquipGeral(payload){
+  if(payload.eventType==='DELETE'){
+    const serie = payload.old.serie;
+    DB.equipamentos = DB.equipamentos.filter(e=>e.serie!==serie);
+    delete ultimoSyncEquip[serie];
+  } else {
+    const e = equipamentoParaCamel(payload.new);
+    const idx = DB.equipamentos.findIndex(x=>x.serie===e.serie);
+    if(idx>=0) DB.equipamentos[idx]=e; else DB.equipamentos.push(e);
+    ultimoSyncEquip[e.serie]=JSON.stringify(e);
+  }
+  salvarLocal();
+  if(equipsCarregados) render();
+}
+function iniciarListenerEquipamentos(canal){
   // Técnico só precisa dos itens que já são dele + os que estão a caminho pra ele —
   // isso evita que cada um dos ~50 técnicos baixe o inventário inteiro da empresa
   // toda vez que abre o app (o que já estourou a cota gratuita do Firestore num dia de testes).
-  // Admin e supervisor continuam vendo a coleção inteira (é o papel deles).
+  // Admin e supervisor continuam vendo a tabela inteira (é o papel deles).
+  // Os listeners de equipamentos entram no MESMO canal recebido por parâmetro (mais .on()
+  // encadeados) em vez de abrir canal próprio — só o .subscribe() final (chamado por
+  // quem chama esta função) é que efetivamente abre a conexão.
   if(souTecnico()){
     const meuId = MEU_PERFIL.tecnicoId;
     if(!meuId){ equipsCarregados=true; render(); return; }
-    EQUIPS_REF.where('tecnicoId','==',meuId).onSnapshot(snap=>{
-      if(snap.metadata.hasPendingWrites && equipsCarregados) return;
-      equipsOwnMap = {}; snap.docs.forEach(d=>{ equipsOwnMap[d.id]=d.data(); });
+    Promise.all([
+      selecionarTudo('equipamentos', q=>q.eq('tecnico_id', meuId)),
+      selecionarTudo('equipamentos', q=>q.eq('transito_para', meuId))
+    ]).then(([ownData, incData])=>{
+      equipsOwnMap = {}; ownData.forEach(r=>{ const e=equipamentoParaCamel(r); equipsOwnMap[e.serie]=e; });
+      equipsIncomingMap = {}; incData.forEach(r=>{ const e=equipamentoParaCamel(r); equipsIncomingMap[e.serie]=e; });
       mesclarEquipamentosTecnico();
-    }, err=>{ flash('⚠️ Erro ao carregar equipamentos: '+err.message,'red'); });
-    EQUIPS_REF.where('transitoPara','==',meuId).onSnapshot(snap=>{
-      if(snap.metadata.hasPendingWrites && equipsCarregados) return;
-      equipsIncomingMap = {}; snap.docs.forEach(d=>{ equipsIncomingMap[d.id]=d.data(); });
-      mesclarEquipamentosTecnico();
-    }, err=>{ flash('⚠️ Erro ao carregar equipamentos: '+err.message,'red'); });
+    }).catch(err=>flash('Erro ao carregar equipamentos: '+err.message,'red'));
+    canal
+      .on('postgres_changes',
+        {event:'*',schema:'public',table:'equipamentos',filter:`tecnico_id=eq.${meuId}`},
+        payload=>aplicarEventoEquipTecnico(payload, equipsOwnMap))
+      .on('postgres_changes',
+        {event:'*',schema:'public',table:'equipamentos',filter:`transito_para=eq.${meuId}`},
+        payload=>aplicarEventoEquipTecnico(payload, equipsIncomingMap));
   } else {
-    EQUIPS_REF.onSnapshot(snap=>{
-      if(snap.metadata.hasPendingWrites && equipsCarregados) return; // eco da própria escrita, evita sobrescrever edição em digitação
-      const lista = snap.docs.map(d=>d.data());
-      ultimoSyncEquip = {};
-      lista.forEach(e=>{ ultimoSyncEquip[e.serie]=JSON.stringify(e); });
-      if(lista.length || equipsCarregados){ DB.equipamentos = lista; salvarLocal(); }
-      if(equipsCarregados) render();
-      equipsCarregados = true;
-    }, err=>{ flash('⚠️ Erro ao carregar equipamentos: '+err.message,'red'); });
+    selecionarTudo('equipamentos').then(data=>{
+      const lista = data.map(equipamentoParaCamel);
+      ultimoSyncEquip = {}; lista.forEach(e=>{ ultimoSyncEquip[e.serie]=JSON.stringify(e); });
+      DB.equipamentos = lista; salvarLocal();
+      equipsCarregados = true; render();
+    }).catch(err=>flash('Erro ao carregar equipamentos: '+err.message,'red'));
+    canal.on('postgres_changes',
+      {event:'*',schema:'public',table:'equipamentos'}, aplicarEventoEquipGeral);
   }
 }
-async function migrarEquipamentosParaColecao(lista){
-  await gravarEmLote(EQUIPS_REF, lista, e=>e.serie);
-  lista.forEach(e=>{ ultimoSyncEquip[e.serie]=JSON.stringify(e); });
-  DOC_REF.update({ equipamentos: firebase.firestore.FieldValue.delete() }).catch(()=>{});
+// Gera um UUID de verdade — movimentacoes.id, auditorias.id e tecnicos.id são colunas
+// uuid no Postgres; o formato curto antigo (base36) era aceito pelo Firestore (documento
+// sem tipo fixo de chave) mas o Postgres rejeita como "invalid input syntax for type uuid"
+// (achado ao vivo, ver BUG-031).
+function uid(){
+  if(typeof crypto!=='undefined' && crypto.randomUUID) return crypto.randomUUID();
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c=>{
+    const r = Math.random()*16|0, v = c==='x'?r:(r&0x3|0x8);
+    return v.toString(16);
+  });
 }
-function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
 const FILIAL_CORRECOES = { 'SFO':'SOO', 'SF0':'SOO', 'JDA':'JND', 'POA':'PAE', 'RIP':'RBP' };
 function todasFiliaisConhecidas(){
   const s = new Set(DB.filiais||[]);
@@ -338,10 +722,61 @@ const $ = s => document.querySelector(s);
 const esc = s => (s==null?'':String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function tecNome(id){ const t = DB.tecnicos.find(x=>x.id===id); if(!t) return '—'; return (t.regiao?'['+t.regiao+'] ':'')+t.nome; }
 function tipoNome(cod){ return (DB.tipos[cod]&&DB.tipos[cod].nome)||cod; }
-function tipoCor(cod){ const k=Object.keys(DB.tipos); const i=k.indexOf(cod); return (DB.tipos[cod]&&DB.tipos[cod].cor)||TIPO_CORES[i%TIPO_CORES.length]||'#64748b'; }
+function tipoCor(cod){ const k=Object.keys(DB.tipos); const i=k.indexOf(cod); const cores=tipoCores(); return (DB.tipos[cod]&&DB.tipos[cod].cor)||cores[i%cores.length]||'#5b6672'; }
 function fmtData(d){ if(!d) return '—'; if(d instanceof Date) return d.toLocaleDateString('pt-BR'); return d; }
 function fmtTS(ts){ const d=new Date(ts); return d.toLocaleDateString('pt-BR')+' '+d.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}); }
-function flash(msg, kind=''){ const f=document.createElement('div'); f.className='flash '+kind; f.innerHTML=msg; document.body.appendChild(f); setTimeout(()=>{f.style.opacity='0';f.style.transition='.3s';setTimeout(()=>f.remove(),300);},2400); }
+/* ---------- Ícones (SVG inline, estilo Lucide — sem emoji, funciona offline) ---------- */
+const ICONS = {
+  check:'<path d="M20 6 9 17l-5-5"/>',
+  'alert-triangle':'<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
+  info:'<circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>',
+  'hard-hat':'<path d="M2 18a1 1 0 0 0 1 1h18a1 1 0 0 0 1-1 8 8 0 0 0-8-8h-4a8 8 0 0 0-8 8Z"/><path d="M10 10V4"/><path d="M14 10V4"/><path d="M6 18v-3"/><path d="M18 18v-3"/>',
+  printer:'<path d="M6 9V2h12v7"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/>',
+  'building-2':'<path d="M6 22V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v18Z"/><path d="M6 12H4a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h2"/><path d="M18 9h2a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-2"/><path d="M10 6h4"/><path d="M10 10h4"/><path d="M10 14h4"/><path d="M10 18h4"/>',
+  'bar-chart-3':'<path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/>',
+  package:'<path d="M16.5 9.4 7.5 4.21"/><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4a2 2 0 0 0 1-1.73Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/>',
+  'map-pin':'<path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="3"/>',
+  search:'<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
+  recycle:'<path d="M7 19H4.815a1.83 1.83 0 0 1-1.57-.881 1.785 1.785 0 0 1-.004-1.784L7.196 9.5"/><path d="M11 19h8.203a1.83 1.83 0 0 0 1.556-.89 1.784 1.784 0 0 0 0-1.775l-1.226-2.12"/><path d="m14 16-3 3 3 3"/><path d="M8.293 13.596 7.196 9.5 3.1 10.598"/><path d="m9.344 5.811 1.093-1.892A1.83 1.83 0 0 1 11.985 3a1.784 1.784 0 0 1 1.546.888l3.943 6.843"/><path d="m13.378 9.633 4.096 1.098 1.097-4.096"/>',
+  clock:'<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
+  hourglass:'<path d="M5 22h14"/><path d="M5 2h14"/><path d="M17 22v-4.172a2 2 0 0 0-.586-1.414L12 12l-4.414 4.414A2 2 0 0 0 7 17.828V22"/><path d="M7 2v4.172a2 2 0 0 0 .586 1.414L12 12l4.414-4.414A2 2 0 0 0 17 6.172V2"/>',
+  'alarm-clock':'<circle cx="12" cy="13" r="8"/><path d="M12 9v4l2 2"/><path d="M5 3 2 6"/><path d="m22 6-3-3"/><path d="M6.38 18.7 4 21"/><path d="M17.64 18.67 20 21"/>',
+  target:'<circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/>',
+  'clipboard-list':'<rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><path d="M12 11h4"/><path d="M12 16h4"/><path d="M8 11h.01"/><path d="M8 16h.01"/>',
+  x:'<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+  inbox:'<path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11Z"/>',
+  pencil:'<path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/>',
+  'trash-2':'<path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/>',
+  download:'<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/>',
+  upload:'<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M17 8l-5-5-5 5"/><path d="M12 3v12"/>',
+  eraser:'<path d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21"/><path d="M22 21H7"/><path d="m5 11 9 9"/>',
+  save:'<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/>',
+  'file-text':'<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v6h6"/><path d="M16 13H8"/><path d="M16 17H8"/><path d="M10 9H8"/>',
+  lock:'<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+  cloud:'<path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/>',
+  tag:'<path d="M12.586 2.586A2 2 0 0 0 11.172 2H4a2 2 0 0 0-2 2v7.172a2 2 0 0 0 .586 1.414l8.704 8.704a2.426 2.426 0 0 0 3.42 0l6.58-6.58a2.426 2.426 0 0 0 0-3.42Z"/><circle cx="7.5" cy="7.5" r="1.5"/>',
+  'refresh-cw':'<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
+  repeat:'<path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/>',
+  'trending-up':'<polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/>',
+  square:'<rect x="3" y="3" width="18" height="18" rx="2"/>',
+  link:'<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>',
+  'x-circle':'<circle cx="12" cy="12" r="10"/><path d="m15 9-6 6"/><path d="m9 9 6 6"/>',
+  image:'<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/>',
+  'list-checks':'<path d="m3 17 2 2 4-4"/><path d="m3 7 2 2 4-4"/><path d="M13 6h8"/><path d="M13 12h8"/><path d="M13 18h8"/>',
+  flame:'<path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5"/>',
+  'folder-open':'<path d="m6 14 1.45-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/>',
+  shuffle:'<path d="m18 14 4 4-4 4"/><path d="m18 2 4 4-4 4"/><path d="M2 18h1.973a4 4 0 0 0 3.3-1.7l5.454-8.6a4 4 0 0 1 3.3-1.7H22"/><path d="M2 6h1.972a4 4 0 0 1 3.6 2.2"/><path d="M22 18h-6.041a4 4 0 0 1-3.3-1.8l-.359-.45"/>',
+  'flask-conical':'<path d="M10 2v6.29a2 2 0 0 1-.5 1.33L4.24 15.7A2 2 0 0 0 6 19h12a2 2 0 0 0 1.76-3.3l-5.26-6.08A2 2 0 0 1 14 8.29V2"/><path d="M8.5 2h7"/><path d="M7 16h10"/>',
+  'undo-2':'<path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5v0a5.5 5.5 0 0 1-5.5 5.5H11"/>',
+  camera:'<path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3Z"/><circle cx="12" cy="13" r="3"/>',
+};
+function ic(nome){ return '<svg class="ic-inline" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+(ICONS[nome]||'')+'</svg>'; }
+/* Referencia o token de cor (--brand, --green, --chart-1, ...) como var() ao vivo
+   em vez de resolver o valor agora — assim gráficos gerados em SVG/inline continuam
+   acompanhando a troca de tema sem precisar re-renderizar. */
+function corVar(nome){ return 'var('+nome+')'; }
+function tipoCores(){ return CHART_VARS.map(corVar); }
+function flash(msg, kind=''){ const iconeSvg = kind==='green'?ic('check'):kind==='red'?ic('alert-triangle'):ic('info'); const f=document.createElement('div'); f.className='flash '+kind; f.innerHTML=iconeSvg+'<span>'+msg+'</span>'; document.body.appendChild(f); setTimeout(()=>{f.style.opacity='0';f.style.transition='.3s';setTimeout(()=>f.remove(),300);},2400); }
 function refTS(e){ return e.desde || DB.config.importadoEm || null; }
 function diasEmPosse(e){ const t=refTS(e); if(!t) return null; return Math.floor((Date.now()-t)/86400000); }
 function fmtDias(n){ if(n==null) return '—'; if(n===0) return 'hoje'; if(n===1) return '1 dia'; if(n<30) return n+' dias'; const m=Math.floor(n/30); return m+(m===1?' mês':' meses'); }
@@ -359,27 +794,34 @@ function itensDoDeposito(dep){ return DB.equipamentos.filter(e=>e.status==='esto
 function acharEquipPorSerie(serie){ const s=(serie||'').toLowerCase(); return DB.equipamentos.find(e=>e.serie.toLowerCase()===s); }
 
 /* ---------- Modo escuro ---------- */
-function toggleDark(){ document.body.classList.toggle('dark'); localStorage.setItem('estoque_dark', document.body.classList.contains('dark')?'1':'0'); }
-if(localStorage.getItem('estoque_dark')==='1') document.body.classList.add('dark');
+/* O tema inicial (localStorage > prefers-color-scheme) já é resolvido por um
+   script inline no <head> do index.html, antes da primeira pintura, pra não
+   piscar o tema errado. Aqui só cuidamos da alternância manual. */
+function toggleDark(){
+  const atual = document.documentElement.getAttribute('data-theme');
+  const novo = atual==='dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', novo);
+  localStorage.setItem('estoque_tema', novo);
+}
 
 /* ---------- Navegação ---------- */
 const PAGES = [
-  { id:'dashboard', icon:'📊', titulo:'Visão Geral', sub:'Resumo do inventário', papeis:['admin','supervisor'] },
-  { id:'equip',     icon:'📦', titulo:'Equipamentos', sub:'Inventário item a item', papeis:['admin','supervisor'] },
-  { id:'mov',       icon:'🔄', titulo:'Movimentar', sub:'Registrar entrada, saída, transferência ou baixa', papeis:['admin','supervisor','tecnico'] },
-  { id:'tecnicos',  icon:'👷', titulo:'Técnicos', sub:'Cadastro e equipamentos em posse', papeis:['admin','supervisor'] },
-  { id:'parados',   icon:'⏰', titulo:'Itens Parados', sub:`Equipamentos com técnicos há ${DIAS_PARADO}+ dias`, papeis:['admin','supervisor'] },
-  { id:'rma',       icon:'♻️', titulo:'Estoque RMA', sub:'Equipamentos enviados para RMA, por filial e técnico', papeis:['admin','supervisor'] },
-  { id:'estoquemin', icon:'🎯', titulo:'Estoque Mínimo', sub:'Filiais abaixo do estoque mínimo por tipo de equipamento', papeis:['admin','supervisor'] },
-  { id:'auditoria', icon:'🔍', titulo:'Auditoria', sub:'Conferência de estoque por técnico ou depósito', papeis:['admin','supervisor'] },
-  { id:'hist',      icon:'🕓', titulo:'Histórico', sub:'Todas as movimentações registradas', papeis:['admin','supervisor'] },
-  { id:'tipos',     icon:'🏷️', titulo:'Tipos', sub:'Os 5 tipos de equipamento', papeis:['admin','supervisor'] },
-  { id:'filiais',   icon:'🏢', titulo:'Filiais', sub:'Cadastro de filiais e depósitos', papeis:['admin'] },
-  { id:'dados',     icon:'💾', titulo:'Dados', sub:'Importar, exportar e backup', papeis:['admin'] },
-  { id:'usuarios',  icon:'🔐', titulo:'Usuários', sub:'Aprovar acessos e definir permissões', papeis:['admin'] },
-  { id:'meusItens', icon:'📦', titulo:'Meus Equipamentos', sub:'Itens sob sua responsabilidade', papeis:['tecnico'] },
-  { id:'meuHistorico', icon:'🕓', titulo:'Meu Histórico', sub:'Movimentações dos seus itens', papeis:['tecnico'] },
-  { id:'retiradas', icon:'🔎', titulo:'Consultar Retirada', sub:'Busque pelo código da retirada em campo (ex.: RET-0001)', papeis:['admin','supervisor','tecnico'] },
+  { id:'dashboard', icon:'bar-chart-3', titulo:'Visão Geral', sub:'Resumo do inventário', papeis:['admin','supervisor'] },
+  { id:'equip',     icon:'package', titulo:'Equipamentos', sub:'Inventário item a item', papeis:['admin','supervisor'] },
+  { id:'mov',       icon:'refresh-cw', titulo:'Movimentar', sub:'Registrar entrada, saída, transferência ou baixa', papeis:['admin','supervisor','tecnico'] },
+  { id:'tecnicos',  icon:'hard-hat', titulo:'Técnicos', sub:'Cadastro e equipamentos em posse', papeis:['admin','supervisor'] },
+  { id:'parados',   icon:'alarm-clock', titulo:'Itens Parados', sub:`Equipamentos com técnicos há ${DIAS_PARADO}+ dias`, papeis:['admin','supervisor'] },
+  { id:'rma',       icon:'recycle', titulo:'Estoque RMA', sub:'Equipamentos enviados para RMA, por filial e técnico', papeis:['admin','supervisor'] },
+  { id:'estoquemin', icon:'target', titulo:'Estoque Mínimo', sub:'Filiais abaixo do estoque mínimo por tipo de equipamento', papeis:['admin','supervisor'] },
+  { id:'auditoria', icon:'search', titulo:'Auditoria', sub:'Conferência de estoque por técnico ou depósito', papeis:['admin','supervisor'] },
+  { id:'hist',      icon:'clock', titulo:'Histórico', sub:'Todas as movimentações registradas', papeis:['admin','supervisor'] },
+  { id:'tipos',     icon:'tag', titulo:'Tipos', sub:'Os 5 tipos de equipamento', papeis:['admin','supervisor'] },
+  { id:'filiais',   icon:'building-2', titulo:'Filiais', sub:'Cadastro de filiais e depósitos', papeis:['admin'] },
+  { id:'dados',     icon:'save', titulo:'Dados', sub:'Importar, exportar e backup', papeis:['admin'] },
+  { id:'usuarios',  icon:'lock', titulo:'Usuários', sub:'Aprovar acessos e definir permissões', papeis:['admin'] },
+  { id:'meusItens', icon:'package', titulo:'Meus Equipamentos', sub:'Itens sob sua responsabilidade', papeis:['tecnico'] },
+  { id:'meuHistorico', icon:'clock', titulo:'Meu Histórico', sub:'Movimentações dos seus itens', papeis:['tecnico'] },
+  { id:'retiradas', icon:'search', titulo:'Consultar Retirada', sub:'Busque pelo código da retirada em campo (ex.: RET-0001)', papeis:['admin','supervisor','tecnico'] },
 ];
 let PAGE = 'dashboard';
 function paginasDisponiveis(){ const papel = MEU_PERFIL?MEU_PERFIL.papel:null; return PAGES.filter(p=>p.papeis.includes(papel)); }
@@ -387,7 +829,7 @@ function paginasDisponiveis(){ const papel = MEU_PERFIL?MEU_PERFIL.papel:null; r
 function renderNav(){
   $('#nav').innerHTML = paginasDisponiveis().map(p=>`
     <button class="nav-item ${p.id===PAGE?'active':''}" onclick="goto('${p.id}')">
-      <span class="ic">${p.icon}</span> ${p.titulo}
+      <span class="ic">${ic(p.icon)}</span> ${p.titulo}
     </button>`).join('');
 }
 function goto(id){
@@ -402,16 +844,31 @@ function toggleSidebar(force){
 
 const RENDERERS = { dashboard:renderDashboard, equip:renderEquip, mov:renderMovPage, tecnicos:renderTecnicos, parados:renderParados, rma:renderRMA, estoquemin:renderEstoqueMinimo, auditoria:renderAuditoria, hist:renderHist, tipos:renderTipos, filiais:renderFiliais, dados:renderDados, usuarios:renderUsuarios, meusItens:renderMeusItens, meuHistorico:renderMeuHistorico, retiradas:renderRetiradas };
 function render(){
+  // Enquanto a carga inicial de equipamentos ainda não terminou de verdade (ex.: logo
+  // depois de um F5), mostra "carregando" em vez de renderizar com o que sobrou no
+  // localStorage de uma sessão anterior — evita o "flash" de números desatualizados.
+  if(!equipsCarregados) return renderCarregando();
   const semDados = ['dados','tipos','filiais','usuarios','meusItens','meuHistorico','rma','retiradas','estoquemin'];
   if(DB.equipamentos.length===0 && !semDados.includes(PAGE)){ return renderVazio(); }
   RENDERERS[PAGE]();
+}
+
+function renderCarregando(){
+  $('#content').innerHTML = `
+  <div class="panel"><div class="pb">
+    <div class="empty">
+      <div class="big spin">${ic('refresh-cw')}</div>
+      <h2 style="margin-bottom:8px">Carregando...</h2>
+      <p class="muted">Buscando os dados mais recentes da nuvem.</p>
+    </div>
+  </div></div>`;
 }
 
 function renderVazio(){
   $('#content').innerHTML = `
   <div class="panel"><div class="pb">
     <div class="empty">
-      <div class="big">📥</div>
+      <div class="big">${ic('inbox')}</div>
       <h2 style="margin-bottom:8px">Nenhum dado ainda</h2>
       <p class="muted" style="margin-bottom:20px;max-width:460px;margin-inline:auto">
         Comece importando seu inventário. Você pode <b>colar</b> os dados copiados da planilha
@@ -449,19 +906,19 @@ function renderDashboard(){
   const maxTipo = Math.max(1,...tiposArr.map(t=>t[1]));
 
   // painel secundário: por depósito (visão geral) OU por técnico (quando uma ou mais filiais estão selecionadas)
-  let painel2Titulo, painel2Arr, painel2Max, painel2Cor='#2563eb', painel2PorTecnico=false;
+  let painel2Titulo, painel2Arr, painel2Max, painel2Cor=corVar('--brand'), painel2PorTecnico=false;
   if(dashFiliais.length){
     const porTec = {};
     eq.filter(e=>e.status==='com_tecnico').forEach(e=>{ const id=e.tecnicoId; porTec[id]=(porTec[id]||0)+1; });
-    painel2Titulo = '👷 Itens com técnicos das filiais selecionadas <span class="muted" style="font-size:11px;font-weight:500">(clique num técnico para ver a ficha completa)</span>';
+    painel2Titulo = ic('hard-hat')+' Itens com técnicos das filiais selecionadas <span class="muted" style="font-size:11px;font-weight:500">(clique num técnico para ver a ficha completa)</span>';
     painel2Arr = Object.entries(porTec).sort((a,b)=>b[1]-a[1]).slice(0,8);
     painel2Max = Math.max(1,...painel2Arr.map(d=>d[1]));
-    painel2Cor='#d97706';
+    painel2Cor=corVar('--amber');
     painel2PorTecnico=true;
   } else {
     const porDep = {};
     eq.filter(e=>e.status!=='baixado').forEach(e=>{ const d=e.local||e.deposito||'—'; porDep[d]=(porDep[d]||0)+1; });
-    painel2Titulo = '📍 Itens ativos por depósito/local';
+    painel2Titulo = ic('map-pin')+' Itens ativos por depósito/local';
     painel2Arr = Object.entries(porDep).sort((a,b)=>b[1]-a[1]).slice(0,8);
     painel2Max = Math.max(1,...painel2Arr.map(d=>d[1]));
   }
@@ -477,36 +934,36 @@ function renderDashboard(){
   $('#content').innerHTML = `
   ${(alertasMinGeral.length||parados.length||tecsSemAud.length||pendentesConf.length)?`
   <div class="panel" style="margin-bottom:18px;border-left:4px solid var(--amber)">
-    <div class="ph"><h3>☀️ Resumo do dia — o que precisa de ação</h3></div>
+    <div class="ph"><h3>${ic('list-checks')} Resumo do dia — o que precisa de ação</h3></div>
     <div class="pb" style="display:flex;flex-wrap:wrap;gap:10px">
-      ${pendentesConf.length?`<button class="badge blue" style="padding:8px 12px;border:0;cursor:pointer" onclick="abrirPendentesConfirmacao()">📥 ${pendentesConf.length} ${pendentesConf.length===1?'item aguardando confirmação':'itens aguardando confirmação'}</button>`:''}
-      ${alertasMinGeral.length?`<button class="badge baixado" style="padding:8px 12px;border:0;cursor:pointer" onclick="goto('estoquemin')">🎯 ${alertasMinGeral.length} ${alertasMinGeral.length===1?'alerta de estoque mínimo':'alertas de estoque mínimo'}</button>`:''}
+      ${pendentesConf.length?`<button class="badge blue" style="padding:8px 12px;border:0;cursor:pointer" onclick="abrirPendentesConfirmacao()">${ic('inbox')} ${pendentesConf.length} ${pendentesConf.length===1?'item aguardando confirmação':'itens aguardando confirmação'}</button>`:''}
+      ${alertasMinGeral.length?`<button class="badge baixado" style="padding:8px 12px;border:0;cursor:pointer" onclick="goto('estoquemin')">${ic('target')} ${alertasMinGeral.length} ${alertasMinGeral.length===1?'alerta de estoque mínimo':'alertas de estoque mínimo'}</button>`:''}
       ${parados.length?`<button class="badge com_tecnico" style="padding:8px 12px;border:0;cursor:pointer" onclick="goto('parados')">${parados.length} ${parados.length===1?'item parado':'itens parados'} ${DIAS_PARADO}+ dias com técnico</button>`:''}
       ${tecsSemAud.length?`<button class="badge gray" style="padding:8px 12px;border:0;cursor:pointer" onclick="goto('auditoria')">${tecsSemAud.length} ${tecsSemAud.length===1?'técnico nunca auditado':'técnicos nunca auditados'}</button>`:''}
     </div>
   </div>`:''}
   <div class="panel" style="margin-bottom:18px"><div class="pb" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-    <span style="font-weight:700;font-size:12.5px;color:var(--txt-soft);white-space:nowrap">🏢 FILIAL / DEPÓSITO ${dashFiliais.length?`<span class="muted" style="font-weight:500">(${dashFiliais.length} selecionada${dashFiliais.length>1?'s':''} · clique para adicionar/remover)</span>`:'<span class="muted" style="font-weight:500">(clique para filtrar, pode escolher várias)</span>'}</span>
+    <span style="font-weight:700;font-size:12.5px;color:var(--txt-soft);white-space:nowrap">${ic('building-2')} FILIAL / DEPÓSITO ${dashFiliais.length?`<span class="muted" style="font-weight:500">(${dashFiliais.length} selecionada${dashFiliais.length>1?'s':''} · clique para adicionar/remover)</span>`:'<span class="muted" style="font-weight:500">(clique para filtrar, pode escolher várias)</span>'}</span>
     <div class="pill-tabs" style="flex-wrap:wrap;background:transparent;padding:0;gap:8px">
-      <button class="${!dashFiliais.length?'active':''}" style="background:${!dashFiliais.length?'var(--brand)':'var(--panel-soft)'};color:${!dashFiliais.length?'#fff':'var(--txt)'};border-radius:9px" onclick="dashFiliais=[];renderDashboard()">Todas <span class="count-badge" style="background:rgba(255,255,255,.25);color:inherit;margin-left:4px">${baseEq.length}</span></button>
+      <button class="${!dashFiliais.length?'active':''}" style="background:${!dashFiliais.length?'var(--brand)':'var(--panel-soft)'};color:${!dashFiliais.length?'#fff':'var(--txt)'};border-radius:var(--radius-md)" onclick="dashFiliais=[];renderDashboard()">Todas <span class="count-badge" style="background:rgba(255,255,255,.25);color:inherit;margin-left:4px">${baseEq.length}</span></button>
       ${todasFiliais.map(d=>{ const n=baseEq.filter(e=>e.deposito===d).length; const on=dashFiliais.includes(d); return `
-        <button class="${on?'active':''}" style="background:${on?'var(--brand)':'var(--panel-soft)'};color:${on?'#fff':'var(--txt)'};border-radius:9px" onclick="dashToggleFilial('${esc(d)}')">${on?'✓ ':''}${esc(d)} <span class="count-badge" style="background:${on?'rgba(255,255,255,.25)':'#e2e8f0'};color:inherit;margin-left:4px">${n}</span></button>`;}).join('')}
+        <button class="${on?'active':''}" style="background:${on?'var(--brand)':'var(--panel-soft)'};color:${on?'#fff':'var(--txt)'};border-radius:var(--radius-md)" onclick="dashToggleFilial('${esc(d)}')">${on?ic('check')+' ':''}${esc(d)} <span class="count-badge" style="background:${on?'rgba(255,255,255,.25)':'var(--surface-2)'};color:inherit;margin-left:4px">${n}</span></button>`;}).join('')}
     </div>
     <div class="spacer"></div>
-    <button class="btn sm" onclick="relatorioFilial()">🖨️ Gerar relatório</button>
+    <button class="btn sm" onclick="relatorioFilial()">${ic('printer')} Gerar relatório</button>
   </div></div>
 
   <div class="grid kpis" style="margin-bottom:20px">
-    ${kpi('b','📦','Total de itens',total)}
-    ${kpi('g','✅','Em estoque',emEstoque)}
-    ${kpi('a','👷','Com técnicos',comTec)}
-    ${kpi('r','♻️','RMA',baixados)}
-    ${kpi('v','🔍','Auditorias',auditoriasFiltradas.length)}
+    ${kpi('b','package','Total de itens',total)}
+    ${kpi('g','check','Em estoque',emEstoque)}
+    ${kpi('a','hard-hat','Com técnicos',comTec)}
+    ${kpi('r','recycle','RMA',baixados)}
+    ${kpi('v','search','Auditorias',auditoriasFiltradas.length)}
   </div>
 
   <div class="chart-row" style="margin-bottom:20px">
     <div class="panel">
-      <div class="ph"><h3>📦 Itens por tipo de equipamento</h3></div>
+      <div class="ph"><h3>${ic('package')} Itens por tipo de equipamento</h3></div>
       <div class="pb">
         ${tiposArr.length?tiposArr.map(([t,n])=>`
           <div class="bar-row">
@@ -518,7 +975,7 @@ function renderDashboard(){
     <div class="panel">
       <div class="ph"><h3>Distribuição (status)</h3></div>
       <div class="pb"><div class="donut-wrap">
-        ${donut([['Em estoque',emEstoque,'#16a34a'],['Com técnico',comTec,'#d97706'],['RMA',baixados,'#dc2626']])}
+        ${donut([['Em estoque',emEstoque,corVar('--green')],['Com técnico',comTec,corVar('--amber')],['RMA',baixados,corVar('--red')]])}
       </div></div>
     </div>
   </div>
@@ -536,7 +993,7 @@ function renderDashboard(){
       </div>
     </div>
     <div class="panel">
-      <div class="ph"><h3>🕓 Últimas movimentações</h3><div class="spacer"></div><button class="btn sm ghost" onclick="goto('hist')">Ver tudo →</button></div>
+      <div class="ph"><h3>${ic('clock')} Últimas movimentações</h3><div class="spacer"></div><button class="btn sm ghost" onclick="goto('hist')">Ver tudo →</button></div>
       <div class="pb" style="padding:8px 0">
         ${ultimas.length?ultimas.map(m=>`
           <div style="display:flex;align-items:center;gap:11px;padding:9px 20px;border-bottom:1px solid #f1f5f9">
@@ -551,7 +1008,7 @@ function renderDashboard(){
     </div>
   </div>`;
 }
-function kpi(c,ic,lbl,val){ return `<div class="kpi ${c}"><div class="ic">${ic}</div><div class="lbl">${lbl}</div><div class="val">${val}</div></div>`; }
+function kpi(c,icone,lbl,val){ return `<div class="kpi ${c}"><div class="ic">${ic(icone)}</div><div class="lbl">${lbl}</div><div class="val">${val}</div></div>`; }
 function movBadge(t){ const m={entrada:'badge blue',saida:'badge com_tecnico',transferencia:'badge violet',baixa:'badge baixado',retorno_rma:'badge estoque',confirmacao:'badge estoque',exclusao:'badge baixado',cancelamento:'badge gray',registro_campo:'badge blue'}; return `<span class="${m[t]||'badge gray'}">${MOV_LABEL[t]||t}</span>`; }
 
 function donut(data){
@@ -559,8 +1016,8 @@ function donut(data){
   let acc=0; const R=100, C=2*Math.PI*R;
   const segs = data.filter(d=>d[1]>0).map(d=>{ const frac=d[1]/total; const dash=Math.max(0,frac*C-3); const seg=`<circle r="${R}" cx="120" cy="120" fill="none" stroke="${d[2]}" stroke-width="34" stroke-linecap="round" stroke-dasharray="${dash} ${C-dash}" stroke-dashoffset="${-acc*C}" transform="rotate(-90 120 120)"/>`; acc+=frac; return seg; }).join('');
   return `<svg width="240" height="240" viewBox="0 0 240 240" style="flex-shrink:0">${segs}
-    <text x="120" y="115" text-anchor="middle" font-size="40" font-weight="800" fill="#0f172a">${total}</text>
-    <text x="120" y="140" text-anchor="middle" font-size="15" fill="#64748b">itens</text></svg>
+    <text x="120" y="115" text-anchor="middle" font-size="40" font-weight="800" fill="var(--txt)">${total}</text>
+    <text x="120" y="140" text-anchor="middle" font-size="15" fill="var(--txt-soft)">itens</text></svg>
   <div class="legend">${data.map(d=>`<div class="li"><span class="sw" style="background:${d[2]}"></span><span>${d[0]}</span><b style="margin-left:auto">${d[1]}</b><span class="muted" style="width:50px;text-align:right;font-weight:500;font-size:13.5px">${Math.round(d[1]/total*100)}%</span></div>`).join('')}</div>`;
 }
 
@@ -573,7 +1030,7 @@ function renderEquip(){
   const lista = filtrarEquip();
   $('#content').innerHTML = `
   <div class="toolbar">
-    <div class="search"><span class="si">🔎</span><input id="fq" placeholder="Buscar por nº de série..." value="${esc(eqFiltro.q)}" oninput="eqFiltro.q=this.value;renderEquipTabela()"></div>
+    <div class="search"><span class="si">${ic('search')}</span><input id="fq" placeholder="Buscar por nº de série..." value="${esc(eqFiltro.q)}" oninput="eqFiltro.q=this.value;renderEquipTabela()"></div>
     <select class="filter" onchange="eqFiltro.tipo=this.value;renderEquipTabela()">
       <option value="">Todos os tipos</option>
       ${Object.keys(DB.tipos).map(t=>`<option value="${t}" ${eqFiltro.tipo===t?'selected':''}>${esc(tipoNome(t))}</option>`).join('')}
@@ -586,7 +1043,7 @@ function renderEquip(){
       <option value="">Todos os depósitos</option>
       ${deps.map(d=>`<option value="${d}" ${eqFiltro.dep===d?'selected':''}>${esc(d)}</option>`).join('')}
     </select>
-    <button class="btn" onclick="exportarEquipCSV()">⬇️ Exportar CSV</button>
+    <button class="btn" onclick="exportarEquipCSV()">${ic('download')} Exportar CSV</button>
     <button class="btn primary" onclick="openEquip()">＋ Equipamento</button>
   </div>
   <div class="panel">
@@ -612,48 +1069,215 @@ function renderEquipTabela(){
     <tr>
       <td class="mono"><a href="#" onclick="abrirKardex('${esc(e.serie)}');return false" title="Ver histórico (kardex)"><b>${esc(e.serie)}</b></a></td>
       <td><span class="tag-tipo" style="border-left:3px solid ${tipoCor(e.tipo)}">${esc(tipoNome(e.tipo))}</span></td>
-      <td><span class="badge ${e.status}">${STATUS[e.status]}</span> ${e.emTransito?`<span class="badge com_tecnico" style="font-size:10px">⏳ em trânsito p/ ${esc(tecNome(e.transitoPara))}</span>`:''}</td>
+      <td><span class="badge ${e.status}">${STATUS[e.status]}</span> ${e.emTransito?`<span class="badge com_tecnico" style="font-size:10px">${ic('hourglass')} em trânsito p/ ${esc(tecNome(e.transitoPara))}</span>`:''}</td>
       <td>${e.status==='com_tecnico'?esc(tecNome(e.tecnicoId)):esc(e.local||e.deposito||'—')}</td>
       <td class="muted">${e.status==='com_tecnico'?'há '+fmtDias(diasEmPosse(e)):fmtData(e.dataEntrada)}</td>
       <td class="right">
         <button class="btn sm" ${e.emTransito?'disabled title="Aguardando confirmação do técnico"':''} onclick="openMov('${esc(e.serie)}')">Mover</button>
-        <button class="btn sm ghost" onclick="openEquip('${esc(e.serie)}')">✏️</button>
+        <button class="btn sm ghost" onclick="openEquip('${esc(e.serie)}')" aria-label="Editar equipamento">${ic('pencil')}</button>
       </td>
     </tr>`).join('');
   $('#eqTabela').innerHTML = lista.length? `<table>
     <thead><tr><th>Nº Série</th><th>Tipo</th><th>Status</th><th>Local / Técnico</th><th>Entrada / Posse</th><th class="right">Ações</th></tr></thead>
     <tbody>${rows}</tbody></table>
     ${lista.length>500?`<div class="muted center" style="padding:14px">Mostrando 500 de ${lista.length}. Use a busca/filtros para refinar.</div>`:''}`
-    : `<div class="empty"><div class="big">🔍</div>Nenhum equipamento encontrado com esses filtros.</div>`;
+    : `<div class="empty"><div class="big">${ic('search')}</div>Nenhum equipamento encontrado com esses filtros.</div>`;
 }
 
 /* =========================================================
    ITENS PARADOS (90+ dias com técnico)
    ========================================================= */
-function renderParados(){
-  const parados = DB.equipamentos.filter(e=>e.status==='com_tecnico' && (diasEmPosse(e)||0)>=DIAS_PARADO)
+let paradosFiliais = []; // array de depósitos selecionados; vazio = todas
+let paradosTecnicoFiltro = ''; // id do técnico selecionado no dropdown; vazio = todos
+function paradosToggleFilial(d){
+  const i = paradosFiliais.indexOf(d);
+  if(i>=0) paradosFiliais.splice(i,1); else paradosFiliais.push(d);
+  renderParados();
+}
+function paradosLista(){
+  return DB.equipamentos.filter(e=>e.status==='com_tecnico' && (diasEmPosse(e)||0)>=DIAS_PARADO)
     .sort((a,b)=>(diasEmPosse(b)||0)-(diasEmPosse(a)||0));
+}
+// Aplica os filtros de filial + técnico atuais — reaproveitado tanto pela tela quanto
+// pela exportação (Excel/relatório), pra exportar sempre bater com o que está na tela.
+function paradosFiltrados(){
+  const todosParados = souSupervisor() ? paradosLista().filter(e=>regiaoPermitida(e.deposito)) : paradosLista();
+  let parados = paradosFiliais.length ? todosParados.filter(e=>paradosFiliais.includes(e.deposito)) : todosParados;
+  if(paradosTecnicoFiltro) parados = parados.filter(e=>e.tecnicoId===paradosTecnicoFiltro);
+  return parados;
+}
+function renderParados(){
+  const todosParados = souSupervisor() ? paradosLista().filter(e=>regiaoPermitida(e.deposito)) : paradosLista();
+  let todasFiliais = [...new Set(todosParados.map(e=>e.deposito).filter(Boolean))].sort();
+  const paradosPorFilial = paradosFiliais.length ? todosParados.filter(e=>paradosFiliais.includes(e.deposito)) : todosParados;
+  const tecnicosDisponiveis = [...new Map(paradosPorFilial.filter(e=>e.tecnicoId).map(e=>[e.tecnicoId, e.tecnicoId])).keys()]
+    .map(id=>DB.tecnicos.find(t=>t.id===id)).filter(Boolean).sort((a,b)=>a.nome.localeCompare(b.nome));
+  if(paradosTecnicoFiltro && !tecnicosDisponiveis.some(t=>t.id===paradosTecnicoFiltro)) paradosTecnicoFiltro='';
+  const parados = paradosFiltrados();
+
+  const dias = parados.map(e=>diasEmPosse(e)||0);
+  const media = dias.length ? Math.round(dias.reduce((s,d)=>s+d,0)/dias.length) : 0;
+  const maisCritico = parados[0];
+  const filiaisAfetadas = new Set(parados.map(e=>e.deposito).filter(Boolean)).size;
+  const tecnicosAfetados = new Set(parados.map(e=>e.tecnicoId).filter(Boolean)).size;
+
+  const porTipo = {}; parados.forEach(e=>{ porTipo[e.tipo]=(porTipo[e.tipo]||0)+1; });
+  const tiposArr = Object.entries(porTipo).sort((a,b)=>b[1]-a[1]);
+  const maxTipo = Math.max(1,...tiposArr.map(t=>t[1]));
+
+  const faixas = [
+    { label:`${DIAS_PARADO}-30 dias`, min:DIAS_PARADO, max:30, cor:corVar('--amber') },
+    { label:'31-60 dias', min:31, max:60, cor:corVar('--red') },
+    { label:'61-90 dias', min:61, max:90, cor:'#991b1b' },
+    { label:'90+ dias', min:91, max:Infinity, cor:'#7f1d1d' }
+  ];
+  const porFaixa = faixas.map(f=>[f.label, parados.filter(e=>{ const d=diasEmPosse(e)||0; return d>=f.min && d<=f.max; }).length, f.cor]);
+
+  const porFilial = {}; todosParados.forEach(e=>{ const d=e.deposito||'—'; porFilial[d]=(porFilial[d]||0)+1; });
+  const filialArr = Object.entries(porFilial).sort((a,b)=>b[1]-a[1]);
+  const maxFilial = Math.max(1,...filialArr.map(f=>f[1]));
+
+  const porTec = {}; parados.forEach(e=>{ if(e.tecnicoId) porTec[e.tecnicoId]=(porTec[e.tecnicoId]||0)+1; });
+  const tecArr = Object.entries(porTec).sort((a,b)=>b[1]-a[1]).slice(0,8);
+  const maxTec = Math.max(1,...tecArr.map(t=>t[1]));
+
   $('#content').innerHTML = `
-  <div class="panel"><div class="ph"><h3>⏰ Itens parados com técnicos (${DIAS_PARADO}+ dias)</h3><span class="count-badge">${parados.length}</span><div class="spacer"></div>${parados.length?`<button class="btn sm" onclick="exportarParadosExcel()">📊 Exportar Excel</button><button class="btn sm" onclick="gerarRelatorioParados()">🖨️ Gerar relatório</button>`:''}</div>
+  ${todasFiliais.length?`
+  <div class="panel" style="margin-bottom:18px"><div class="pb" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+    <span style="font-weight:700;font-size:12.5px;color:var(--txt-soft);white-space:nowrap">${ic('building-2')} FILIAL ${paradosFiliais.length?`<span class="muted" style="font-weight:500">(${paradosFiliais.length} selecionada${paradosFiliais.length>1?'s':''} · clique pra adicionar/remover)</span>`:'<span class="muted" style="font-weight:500">(clique pra filtrar, pode escolher várias)</span>'}</span>
+    <div class="pill-tabs" style="flex-wrap:wrap;background:transparent;padding:0;gap:8px">
+      <button class="${!paradosFiliais.length?'active':''}" style="background:${!paradosFiliais.length?'var(--brand)':'var(--panel-soft)'};color:${!paradosFiliais.length?'#fff':'var(--txt)'};border-radius:var(--radius-md)" onclick="paradosFiliais=[];renderParados()">Todas <span class="count-badge" style="background:rgba(255,255,255,.25);color:inherit;margin-left:4px">${todosParados.length}</span></button>
+      ${todasFiliais.map(d=>{ const n=todosParados.filter(e=>e.deposito===d).length; const on=paradosFiliais.includes(d); return `
+        <button class="${on?'active':''}" style="background:${on?'var(--brand)':'var(--panel-soft)'};color:${on?'#fff':'var(--txt)'};border-radius:var(--radius-md)" onclick="paradosToggleFilial('${esc(d)}')">${on?ic('check')+' ':''}${esc(d)} <span class="count-badge" style="background:${on?'rgba(255,255,255,.25)':'var(--surface-2)'};color:inherit;margin-left:4px">${n}</span></button>`;}).join('')}
+    </div>
+    <div class="spacer"></div>
+    <div class="field" style="margin:0;min-width:200px"><label style="font-size:11px">${ic('hard-hat')} Filtrar por técnico</label>
+      <select onchange="paradosTecnicoFiltro=this.value;renderParados()">
+        <option value="">Todos os técnicos (${tecnicosDisponiveis.length})</option>
+        ${tecnicosDisponiveis.map(t=>`<option value="${t.id}" ${paradosTecnicoFiltro===t.id?'selected':''}>${t.regiao?'['+esc(t.regiao)+'] ':''}${esc(t.nome)}</option>`).join('')}
+      </select>
+    </div>
+  </div></div>`:''}
+
+  <div class="grid kpis" style="margin-bottom:20px">
+    ${kpi('r','alarm-clock','Itens parados',parados.length)}
+    ${kpi('a','bar-chart-3','Média de dias parado',media)}
+    ${kpi('v','flame','Mais crítico',maisCritico?fmtDias(diasEmPosse(maisCritico)):'—')}
+    ${kpi('b','building-2','Filiais afetadas',filiaisAfetadas)}
+    ${kpi('g','hard-hat','Técnicos afetados',tecnicosAfetados)}
+  </div>
+
+  ${parados.length?`
+  <div class="chart-row" style="margin-bottom:20px">
+    <div class="panel">
+      <div class="ph"><h3>${ic('package')} Itens parados por tipo de equipamento</h3></div>
+      <div class="pb">
+        ${tiposArr.length?tiposArr.map(([t,n])=>`
+          <div class="bar-row">
+            <div class="bl"><span style="width:11px;height:11px;border-radius:3px;background:${tipoCor(t)};display:inline-block"></span>${esc(tipoNome(t))}</div>
+            <div class="bar-track"><div class="bar-fill" style="width:${n/maxTipo*100}%;background:${tipoCor(t)}">${n}</div></div>
+          </div>`).join(''):'<div class="empty">Sem dados</div>'}
+      </div>
+    </div>
+    <div class="panel">
+      <div class="ph"><h3>${ic('alarm-clock')} Distribuição por tempo parado</h3></div>
+      <div class="pb"><div class="donut-wrap">${donut(porFaixa)}</div></div>
+    </div>
+  </div>
+
+  <div class="chart-row">
+    <div class="panel">
+      <div class="ph"><h3>${ic('building-2')} Itens parados por filial</h3><span class="muted" style="font-size:11px;font-weight:500;margin-left:6px">(clique para filtrar)</span></div>
+      <div class="pb">
+        ${filialArr.length?filialArr.map(([f,n])=>{
+          const intensidade = n/maxFilial; // 0 a 1 — mais itens parados = vermelho mais forte/escuro
+          const cor = `rgb(${220-Math.round(60*(1-intensidade))},${38+Math.round(90*(1-intensidade))},${38+Math.round(90*(1-intensidade))})`;
+          return `
+          <div class="bar-row" style="cursor:pointer" onclick="paradosToggleFilial('${esc(f)}')">
+            <div class="bl">${esc(f)}</div>
+            <div class="bar-track"><div class="bar-fill" style="width:${n/maxFilial*100}%;background:${cor}">${n}</div></div>
+          </div>`;}).join(''):'<div class="empty">Sem dados</div>'}
+      </div>
+    </div>
+    <div class="panel">
+      <div class="ph"><h3>${ic('hard-hat')} Técnicos com mais itens parados</h3><span class="muted" style="font-size:11px;font-weight:500;margin-left:6px">(clique para ver os itens)</span></div>
+      <div class="pb">
+        ${tecArr.length?tecArr.map(([id,n])=>`
+          <div class="bar-row" style="cursor:pointer" onclick="paradosFichaTecnico('${id}')">
+            <div class="bl">${esc(tecNome(id))}</div>
+            <div class="bar-track"><div class="bar-fill" style="width:${n/maxTec*100}%;background:${corVar('--amber')}">${n}</div></div>
+            <span class="muted" style="font-size:12px">→</span>
+          </div>`).join(''):'<div class="empty">Nenhum técnico com item parado</div>'}
+      </div>
+    </div>
+  </div>`:''}
+
+  ${(()=>{
+    // agrupado por técnico (a lista de itens de cada um abre num modal ao clicar)
+    const porTecnicoGrupo = {};
+    parados.forEach(e=>{ if(e.tecnicoId) (porTecnicoGrupo[e.tecnicoId]=porTecnicoGrupo[e.tecnicoId]||[]).push(e); });
+    const grupos = Object.entries(porTecnicoGrupo).map(([id,itens])=>({ id, itens }))
+      .sort((a,b)=>b.itens.length-a.itens.length);
+    return `
+  <div class="panel" style="margin-top:20px"><div class="ph"><h3>${ic('alarm-clock')} Itens parados agrupados por técnico</h3><span class="count-badge">${parados.length}</span><div class="spacer"></div>${parados.length?`<button class="btn sm" onclick="exportarParadosExcel()">${ic('bar-chart-3')} Exportar Excel</button><button class="btn sm" onclick="gerarRelatorioParados()">${ic('printer')} Gerar relatório</button>`:''}</div>
   <div class="tbl-wrap">${
-    parados.length? `<table><thead><tr><th>Nº Série</th><th>Tipo</th><th>Técnico</th><th>Filial</th><th>Há quanto tempo</th><th class="right">Ações</th></tr></thead><tbody>
-      ${parados.map(e=>{ const t=DB.tecnicos.find(x=>x.id===e.tecnicoId); return `<tr>
-        <td class="mono"><a href="#" onclick="abrirKardex('${esc(e.serie)}');return false"><b>${esc(e.serie)}</b></a></td>
-        <td><span class="tag-tipo" style="border-left:3px solid ${tipoCor(e.tipo)}">${esc(tipoNome(e.tipo))}</span></td>
-        <td>${esc(tecNome(e.tecnicoId))}</td>
-        <td>${esc(e.deposito||'—')}</td>
-        <td><b style="color:var(--red)">${fmtDias(diasEmPosse(e))}</b></td>
-        <td class="right">
-          <button class="btn sm" onclick="openMov('${esc(e.serie)}')">Mover</button>
-          ${t?`<button class="btn sm ghost" onclick="fichaTecnico('${t.id}')">Ver técnico</button>`:''}
-        </td>
+    grupos.length? `<table><thead><tr><th>Técnico</th><th>Filial</th><th class="center">Itens parados</th><th>Mais crítico</th><th class="right">Ações</th></tr></thead><tbody>
+      ${grupos.map(g=>{ const t=DB.tecnicos.find(x=>x.id===g.id); const critico=g.itens[0]; return `<tr style="cursor:pointer" onclick="paradosFichaTecnico('${g.id}')">
+        <td><b>${esc(tecNome(g.id))}</b></td>
+        <td>${esc(t&&t.regiao||'—')}</td>
+        <td class="center"><span class="count-badge">${g.itens.length}</span></td>
+        <td><b style="color:var(--red)">${fmtDias(diasEmPosse(critico))}</b> <span class="muted" style="font-size:11.5px">(${esc(critico.serie)})</span></td>
+        <td class="right"><button class="btn sm ghost" onclick="event.stopPropagation();paradosFichaTecnico('${g.id}')">Ver itens →</button></td>
       </tr>`;}).join('')}</tbody></table>`
-    : `<div class="empty"><div class="big">✅</div>Nenhum item parado há ${DIAS_PARADO}+ dias. Tudo em dia!</div>`
+    : `<div class="empty"><div class="big">${ic('check')}</div>Nenhum item parado há ${DIAS_PARADO}+ dias. Tudo em dia!</div>`
   }</div></div>`;
+  })()}`;
+}
+function paradosFichaTecnico(tecnicoId){
+  const itens = paradosLista().filter(e=>e.tecnicoId===tecnicoId && (!souSupervisor()||regiaoPermitida(e.deposito)));
+  const t = DB.tecnicos.find(x=>x.id===tecnicoId);
+  modal(ic('alarm-clock')+' Itens parados de '+esc(tecNome(tecnicoId)), `
+    <div class="tbl-wrap" style="max-height:400px">${
+      itens.length? `<table><thead><tr><th>Nº Série</th><th>Tipo</th><th>Filial</th><th>Há quanto tempo</th><th class="right">Ações</th></tr></thead><tbody>
+        ${itens.map(e=>`<tr>
+          <td class="mono"><a href="#" onclick="abrirKardex('${esc(e.serie)}');return false"><b>${esc(e.serie)}</b></a></td>
+          <td><span class="tag-tipo" style="border-left:3px solid ${tipoCor(e.tipo)}">${esc(tipoNome(e.tipo))}</span></td>
+          <td>${esc(e.deposito||'—')}</td>
+          <td><b style="color:var(--red)">${fmtDias(diasEmPosse(e))}</b></td>
+          <td class="right"><button class="btn sm" onclick="closeModal();openMov('${esc(e.serie)}')">Mover</button></td>
+        </tr>`).join('')}</tbody></table>`
+      : '<div class="empty">Nenhum item parado.</div>'
+    }</div>`,
+    `<button class="btn" onclick="exportarParadosTecnicoExcel('${tecnicoId}')">${ic('bar-chart-3')} Exportar Excel</button><button class="btn" onclick="gerarRelatorioParadosTecnico('${tecnicoId}')">${ic('printer')} Gerar relatório</button><button class="btn" onclick="closeModal()">Fechar</button>`, 'lg');
+}
+function exportarParadosTecnicoExcel(tecnicoId){
+  const itens = paradosLista().filter(e=>e.tecnicoId===tecnicoId);
+  if(window.__noXLSX||typeof XLSX==='undefined') return flash('Exportação para Excel indisponível (sem internet). Use "Gerar relatório" e imprima como PDF.','red');
+  const linhas = itens.map(e=>({ 'Nº Série':e.serie, 'Tipo':tipoNome(e.tipo), 'Filial':e.deposito||'—', 'Dias parado':diasEmPosse(e)||0 }));
+  const ws = XLSX.utils.json_to_sheet(linhas.length?linhas:[{'Nº Série':'','Tipo':'','Filial':'','Dias parado':'Nenhum item'}]);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Itens Parados');
+  XLSX.writeFile(wb, 'itens_parados_'+(tecNome(tecnicoId)||'tecnico').replace(/[^\w-]+/g,'_')+'_'+new Date().toISOString().slice(0,10)+'.xlsx');
+}
+function gerarRelatorioParadosTecnico(tecnicoId){
+  const itens = paradosLista().filter(e=>e.tecnicoId===tecnicoId);
+  const hoje = new Date().toLocaleDateString('pt-BR')+' '+new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
+  const html=`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="utf-8"><title>Relatório de Itens Parados</title>
+    <style>body{font-family:Arial,sans-serif;max-width:820px;margin:30px auto;padding:0 24px;color:#111;font-size:13px;line-height:1.5}
+    h1{font-size:20px;margin-bottom:2px}h2{font-size:13px;font-weight:normal;color:#555;margin-bottom:20px}
+    table{width:100%;border-collapse:collapse;margin:8px 0}th,td{border:1px solid #ccc;padding:7px 9px;text-align:left;font-size:12px}th{background:#f0f0f0}
+    @media print{button{display:none}}</style></head><body>
+    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">Imprimir / Salvar PDF</button>
+    <h1>Relatório de Itens Parados</h1>
+    <h2>${esc(tecNome(tecnicoId))} · ${DIAS_PARADO}+ dias sem movimentação · ${itens.length} item(ns) · gerado em ${hoje}</h2>
+    <table><thead><tr><th>Nº Série</th><th>Tipo</th><th>Filial</th><th>Dias parado</th></tr></thead><tbody>
+      ${itens.length? itens.map(e=>`<tr><td>${esc(e.serie)}</td><td>${esc(tipoNome(e.tipo))}</td><td>${esc(e.deposito||'—')}</td><td>${diasEmPosse(e)||0}</td></tr>`).join('') : '<tr><td colspan="4">Nenhum item parado.</td></tr>'}
+    </tbody></table>
+    </body></html>`;
+  const w=window.open('','_blank'); if(!w) return flash('Permita pop-ups para gerar o relatório','red'); w.document.write(html); w.document.close();
 }
 function exportarParadosExcel(){
-  const parados = DB.equipamentos.filter(e=>e.status==='com_tecnico' && (diasEmPosse(e)||0)>=DIAS_PARADO)
-    .sort((a,b)=>(diasEmPosse(b)||0)-(diasEmPosse(a)||0));
+  const parados = paradosFiltrados();
   if(window.__noXLSX||typeof XLSX==='undefined') return flash('Exportação para Excel indisponível (sem internet). Use "Gerar relatório" e imprima como PDF.','red');
   const linhas = parados.map(e=>({ 'Nº Série':e.serie, 'Tipo':tipoNome(e.tipo), 'Técnico':tecNome(e.tecnicoId), 'Filial':e.deposito||'—', 'Dias parado':diasEmPosse(e)||0 }));
   const ws = XLSX.utils.json_to_sheet(linhas.length?linhas:[{'Nº Série':'','Tipo':'','Técnico':'','Filial':'','Dias parado':'Nenhum item'}]);
@@ -662,15 +1286,14 @@ function exportarParadosExcel(){
   XLSX.writeFile(wb, 'itens_parados_'+new Date().toISOString().slice(0,10)+'.xlsx');
 }
 function gerarRelatorioParados(){
-  const parados = DB.equipamentos.filter(e=>e.status==='com_tecnico' && (diasEmPosse(e)||0)>=DIAS_PARADO)
-    .sort((a,b)=>(diasEmPosse(b)||0)-(diasEmPosse(a)||0));
+  const parados = paradosFiltrados();
   const hoje = new Date().toLocaleDateString('pt-BR')+' '+new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
   const html=`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="utf-8"><title>Relatório de Itens Parados</title>
     <style>body{font-family:Arial,sans-serif;max-width:820px;margin:30px auto;padding:0 24px;color:#111;font-size:13px;line-height:1.5}
     h1{font-size:20px;margin-bottom:2px}h2{font-size:13px;font-weight:normal;color:#555;margin-bottom:20px}
     table{width:100%;border-collapse:collapse;margin:8px 0}th,td{border:1px solid #ccc;padding:7px 9px;text-align:left;font-size:12px}th{background:#f0f0f0}
     @media print{button{display:none}}</style></head><body>
-    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">🖨️ Imprimir / Salvar PDF</button>
+    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">Imprimir / Salvar PDF</button>
     <h1>Relatório de Itens Parados com Técnicos</h1>
     <h2>${DIAS_PARADO}+ dias sem movimentação · ${parados.length} item(ns) · gerado em ${hoje}</h2>
     <table><thead><tr><th>Nº Série</th><th>Tipo</th><th>Técnico</th><th>Filial</th><th>Dias parado</th></tr></thead><tbody>
@@ -726,13 +1349,13 @@ function verEstoqueTecnico(tecnicoId){
   const porTipo={}; itens.forEach(e=>porTipo[e.tipo]=(porTipo[e.tipo]||0)+1);
   const tiposComMin = Object.keys(DB.tipos).filter(tp=>(DB.tipos[tp].min||0)>0);
   const outrosTipos = Object.keys(porTipo).filter(tp=>!tiposComMin.includes(tp));
-  modal('👷 Estoque de '+esc(tecNome(tecnicoId)), `
+  modal(ic('hard-hat')+' Estoque de '+esc(tecNome(tecnicoId)), `
     <div class="tbl-wrap"><table><thead><tr><th>Tipo</th><th class="center">Atual</th><th class="center">Mínimo</th><th class="center">Faltam</th></tr></thead><tbody>
       ${tiposComMin.length? tiposComMin.map(tp=>{ const atual=porTipo[tp]||0; const min=DB.tipos[tp].min||0; const falta=Math.max(0,min-atual); return `<tr ${falta>0?'style="background:var(--red-soft)"':''}>
         <td><span class="tag-tipo" style="border-left:3px solid ${tipoCor(tp)}">${esc(tipoNome(tp))}</span></td>
         <td class="center">${atual}</td>
         <td class="center muted">${min}</td>
-        <td class="center">${falta>0?`<b style="color:var(--red)">${falta}</b>`:'<span style="color:var(--green)">✓</span>'}</td>
+        <td class="center">${falta>0?`<b style="color:var(--red)">${falta}</b>`:`<span style="color:var(--green)">${ic('check')}</span>`}</td>
       </tr>`;}).join('') : '<tr><td class="empty" colspan="4">Nenhum tipo com mínimo configurado.</td></tr>'}
       ${outrosTipos.map(tp=>`<tr>
         <td><span class="tag-tipo" style="border-left:3px solid ${tipoCor(tp)}">${esc(tipoNome(tp))}</span></td>
@@ -741,7 +1364,7 @@ function verEstoqueTecnico(tecnicoId){
         <td class="center muted">—</td>
       </tr>`).join('')}
     </tbody></table></div>`,
-    `<button class="btn" onclick="exportarEstoqueMinTecnicoExcel('${tecnicoId}')">📊 Exportar Excel</button><button class="btn" onclick="gerarRelatorioEstoqueMinTecnico('${tecnicoId}')">🖨️ Gerar relatório</button><button class="btn" onclick="closeModal()">Fechar</button><button class="btn primary" onclick="closeModal();fichaTecnico('${tecnicoId}')">Ver ficha completa →</button>`, 'lg');
+    `<button class="btn" onclick="exportarEstoqueMinTecnicoExcel('${tecnicoId}')">${ic('bar-chart-3')} Exportar Excel</button><button class="btn" onclick="gerarRelatorioEstoqueMinTecnico('${tecnicoId}')">${ic('printer')} Gerar relatório</button><button class="btn" onclick="closeModal()">Fechar</button><button class="btn primary" onclick="closeModal();fichaTecnico('${tecnicoId}')">Ver ficha completa →</button>`, 'lg');
 }
 function exportarEstoqueMinTecnicoExcel(tecnicoId){
   const t = DB.tecnicos.find(x=>x.id===tecnicoId); if(!t) return;
@@ -766,11 +1389,11 @@ function gerarRelatorioEstoqueMinTecnico(tecnicoId){
     h1{font-size:20px;margin-bottom:2px}h2{font-size:13px;font-weight:normal;color:#555;margin-bottom:20px}
     table{width:100%;border-collapse:collapse;margin:8px 0}th,td{border:1px solid #ccc;padding:7px 9px;text-align:left;font-size:12px}th{background:#f0f0f0}
     @media print{button{display:none}}</style></head><body>
-    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">🖨️ Imprimir / Salvar PDF</button>
+    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">Imprimir / Salvar PDF</button>
     <h1>Relatório de Estoque Mínimo por Técnico</h1>
-    <h2>👷 ${esc(t.nome)} · ${esc(t.regiao||'—')} · gerado em ${hoje}</h2>
+    <h2>${esc(t.nome)} · ${esc(t.regiao||'—')} · gerado em ${hoje}</h2>
     <table><thead><tr><th>Tipo</th><th>Atual</th><th>Mínimo</th><th>Faltam</th></tr></thead><tbody>
-      ${tiposComMin.length? tiposComMin.map(tp=>{ const atual=porTipo[tp]||0; const min=DB.tipos[tp].min||0; const falta=Math.max(0,min-atual); return `<tr><td>${esc(tipoNome(tp))}</td><td>${atual}</td><td>${min}</td><td>${falta>0?falta:'✓'}</td></tr>`; }).join('') : '<tr><td colspan="4">Nenhum tipo com mínimo configurado.</td></tr>'}
+      ${tiposComMin.length? tiposComMin.map(tp=>{ const atual=porTipo[tp]||0; const min=DB.tipos[tp].min||0; const falta=Math.max(0,min-atual); return `<tr><td>${esc(tipoNome(tp))}</td><td>${atual}</td><td>${min}</td><td>${falta>0?falta:ic('check')}</td></tr>`; }).join('') : '<tr><td colspan="4">Nenhum tipo com mínimo configurado.</td></tr>'}
     </tbody></table>
     </body></html>`;
   const w=window.open('','_blank'); if(!w) return flash('Permita pop-ups para gerar o relatório','red'); w.document.write(html); w.document.close();
@@ -788,29 +1411,29 @@ function renderEstoqueMinimo(){
   const alertasTec = estoqueMinFilialTec ? todosAlertasTec.filter(a=>a.tecnico.regiao===estoqueMinFilialTec) : todosAlertasTec;
   const tecsComDeficit = new Set(todosAlertasTec.map(a=>a.tecnico.id));
   $('#content').innerHTML = `
-  ${!temMinConfigurado?`<div class="panel" style="margin-bottom:18px;border-left:4px solid var(--amber)"><div class="pb">Nenhum tipo tem estoque mínimo configurado ainda. ${souAdmin()?'Vá em <b>Dados</b> e clique em "🎯 Aplicar estoque mínimo oficial", ou defina manualmente em <b>Tipos</b>.':'Peça para um administrador configurar.'}</div></div>`:''}
+  ${!temMinConfigurado?`<div class="panel" style="margin-bottom:18px;border-left:4px solid var(--amber)"><div class="pb">Nenhum tipo tem estoque mínimo configurado ainda. ${souAdmin()?'Vá em <b>Dados</b> e clique em "'+ic('target')+' Aplicar estoque mínimo oficial", ou defina manualmente em <b>Tipos</b>.':'Peça para um administrador configurar.'}</div></div>`:''}
   <div class="grid kpis" style="margin-bottom:20px">
-    ${kpi('r','📦','Total de equipamentos faltando',alertas.reduce((s,a)=>s+a.deficit,0))}
+    ${kpi('r','package','Total de equipamentos faltando',alertas.reduce((s,a)=>s+a.deficit,0))}
     ${(()=>{ const porTipo={}; alertas.forEach(a=>{ porTipo[a.tipo]=(porTipo[a.tipo]||0)+a.deficit; }); const arr=Object.entries(porTipo).sort((a,b)=>b[1]-a[1]);
       const texto = arr.length? esc(tipoNome(arr[0][0]))+' <span style="font-size:16px;color:var(--txt-soft)">('+arr[0][1]+')</span>' : '—';
-      return `<div class="kpi v"><div class="ic">🎯</div><div class="lbl">Tipo mais crítico</div><div class="val" style="font-size:22px">${texto}</div></div>`; })()}
-    ${kpi('a','🏢','Filiais afetadas',filiaisAfetadas.length)}
+      return `<div class="kpi v"><div class="ic">${ic('target')}</div><div class="lbl">Tipo mais crítico</div><div class="val" style="font-size:22px">${texto}</div></div>`; })()}
+    ${kpi('a','building-2','Filiais afetadas',filiaisAfetadas.length)}
   </div>
   ${filiaisAfetadas.length?`
   <div class="panel" style="margin-bottom:18px"><div class="pb" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-    <span style="font-weight:700;font-size:12.5px;color:var(--txt-soft)">🏢 FILTRAR POR FILIAL</span>
+    <span style="font-weight:700;font-size:12.5px;color:var(--txt-soft)">${ic('building-2')} FILTRAR POR FILIAL</span>
     <div class="pill-tabs" style="flex-wrap:wrap;background:transparent;padding:0;gap:8px">
-      <button class="${!estoqueMinFilial?'active':''}" style="background:${!estoqueMinFilial?'var(--brand)':'var(--panel-soft)'};color:${!estoqueMinFilial?'#fff':'var(--txt)'};border-radius:9px" onclick="estoqueMinFilial='';renderEstoqueMinimo()">Todas <span class="count-badge" style="background:rgba(255,255,255,.25);color:inherit;margin-left:4px">${todosAlertas.length}</span></button>
+      <button class="${!estoqueMinFilial?'active':''}" style="background:${!estoqueMinFilial?'var(--brand)':'var(--panel-soft)'};color:${!estoqueMinFilial?'#fff':'var(--txt)'};border-radius:var(--radius-md)" onclick="estoqueMinFilial='';renderEstoqueMinimo()">Todas <span class="count-badge" style="background:rgba(255,255,255,.25);color:inherit;margin-left:4px">${todosAlertas.length}</span></button>
       ${filiaisAfetadas.map(f=>{ const n=todosAlertas.filter(a=>a.filial===f).length; const on=estoqueMinFilial===f; return `
-        <button class="${on?'active':''}" style="background:${on?'var(--brand)':'var(--panel-soft)'};color:${on?'#fff':'var(--txt)'};border-radius:9px" onclick="estoqueMinFilial=(estoqueMinFilial==='${esc(f)}')?'':'${esc(f)}';renderEstoqueMinimo()">${esc(f)} <span class="count-badge" style="background:${on?'rgba(255,255,255,.25)':'#e2e8f0'};color:inherit;margin-left:4px">${n}</span></button>`;}).join('')}
+        <button class="${on?'active':''}" style="background:${on?'var(--brand)':'var(--panel-soft)'};color:${on?'#fff':'var(--txt)'};border-radius:var(--radius-md)" onclick="estoqueMinFilial=(estoqueMinFilial==='${esc(f)}')?'':'${esc(f)}';renderEstoqueMinimo()">${esc(f)} <span class="count-badge" style="background:${on?'rgba(255,255,255,.25)':'var(--surface-2)'};color:inherit;margin-left:4px">${n}</span></button>`;}).join('')}
     </div>
     <div class="spacer"></div>
-    <button class="btn sm" onclick="exportarEstoqueMinExcel()">📊 Exportar Excel</button><button class="btn sm" onclick="gerarRelatorioEstoqueMin()">🖨️ Gerar relatório</button>
+    <button class="btn sm" onclick="exportarEstoqueMinExcel()">${ic('bar-chart-3')} Exportar Excel</button><button class="btn sm" onclick="gerarRelatorioEstoqueMin()">${ic('printer')} Gerar relatório</button>
   </div></div>`:''}
   ${alertas.length?`
   <div class="chart-row" style="margin-bottom:20px">
     <div class="panel">
-      <div class="ph"><h3>📊 Necessidade por tipo de equipamento</h3></div>
+      <div class="ph"><h3>${ic('bar-chart-3')} Necessidade por tipo de equipamento</h3></div>
       <div class="pb">${(()=>{
         const porTipo={}; alertas.forEach(a=>{ porTipo[a.tipo]=(porTipo[a.tipo]||0)+a.deficit; });
         const arr=Object.entries(porTipo).sort((a,b)=>b[1]-a[1]);
@@ -832,7 +1455,7 @@ function renderEstoqueMinimo(){
     </div>
   </div>
   <div class="panel" style="margin-bottom:20px">
-    <div class="ph"><h3>🏢 Necessidade por filial</h3><span class="muted" style="font-size:11px;font-weight:500;margin-left:6px">(clique para filtrar)</span></div>
+    <div class="ph"><h3>${ic('building-2')} Necessidade por filial</h3><span class="muted" style="font-size:11px;font-weight:500;margin-left:6px">(clique para filtrar)</span></div>
     <div class="pb">${(()=>{
       const porFilial={}; todosAlertas.forEach(a=>{ porFilial[a.filial]=(porFilial[a.filial]||0)+a.deficit; });
       const arr=Object.entries(porFilial).sort((a,b)=>b[1]-a[1]);
@@ -849,7 +1472,7 @@ function renderEstoqueMinimo(){
     })()}</div>
   </div>`:''}
   ${estoqueMinFilial?`
-  <div class="panel" style="margin-bottom:18px"><div class="ph"><h3>👷 Estoque por técnico em ${esc(estoqueMinFilial)}</h3><span class="muted" style="font-size:11px;font-weight:500;margin-left:6px">(clique para ver a ficha completa)</span></div>
+  <div class="panel" style="margin-bottom:18px"><div class="ph"><h3>${ic('hard-hat')} Estoque por técnico em ${esc(estoqueMinFilial)}</h3><span class="muted" style="font-size:11px;font-weight:500;margin-left:6px">(clique para ver a ficha completa)</span></div>
     <div class="pb">
       ${(()=>{ const tecs=DB.tecnicos.filter(t=>t.regiao===estoqueMinFilial); if(!tecs.length) return '<div class="empty">Nenhum técnico cadastrado nessa filial.</div>';
         return `<div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(260px,1fr))">${tecs.map(t=>{
@@ -857,20 +1480,20 @@ function renderEstoqueMinimo(){
           const porTipo={}; itens.forEach(e=>porTipo[e.tipo]=(porTipo[e.tipo]||0)+1);
           const abaixoDoMin = tecsComDeficit.has(t.id);
           return `<div class="panel" style="box-shadow:none;cursor:pointer${abaixoDoMin?';border-color:var(--red)':''}" onclick="verEstoqueTecnico('${t.id}')"><div class="pb">
-            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px"><b>${esc(t.nome)}</b>${abaixoDoMin?'<span class="badge baixado" style="font-size:10px">⚠️ pessoal baixo</span>':''}<span class="count-badge" style="margin-left:auto">${itens.length}</span></div>
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px"><b>${esc(t.nome)}</b>${abaixoDoMin?`<span class="badge baixado" style="font-size:10px">${ic('alert-triangle')} pessoal baixo</span>`:''}<span class="count-badge" style="margin-left:auto">${itens.length}</span></div>
             <div style="display:flex;gap:6px;flex-wrap:wrap">${Object.keys(porTipo).length?Object.entries(porTipo).sort((a,b)=>b[1]-a[1]).map(([tp,n])=>`<span class="tag-tipo" style="border-left:3px solid ${tipoCor(tp)};font-size:11px">${esc(tipoNome(tp))}: ${n}</span>`).join(''):'<span class="muted" style="font-size:12px">Nenhum item</span>'}</div>
           </div></div>`;}).join('')}</div>`; })()}
     </div>
   </div>`:''}
   ${todosAlertasTec.length?`
-  <div class="panel" style="margin-bottom:18px;border-left:4px solid var(--red)"><div class="ph"><h3>👷⚠️ Técnicos abaixo do mínimo pessoal</h3><span class="count-badge">${new Set(alertasTec.map(a=>a.tecnico.id)).size}</span><div class="spacer"></div>${alertasTec.length?`<button class="btn sm" onclick="exportarEstoqueMinTecExcel()">📊 Exportar Excel</button><button class="btn sm" onclick="gerarRelatorioEstoqueMinTec()">🖨️ Gerar relatório</button>`:''}</div>
+  <div class="panel" style="margin-bottom:18px;border-left:4px solid var(--red)"><div class="ph"><h3>${ic('hard-hat')}${ic('alert-triangle')} Técnicos abaixo do mínimo pessoal</h3><span class="count-badge">${new Set(alertasTec.map(a=>a.tecnico.id)).size}</span><div class="spacer"></div>${alertasTec.length?`<button class="btn sm" onclick="exportarEstoqueMinTecExcel()">${ic('bar-chart-3')} Exportar Excel</button><button class="btn sm" onclick="gerarRelatorioEstoqueMinTec()">${ic('printer')} Gerar relatório</button>`:''}</div>
     <p class="muted" style="margin:0 12px 8px">Mesmo quando a filial no total está OK, um técnico específico pode estar com menos do que devia carregar.</p>
     <div class="pb" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding-top:0">
-      <span style="font-weight:700;font-size:12.5px;color:var(--txt-soft)">🏢 FILTRAR POR FILIAL</span>
+      <span style="font-weight:700;font-size:12.5px;color:var(--txt-soft)">${ic('building-2')} FILTRAR POR FILIAL</span>
       <div class="pill-tabs" style="flex-wrap:wrap;background:transparent;padding:0;gap:8px">
-        <button class="${!estoqueMinFilialTec?'active':''}" style="background:${!estoqueMinFilialTec?'var(--brand)':'var(--panel-soft)'};color:${!estoqueMinFilialTec?'#fff':'var(--txt)'};border-radius:9px" onclick="estoqueMinFilialTec='';renderEstoqueMinimo()">Todas <span class="count-badge" style="background:rgba(255,255,255,.25);color:inherit;margin-left:4px">${new Set(todosAlertasTec.map(a=>a.tecnico.id)).size}</span></button>
+        <button class="${!estoqueMinFilialTec?'active':''}" style="background:${!estoqueMinFilialTec?'var(--brand)':'var(--panel-soft)'};color:${!estoqueMinFilialTec?'#fff':'var(--txt)'};border-radius:var(--radius-md)" onclick="estoqueMinFilialTec='';renderEstoqueMinimo()">Todas <span class="count-badge" style="background:rgba(255,255,255,.25);color:inherit;margin-left:4px">${new Set(todosAlertasTec.map(a=>a.tecnico.id)).size}</span></button>
         ${filiaisAfetadasTec.map(f=>{ const n=new Set(todosAlertasTec.filter(a=>a.tecnico.regiao===f).map(a=>a.tecnico.id)).size; const on=estoqueMinFilialTec===f; return `
-          <button class="${on?'active':''}" style="background:${on?'var(--brand)':'var(--panel-soft)'};color:${on?'#fff':'var(--txt)'};border-radius:9px" onclick="estoqueMinFilialTec=(estoqueMinFilialTec==='${esc(f)}')?'':'${esc(f)}';renderEstoqueMinimo()">${esc(f)} <span class="count-badge" style="background:${on?'rgba(255,255,255,.25)':'#e2e8f0'};color:inherit;margin-left:4px">${n}</span></button>`;}).join('')}
+          <button class="${on?'active':''}" style="background:${on?'var(--brand)':'var(--panel-soft)'};color:${on?'#fff':'var(--txt)'};border-radius:var(--radius-md)" onclick="estoqueMinFilialTec=(estoqueMinFilialTec==='${esc(f)}')?'':'${esc(f)}';renderEstoqueMinimo()">${esc(f)} <span class="count-badge" style="background:${on?'rgba(255,255,255,.25)':'var(--surface-2)'};color:inherit;margin-left:4px">${n}</span></button>`;}).join('')}
       </div>
     </div>
     <div class="tbl-wrap"><table><thead><tr><th>Técnico</th><th>Filial</th><th>O que falta</th><th class="center">Itens faltando</th></tr></thead><tbody>${(()=>{
@@ -906,7 +1529,7 @@ function gerarRelatorioEstoqueMin(){
     h1{font-size:20px;margin-bottom:2px}h2{font-size:13px;font-weight:normal;color:#555;margin-bottom:20px}
     table{width:100%;border-collapse:collapse;margin:8px 0}th,td{border:1px solid #ccc;padding:7px 9px;text-align:left;font-size:12px}th{background:#f0f0f0}
     @media print{button{display:none}}</style></head><body>
-    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">🖨️ Imprimir / Salvar PDF</button>
+    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">Imprimir / Salvar PDF</button>
     <h1>Relatório de Estoque Mínimo por Filial</h1>
     <h2>${esc(titulo)} · ${alertas.length} item(ns) em falta · gerado em ${hoje}</h2>
     <table><thead><tr><th>Filial</th><th>Tipo</th><th>Atual</th><th>Mínimo</th><th>Faltam</th></tr></thead><tbody>
@@ -938,11 +1561,11 @@ function gerarRelatorioEstoqueMinTec(){
     h3{font-size:14px;margin:22px 0 8px;border-bottom:2px solid #dc2626;padding-bottom:4px}
     table{width:100%;border-collapse:collapse;margin:8px 0}th,td{border:1px solid #ccc;padding:7px 9px;text-align:left;font-size:12px}th{background:#f0f0f0}
     @media print{button{display:none}}</style></head><body>
-    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">🖨️ Imprimir / Salvar PDF</button>
+    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">Imprimir / Salvar PDF</button>
     <h1>Relatório de Técnicos Abaixo do Mínimo Pessoal</h1>
     <h2>${esc(titulo)} · ${linhas.length} técnico(s) · gerado em ${hoje}</h2>
     ${linhas.length? linhas.map(l=>`
-      <h3>👷 ${esc(l.tecnico.nome)} — ${esc(l.tecnico.regiao||'—')}</h3>
+      <h3>${ic('hard-hat')} ${esc(l.tecnico.nome)} — ${esc(l.tecnico.regiao||'—')}</h3>
       <table><thead><tr><th>Tipo</th><th>Atual</th><th>Mínimo</th><th>Faltam</th></tr></thead><tbody>
         ${l.itens.map(a=>`<tr><td>${esc(tipoNome(a.tipo))}</td><td>${a.atual}</td><td>${a.min}</td><td>${a.deficit}</td></tr>`).join('')}
       </tbody></table>`).join('') : '<p>Nenhum técnico abaixo do mínimo.</p>'}
@@ -976,34 +1599,34 @@ function renderRMA(){
 
   $('#content').innerHTML = `
   <div class="panel" style="margin-bottom:18px"><div class="pb" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-    <span style="font-weight:700;font-size:12.5px;color:var(--txt-soft);white-space:nowrap">🏢 FILIAL ${rmaFiliais.length?`<span class="muted" style="font-weight:500">(${rmaFiliais.length} selecionada${rmaFiliais.length>1?'s':''})</span>`:'<span class="muted" style="font-weight:500">(clique para filtrar)</span>'}</span>
+    <span style="font-weight:700;font-size:12.5px;color:var(--txt-soft);white-space:nowrap">${ic('building-2')} FILIAL ${rmaFiliais.length?`<span class="muted" style="font-weight:500">(${rmaFiliais.length} selecionada${rmaFiliais.length>1?'s':''})</span>`:'<span class="muted" style="font-weight:500">(clique para filtrar)</span>'}</span>
     <div class="pill-tabs" style="flex-wrap:wrap;background:transparent;padding:0;gap:8px">
-      <button class="${!rmaFiliais.length?'active':''}" style="background:${!rmaFiliais.length?'var(--brand)':'var(--panel-soft)'};color:${!rmaFiliais.length?'#fff':'var(--txt)'};border-radius:9px" onclick="rmaFiliais=[];renderRMA()">Todas <span class="count-badge" style="background:rgba(255,255,255,.25);color:inherit;margin-left:4px">${baseRma.length}</span></button>
+      <button class="${!rmaFiliais.length?'active':''}" style="background:${!rmaFiliais.length?'var(--brand)':'var(--panel-soft)'};color:${!rmaFiliais.length?'#fff':'var(--txt)'};border-radius:var(--radius-md)" onclick="rmaFiliais=[];renderRMA()">Todas <span class="count-badge" style="background:rgba(255,255,255,.25);color:inherit;margin-left:4px">${baseRma.length}</span></button>
       ${todasFiliais.map(d=>{ const n=baseRma.filter(e=>(e.rmaDeposito||e.deposito)===d).length; const on=rmaFiliais.includes(d); return `
-        <button class="${on?'active':''}" style="background:${on?'var(--brand)':'var(--panel-soft)'};color:${on?'#fff':'var(--txt)'};border-radius:9px" onclick="rmaToggleFilial('${esc(d)}')">${on?'✓ ':''}${esc(d)} <span class="count-badge" style="background:${on?'rgba(255,255,255,.25)':'#e2e8f0'};color:inherit;margin-left:4px">${n}</span></button>`;}).join('')}
+        <button class="${on?'active':''}" style="background:${on?'var(--brand)':'var(--panel-soft)'};color:${on?'#fff':'var(--txt)'};border-radius:var(--radius-md)" onclick="rmaToggleFilial('${esc(d)}')">${on?ic('check')+' ':''}${esc(d)} <span class="count-badge" style="background:${on?'rgba(255,255,255,.25)':'var(--surface-2)'};color:inherit;margin-left:4px">${n}</span></button>`;}).join('')}
     </div>
     <div class="spacer"></div>
-    ${rma.length?`<button class="btn sm" onclick="exportarRMAExcel()">📊 Exportar Excel</button><button class="btn sm" onclick="gerarRelatorioRMA()">🖨️ Gerar relatório</button>`:''}
+    ${rma.length?`<button class="btn sm" onclick="exportarRMAExcel()">${ic('bar-chart-3')} Exportar Excel</button><button class="btn sm" onclick="gerarRelatorioRMA()">${ic('printer')} Gerar relatório</button>`:''}
   </div></div>
 
   <div class="grid kpis" style="margin-bottom:20px">
-    ${kpi('r','♻️','Total em RMA',rma.length)}
-    ${kpi('v','👷','Técnicos envolvidos',new Set(rma.filter(e=>e.rmaTecnicoId).map(e=>e.rmaTecnicoId)).size)}
-    ${kpi('a','🏢','Filiais com RMA',todasFiliais.length)}
+    ${kpi('r','recycle','Total em RMA',rma.length)}
+    ${kpi('v','hard-hat','Técnicos envolvidos',new Set(rma.filter(e=>e.rmaTecnicoId).map(e=>e.rmaTecnicoId)).size)}
+    ${kpi('a','building-2','Filiais com RMA',todasFiliais.length)}
   </div>
 
   <div class="chart-row" style="margin-bottom:20px">
     <div class="panel">
-      <div class="ph"><h3>📦 RMA por tipo de equipamento</h3></div>
+      <div class="ph"><h3>${ic('package')} RMA por tipo de equipamento</h3></div>
       <div class="pb"><div class="donut-wrap">${donutTipo.length?donut(donutTipo):'<div class="empty">Sem dados</div>'}</div></div>
     </div>
     <div class="panel">
-      <div class="ph"><h3>📍 RMA por filial</h3></div>
+      <div class="ph"><h3>${ic('map-pin')} RMA por filial</h3></div>
       <div class="pb">
         ${depArr.length?depArr.map(([d,n])=>`
           <div class="bar-row" style="cursor:pointer" onclick="rmaFiliais=['${esc(d)}'];renderRMA()">
             <div class="bl">${esc(d)}</div>
-            <div class="bar-track"><div class="bar-fill" style="width:${n/maxDep*100}%;background:#2563eb">${n}</div></div>
+            <div class="bar-track"><div class="bar-fill" style="width:${n/maxDep*100}%;background:${corVar('--brand')}">${n}</div></div>
           </div>`).join(''):'<div class="empty">Sem dados</div>'}
       </div>
     </div>
@@ -1011,17 +1634,17 @@ function renderRMA(){
 
   <div class="chart-row">
     <div class="panel">
-      <div class="ph"><h3>👷 RMA por técnico <span class="muted" style="font-size:11px;font-weight:500">(clique para ver os itens)</span></h3></div>
+      <div class="ph"><h3>${ic('hard-hat')} RMA por técnico <span class="muted" style="font-size:11px;font-weight:500">(clique para ver os itens)</span></h3></div>
       <div class="pb">
         ${tecArr.length?tecArr.map(([id,n])=>`
           <div class="bar-row" style="cursor:pointer" onclick="rmaFichaTecnico('${id==='__sem__'?'':id}')">
             <div class="bl">${id==='__sem__'?'Sem técnico (direto do estoque)':esc(tecNome(id))}</div>
-            <div class="bar-track"><div class="bar-fill" style="width:${n/maxTec*100}%;background:#d97706">${n}</div></div>
+            <div class="bar-track"><div class="bar-fill" style="width:${n/maxTec*100}%;background:${corVar('--amber')}">${n}</div></div>
           </div>`).join(''):'<div class="empty">Sem dados</div>'}
       </div>
     </div>
     <div class="panel">
-      <div class="ph"><h3>🕓 Envios recentes para RMA</h3><div class="spacer"></div><button class="btn sm ghost" onclick="verTodosRMA()">Ver tudo →</button></div>
+      <div class="ph"><h3>${ic('clock')} Envios recentes para RMA</h3><div class="spacer"></div><button class="btn sm ghost" onclick="verTodosRMA()">Ver tudo →</button></div>
       <div class="pb" style="padding:8px 0">
         ${recentes.length?recentes.map(e=>`
           <div style="display:flex;align-items:center;gap:11px;padding:9px 20px;border-bottom:1px solid #f1f5f9">
@@ -1030,7 +1653,7 @@ function renderRMA(){
               <div class="mono" style="font-weight:600;font-size:12px">${esc(e.serie)}</div>
               <div class="muted" style="font-size:11.5px">${e.rmaTecnicoId?esc(tecNome(e.rmaTecnicoId)):'—'} · ${esc(e.rmaDeposito||e.deposito||'—')}</div>
             </div>
-            ${souAdmin()?`<button class="btn sm ghost" onclick="retornarDoRMA('${esc(e.serie)}')">↩️ Retornar</button>`:''}
+            ${souAdmin()?`<button class="btn sm ghost" onclick="retornarDoRMA('${esc(e.serie)}')">${ic('undo-2')} Retornar</button>`:''}
           </div>`).join(''):'<div class="empty" style="padding:30px">Nenhum item em RMA.</div>'}
       </div>
     </div>
@@ -1054,7 +1677,7 @@ function gerarRelatorioRMA(){
     h1{font-size:20px;margin-bottom:2px}h2{font-size:13px;font-weight:normal;color:#555;margin-bottom:20px}
     table{width:100%;border-collapse:collapse;margin:8px 0}th,td{border:1px solid #ccc;padding:7px 9px;text-align:left;font-size:12px}th{background:#f0f0f0}
     @media print{button{display:none}}</style></head><body>
-    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">🖨️ Imprimir / Salvar PDF</button>
+    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">Imprimir / Salvar PDF</button>
     <h1>Relatório de Estoque RMA</h1>
     <h2>${esc(titulo)} · ${rma.length} item(ns) · gerado em ${hoje}</h2>
     <table><thead><tr><th>Nº Série</th><th>Tipo</th><th>Filial</th><th>Técnico</th><th>Desde</th></tr></thead><tbody>
@@ -1066,7 +1689,7 @@ function gerarRelatorioRMA(){
 function verTodosRMA(){
   const rma = DB.equipamentos.filter(e=>e.status==='baixado' && (!souSupervisor()||regiaoPermitida(e.rmaDeposito||e.deposito)) && (!rmaFiliais.length||rmaFiliais.includes(e.rmaDeposito||e.deposito)))
     .sort((a,b)=>(b.rmaDesde||0)-(a.rmaDesde||0));
-  modal('♻️ Todos os itens em RMA', `
+  modal(ic('recycle')+' Todos os itens em RMA', `
     <div class="tbl-wrap" style="max-height:480px">${
       rma.length? `<table><thead><tr><th>Nº Série</th><th>Tipo</th><th>Técnico</th><th>Filial</th><th>Data</th>${souAdmin()?'<th></th>':''}</tr></thead><tbody>
         ${rma.map(e=>`<tr>
@@ -1075,14 +1698,14 @@ function verTodosRMA(){
           <td>${e.rmaTecnicoId?esc(tecNome(e.rmaTecnicoId)):'—'}</td>
           <td>${esc(e.rmaDeposito||e.deposito||'—')}</td>
           <td class="muted">${e.rmaDesde?fmtTS(e.rmaDesde):'—'}</td>
-          ${souAdmin()?`<td class="right"><button class="btn sm ghost" onclick="retornarDoRMA('${esc(e.serie)}');closeModal();verTodosRMA()">↩️ Retornar</button></td>`:''}
+          ${souAdmin()?`<td class="right"><button class="btn sm ghost" onclick="retornarDoRMA('${esc(e.serie)}');closeModal();verTodosRMA()">${ic('undo-2')} Retornar</button></td>`:''}
         </tr>`).join('')}</tbody></table>`
       : '<div class="empty">Nenhum item em RMA.</div>'
     }</div>`, `<button class="btn" onclick="closeModal()">Fechar</button>`, 'lg');
 }
 function rmaFichaTecnico(tecnicoId){
   const itens = DB.equipamentos.filter(e=>e.status==='baixado' && (e.rmaTecnicoId||null)===(tecnicoId||null) && (!souSupervisor()||regiaoPermitida(e.rmaDeposito||e.deposito)));
-  const titulo = tecnicoId? '♻️ RMA enviado por '+esc(tecNome(tecnicoId)) : '📍 RMA enviado direto do estoque (sem técnico)';
+  const titulo = tecnicoId? ic('recycle')+' RMA enviado por '+esc(tecNome(tecnicoId)) : ic('map-pin')+' RMA enviado direto do estoque (sem técnico)';
 
   const porTipo={}; itens.forEach(e=>porTipo[e.tipo]=(porTipo[e.tipo]||0)+1);
   const donutData = Object.entries(porTipo).sort((a,b)=>b[1]-a[1]).map(([tp,n])=>[tipoNome(tp),n,tipoCor(tp)]);
@@ -1093,15 +1716,15 @@ function rmaFichaTecnico(tecnicoId){
   modal(titulo, `
     <div class="chart-row" style="margin-bottom:18px">
       <div class="panel" style="box-shadow:none">
-        <div class="ph"><h3>📊 RMA por tipo de equipamento</h3></div>
+        <div class="ph"><h3>${ic('bar-chart-3')} RMA por tipo de equipamento</h3></div>
         <div class="pb"><div class="donut-wrap">${donutData.length?donut(donutData):'<div class="empty">Nenhum item.</div>'}</div></div>
       </div>
       <div class="panel" style="box-shadow:none">
         <div class="ph"><h3>Resumo</h3></div>
         <div class="pb" style="display:flex;flex-direction:column;gap:14px">
           <div class="grid" style="grid-template-columns:1fr 1fr;gap:12px">
-            <div class="kpi r" style="padding:14px 16px"><div class="lbl" style="font-size:10px">♻️ TOTAL EM RMA</div><div class="val" style="font-size:22px">${itens.length}</div></div>
-            <div class="kpi a" style="padding:14px 16px"><div class="lbl" style="font-size:10px">🏢 FILIAIS</div><div class="val" style="font-size:22px">${depsEnvolvidos}</div></div>
+            <div class="kpi r" style="padding:14px 16px"><div class="lbl" style="font-size:10px">${ic('recycle')} TOTAL EM RMA</div><div class="val" style="font-size:22px">${itens.length}</div></div>
+            <div class="kpi a" style="padding:14px 16px"><div class="lbl" style="font-size:10px">${ic('building-2')} FILIAIS</div><div class="val" style="font-size:22px">${depsEnvolvidos}</div></div>
           </div>
           ${ultimoEnvio?`<div class="muted" style="font-size:12px">Último envio: ${fmtTS(ultimoEnvio)}</div>`:''}
           ${Object.keys(porTipo).length?`<div style="display:flex;gap:8px;flex-wrap:wrap">${Object.entries(porTipo).sort((a,b)=>b[1]-a[1]).map(([tp,n])=>`<span class="tag-tipo" style="border-left:3px solid ${tipoCor(tp)}">${esc(tipoNome(tp))}: ${n}</span>`).join('')}</div>`:''}
@@ -1111,7 +1734,7 @@ function rmaFichaTecnico(tecnicoId){
     ${souAdmin()&&itens.length?`<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
       <label class="checkbox" style="font-size:12.5px"><input type="checkbox" onchange="document.querySelectorAll('.rmaChk').forEach(c=>c.checked=this.checked)"> Selecionar todos</label>
       <div class="spacer"></div>
-      <button class="btn sm green" onclick="retornarSelecionadosRMA('${tecnicoId||''}')">↩️ Retornar selecionados</button>
+      <button class="btn sm green" onclick="retornarSelecionadosRMA('${tecnicoId||''}')">${ic('undo-2')} Retornar selecionados</button>
     </div>`:''}
     <div class="tbl-wrap" style="max-height:320px">${
       itens.length? `<table><thead><tr>${souAdmin()?'<th style="width:30px"></th>':''}<th>Nº Série</th><th>Tipo</th><th>Filial</th><th>Data</th>${souAdmin()?'<th></th>':''}</tr></thead><tbody>
@@ -1121,10 +1744,10 @@ function rmaFichaTecnico(tecnicoId){
           <td><span class="tag-tipo">${esc(tipoNome(e.tipo))}</span></td>
           <td>${esc(e.rmaDeposito||e.deposito||'—')}</td>
           <td class="muted">${e.rmaDesde?fmtTS(e.rmaDesde):'—'}</td>
-          ${souAdmin()?`<td class="right"><button class="btn sm ghost" onclick="retornarDoRMA('${esc(e.serie)}');closeModal();rmaFichaTecnico('${tecnicoId||''}')">↩️ Retornar</button></td>`:''}
+          ${souAdmin()?`<td class="right"><button class="btn sm ghost" onclick="retornarDoRMA('${esc(e.serie)}');closeModal();rmaFichaTecnico('${tecnicoId||''}')">${ic('undo-2')} Retornar</button></td>`:''}
         </tr>`).join('')}</tbody></table>`
       : '<div class="empty">Nenhum item.</div>'
-    }</div>`, `<button class="btn" onclick="exportarRMATecnicoExcel('${tecnicoId||''}')">📊 Exportar Excel</button><button class="btn" onclick="gerarRelatorioRMATecnico('${tecnicoId||''}')">🖨️ Gerar relatório</button><button class="btn" onclick="closeModal()">Fechar</button>`, 'lg');
+    }</div>`, `<button class="btn" onclick="exportarRMATecnicoExcel('${tecnicoId||''}')">${ic('bar-chart-3')} Exportar Excel</button><button class="btn" onclick="gerarRelatorioRMATecnico('${tecnicoId||''}')">${ic('printer')} Gerar relatório</button><button class="btn" onclick="closeModal()">Fechar</button>`, 'lg');
 }
 function exportarRMATecnicoExcel(tecnicoId){
   const itens = DB.equipamentos.filter(e=>e.status==='baixado' && (e.rmaTecnicoId||null)===(tecnicoId||null) && (!souSupervisor()||regiaoPermitida(e.rmaDeposito||e.deposito)));
@@ -1145,7 +1768,7 @@ function gerarRelatorioRMATecnico(tecnicoId){
     h1{font-size:20px;margin-bottom:2px}h2{font-size:13px;font-weight:normal;color:#555;margin-bottom:20px}
     table{width:100%;border-collapse:collapse;margin:8px 0}th,td{border:1px solid #ccc;padding:7px 9px;text-align:left;font-size:12px}th{background:#f0f0f0}
     @media print{button{display:none}}</style></head><body>
-    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">🖨️ Imprimir / Salvar PDF</button>
+    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">Imprimir / Salvar PDF</button>
     <h1>Relatório de RMA</h1>
     <h2>${esc(titulo)} · ${itens.length} item(ns) · gerado em ${hoje}</h2>
     <table><thead><tr><th>Nº Série</th><th>Tipo</th><th>Filial</th><th>Desde</th></tr></thead><tbody>
@@ -1167,7 +1790,7 @@ function retornarSelecionadosRMA(tecnicoId){
     registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:'retorno_rma', serie, de:'RMA', para:destino, tecnicoId:null, usuario:nomeUsuarioAtual(), obs:'Retorno do RMA ao estoque (admin, em lote)' });
     n++;
   });
-  salvar(); closeModal(); render(); flash(`✅ ${n} equipamento(s) retornado(s) ao estoque`,'green');
+  salvar(); closeModal(); render(); flash(`${n} equipamento(s) retornado(s) ao estoque`,'green');
 }
 function retornarDoRMA(serie){
   if(!souAdmin()) return flash('Somente administradores podem retornar itens do RMA','red');
@@ -1176,7 +1799,7 @@ function retornarDoRMA(serie){
   if(!confirm('Retornar o equipamento '+serie+' do RMA para o estoque de '+destino+'?')) return;
   e.status='estoque'; e.tecnicoId=null; e.deposito=e.rmaDeposito||e.deposito; e.local=e.deposito; e.confirmado=true; e.desde=Date.now();
   registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:'retorno_rma', serie, de:'RMA', para:destino, tecnicoId:null, usuario:nomeUsuarioAtual(), obs:'Retorno do RMA ao estoque (admin)' });
-  salvar(); render(); flash('✅ Equipamento retornado ao estoque','green');
+  salvar(); render(); flash('Equipamento retornado ao estoque','green');
 }
 
 /* =========================================================
@@ -1190,19 +1813,19 @@ function renderMovPage(){
   const pendentes = pendentesConfirmacaoLista();
   $('#content').innerHTML = `
   <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(230px,1fr));margin-bottom:18px">
-    ${movCard('entrada','📥','Entrada no estoque','Equipamento novo ou que retornou','green')}
-    ${movCard('saida','👷','Saída para técnico','Entregar item a um técnico','b')}
-    ${movCard('transferencia','🔁','Transferência','Passar item entre técnicos','v')}
-    ${movCard('baixa','♻️','Enviar para RMA','Defeito, garantia ou devolução ao fabricante','r')}
+    ${movCard('entrada','inbox','Entrada no estoque','Equipamento novo ou que retornou','green')}
+    ${movCard('saida','hard-hat','Saída para técnico','Entregar item a um técnico','b')}
+    ${movCard('transferencia','repeat','Transferência','Passar item entre técnicos','v')}
+    ${movCard('baixa','recycle','Enviar para RMA','Defeito, garantia ou devolução ao fabricante','r')}
   </div>
   <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(230px,1fr));margin-bottom:8px">
     <button class="panel" style="text-align:left;padding:0;border:0;${pendentes.length?'border-left:3px solid var(--amber)':''}" onclick="abrirPendentesConfirmacao()">
       <div class="pb" style="display:flex;gap:14px;align-items:flex-start">
-        <div style="font-size:24px;width:50px;height:50px;border-radius:13px;background:#d9770619;display:grid;place-items:center;flex-shrink:0">⏳</div>
+        <div style="font-size:24px;width:50px;height:50px;border-radius:13px;background:var(--amber-soft);color:var(--amber);display:grid;place-items:center;flex-shrink:0">${ic('hourglass')}</div>
         <div style="flex:1"><div style="font-weight:700;font-size:15px;margin-bottom:3px">Aguardando confirmação do técnico ${pendentes.length?`<span class="count-badge" style="margin-left:4px">${pendentes.length}</span>`:''}</div><div class="muted" style="font-size:12.5px">Itens enviados que ainda não foram confirmados</div></div>
       </div></button>
   </div>
-  <div class="panel" style="margin-top:18px"><div class="ph"><h3>🕓 Movimentações recentes</h3><div class="spacer"></div><button class="btn sm ghost" onclick="goto('hist')">Ver histórico →</button></div>
+  <div class="panel" style="margin-top:18px"><div class="ph"><h3>${ic('clock')} Movimentações recentes</h3><div class="spacer"></div><button class="btn sm ghost" onclick="goto('hist')">Ver histórico →</button></div>
     <div class="tbl-wrap">${tabelaMov([...DB.movimentacoes].slice(-12).reverse())}</div>
   </div>`;
 }
@@ -1213,19 +1836,19 @@ function renderMovPageTecnico(){
   const enviadosPorMim = DB.equipamentos.filter(e=>e.emTransito && e.transitoDeTecnicoId===t.id);
   $('#content').innerHTML = `
   <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(230px,1fr));margin-bottom:18px">
-    ${actionCard('📝','Registrar retirada em campo','Equipamento de manutenção ou desinstalação','b','abrirRegistrarForm()')}
-    ${movCard('transferencia','🔁','Transferir para outro técnico','Passar um item seu para outro técnico','v')}
-    ${movCard('baixa','♻️','Enviar para RMA','Defeito, garantia ou devolução ao fabricante','r')}
+    ${actionCard('file-text','Registrar retirada em campo','Equipamento de manutenção ou desinstalação','b','abrirRegistrarForm()')}
+    ${movCard('transferencia','repeat','Transferir para outro técnico','Passar um item seu para outro técnico','v')}
+    ${movCard('baixa','recycle','Enviar para RMA','Defeito, garantia ou devolução ao fabricante','r')}
   </div>
   ${enviadosPorMim.length?`
   <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(230px,1fr));margin-bottom:18px">
     <button class="panel" style="text-align:left;padding:0;border:0;border-left:3px solid var(--amber)" onclick="verMinhasTransferenciasPendentes()">
       <div class="pb" style="display:flex;gap:14px;align-items:flex-start">
-        <div style="font-size:24px;width:50px;height:50px;border-radius:13px;background:#d9770619;display:grid;place-items:center;flex-shrink:0">⏳</div>
+        <div style="font-size:24px;width:50px;height:50px;border-radius:13px;background:var(--amber-soft);color:var(--amber);display:grid;place-items:center;flex-shrink:0">${ic('hourglass')}</div>
         <div style="flex:1"><div style="font-weight:700;font-size:15px;margin-bottom:3px">Transferências enviadas <span class="count-badge" style="margin-left:4px">${enviadosPorMim.length}</span></div><div class="muted" style="font-size:12.5px">Aguardando o outro técnico confirmar</div></div>
       </div></button>
   </div>`:''}
-  <div class="panel"><div class="ph"><h3>📦 Meus equipamentos disponíveis</h3><span class="count-badge">${meus}</span></div>
+  <div class="panel"><div class="ph"><h3>${ic('package')} Meus equipamentos disponíveis</h3><span class="count-badge">${meus}</span></div>
     <div class="pb"><p class="muted">Use os botões acima para transferir ou enviar para RMA. Veja a lista completa em <b>Meus Equipamentos</b>.</p></div>
   </div>`;
 }
@@ -1234,22 +1857,22 @@ function verMinhasTransferenciasPendentes(){
   const itens = DB.equipamentos.filter(e=>e.emTransito && e.transitoDeTecnicoId===t.id);
   const porDestino = {};
   itens.forEach(e=>{ (porDestino[e.transitoPara]=porDestino[e.transitoPara]||[]).push(e); });
-  modal('⏳ Transferências aguardando confirmação', `
+  modal(ic('hourglass')+' Transferências aguardando confirmação', `
     <div style="display:flex;flex-direction:column;gap:14px;max-height:460px;overflow:auto">${
       Object.keys(porDestino).length? Object.entries(porDestino).map(([destId,lista])=>`
         <div class="panel" style="box-shadow:none">
-          <div class="ph"><h3 style="font-size:14px">👷 ${esc(tecNome(destId))}</h3><span class="count-badge" style="margin-left:8px">${lista.length}</span><div class="spacer"></div>
-            <button class="btn sm red ghost" onclick="cancelarLoteTransferencia('${destId}')">✕ Cancelar tudo deste lote</button>
+          <div class="ph"><h3 style="font-size:14px">${ic('hard-hat')} ${esc(tecNome(destId))}</h3><span class="count-badge" style="margin-left:8px">${lista.length}</span><div class="spacer"></div>
+            <button class="btn sm red ghost" onclick="cancelarLoteTransferencia('${destId}')">${ic('x')} Cancelar tudo deste lote</button>
           </div>
           <div class="pb" style="display:flex;flex-direction:column;gap:8px">
             ${lista.map(e=>`
-              <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:8px 10px;background:var(--panel-soft);border-radius:9px">
+              <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:8px 10px;background:var(--panel-soft);border-radius:var(--radius-md)">
                 <div style="flex:1;min-width:160px"><span class="mono"><b>${esc(e.serie)}</b></span> <span class="tag-tipo" style="margin-left:6px">${esc(tipoNome(e.tipo))}</span></div>
                 <div class="muted" style="font-size:11px">${fmtTS(e.transitoDesde)}</div>
-                <button class="btn sm ghost" onclick="cancelarEnvio('${esc(e.serie)}')">✕</button>
+                <button class="btn sm ghost" onclick="cancelarEnvio('${esc(e.serie)}')" aria-label="Cancelar envio">${ic('x')}</button>
               </div>`).join('')}
           </div>
-        </div>`).join('') : '<div class="empty"><div class="big">✅</div>Nada pendente no momento.</div>'
+        </div>`).join('') : '<div class="empty"><div class="big">'+ic('check')+'</div>Nada pendente no momento.</div>'
     }</div>`, `<button class="btn" onclick="closeModal()">Fechar</button>`, 'lg');
 }
 function cancelarLoteTransferencia(destinoId){
@@ -1261,13 +1884,13 @@ function cancelarLoteTransferencia(destinoId){
     e.emTransito=false; e.transitoPara=null; e.transitoDesde=null; e.transitoDe=null; e.transitoUsuario=null; e.transitoDeTecnicoId=null;
     registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:'cancelamento', serie:e.serie, de:'Em trânsito', para:tecNome(destinoId)+' (cancelado em lote)', tecnicoId:null, usuario:nomeUsuarioAtual(), obs:'Envio cancelado em lote antes da confirmação' });
   });
-  salvar(); closeModal(); render(); flash(`✅ ${itens.length} envio(s) cancelado(s)`,'green');
+  salvar(); closeModal(); render(); flash(`${itens.length} envio(s) cancelado(s)`,'green');
 }
 let pendConfFilial = '';
 let pendConfTec = '';
 function abrirPendentesConfirmacao(){
   pendConfFilial=''; pendConfTec='';
-  modal('⏳ Aguardando confirmação do técnico', `<div id="pendConfBody"></div>`, `<button class="btn" onclick="gerarRelatorioPendentes()">🖨️ Gerar relatório</button><button class="btn" onclick="closeModal()">Fechar</button>`, 'lg');
+  modal(ic('hourglass')+' Aguardando confirmação do técnico', `<div id="pendConfBody"></div>`, `<button class="btn" onclick="gerarRelatorioPendentes()">${ic('printer')} Gerar relatório</button><button class="btn" onclick="closeModal()">Fechar</button>`, 'lg');
   renderPendentesConfirmacaoBody();
 }
 function sincronizarFiltrosPendentes(porDestino){
@@ -1318,20 +1941,20 @@ function renderPendentesConfirmacaoBody(){
     <div style="display:flex;flex-direction:column;gap:14px;max-height:400px;overflow:auto">${
       grupos.length? grupos.map(([destId,lista])=>`
         <div class="panel" style="box-shadow:none">
-          <div class="ph"><h3 style="font-size:14px">👷 ${esc(tecNome(destId))}</h3><span class="count-badge" style="margin-left:8px">${lista.length}</span><div class="spacer"></div>
-            ${souAdmin()||souSupervisor()?`<button class="btn sm red ghost" onclick="cancelarLotePendente('${destId}')">✕ Cancelar tudo deste lote</button>`:''}
+          <div class="ph"><h3 style="font-size:14px">${ic('hard-hat')} ${esc(tecNome(destId))}</h3><span class="count-badge" style="margin-left:8px">${lista.length}</span><div class="spacer"></div>
+            ${souAdmin()||souSupervisor()?`<button class="btn sm red ghost" onclick="cancelarLotePendente('${destId}')">${ic('x')} Cancelar tudo deste lote</button>`:''}
           </div>
           <div class="pb" style="display:flex;flex-direction:column;gap:8px">
             ${lista.map(e=>`
-              <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:8px 10px;background:var(--panel-soft);border-radius:9px">
+              <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:8px 10px;background:var(--panel-soft);border-radius:var(--radius-md)">
                 <div style="flex:1;min-width:180px">
                   <span class="mono"><b>${esc(e.serie)}</b></span> <span class="tag-tipo" style="margin-left:6px">${esc(tipoNome(e.tipo))}</span>
                   <div class="muted" style="font-size:11px;margin-top:2px">${esc(e.transitoDe||'—')} · enviado por ${esc(e.transitoUsuario||'—')} · ${fmtTS(e.transitoDesde)}</div>
                 </div>
-                ${souAdmin()||souSupervisor()?`<button class="btn sm ghost" onclick="cancelarEnvio('${esc(e.serie)}')">✕</button>`:''}
+                ${souAdmin()||souSupervisor()?`<button class="btn sm ghost" onclick="cancelarEnvio('${esc(e.serie)}')" aria-label="Cancelar envio">${ic('x')}</button>`:''}
               </div>`).join('')}
           </div>
-        </div>`).join('') : '<div class="empty"><div class="big">✅</div>Nada pendente no momento.</div>'
+        </div>`).join('') : '<div class="empty"><div class="big">'+ic('check')+'</div>Nada pendente no momento.</div>'
     }</div>`;
 }
 function gerarRelatorioPendentes(){
@@ -1345,11 +1968,11 @@ function gerarRelatorioPendentes(){
     h3{font-size:14px;margin:22px 0 8px;border-bottom:2px solid #d97706;padding-bottom:4px}
     table{width:100%;border-collapse:collapse;margin:8px 0}th,td{border:1px solid #ccc;padding:7px 9px;text-align:left;font-size:12px}th{background:#f0f0f0}
     @media print{button{display:none}}</style></head><body>
-    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">🖨️ Imprimir / Salvar PDF</button>
+    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">Imprimir / Salvar PDF</button>
     <h1>Relatório de Equipamentos Pendentes de Confirmação</h1>
     <h2>${esc(titulo)} · ${totalItens} item(ns) · gerado em ${hoje}</h2>
     ${grupos.length? grupos.map(([destId,lista])=>`
-      <h3>👷 ${esc(tecNome(destId))} — ${lista.length} item(ns)</h3>
+      <h3>${ic('hard-hat')} ${esc(tecNome(destId))} — ${lista.length} item(ns)</h3>
       <table><thead><tr><th>Nº Série</th><th>Tipo</th><th>De</th><th>Para</th><th>Enviado por</th><th>Data</th></tr></thead><tbody>
         ${lista.map(e=>`<tr><td>${esc(e.serie)}</td><td>${esc(tipoNome(e.tipo))}</td><td>${esc(e.transitoDe||'—')}</td><td>${esc(tecNome(destId))}</td><td>${esc(e.transitoUsuario||'—')}</td><td>${fmtTS(e.transitoDesde)}</td></tr>`).join('')}
       </tbody></table>`).join('') : '<p>Nenhuma pendência encontrada.</p>'}
@@ -1368,7 +1991,7 @@ function cancelarLotePendente(destinoId){
   });
   salvar(); render();
   if($('#pendConfBody')) renderPendentesConfirmacaoBody(); else closeModal();
-  flash(`✅ ${itens.length} envio(s) cancelado(s)`,'green');
+  flash(`${itens.length} envio(s) cancelado(s)`,'green');
 }
 function cancelarEnvio(serie){
   const e = DB.equipamentos.find(x=>x.serie===serie); if(!e || !e.emTransito) return;
@@ -1384,14 +2007,14 @@ function cancelarEnvio(serie){
   else if(document.getElementById('modalBg') && document.getElementById('modalBg').classList.contains('show')) closeModal();
   flash('Envio cancelado','green');
 }
-function movCard(tipo,ic,titulo,desc,cor){
-  return actionCard(ic,titulo,desc,cor,`openMov(null,'${tipo}')`);
+function movCard(tipo,icone,titulo,desc,cor){
+  return actionCard(icone,titulo,desc,cor,`openMov(null,'${tipo}')`);
 }
-function actionCard(ic,titulo,desc,cor,onclickJs){
+function actionCard(icone,titulo,desc,cor,onclickJs){
   const cores={green:'var(--green)',b:'var(--brand)',v:'var(--violet)',r:'var(--red)'};
   return `<button class="panel" style="text-align:left;padding:0;border:0" onclick="${onclickJs}">
     <div class="pb" style="display:flex;gap:14px;align-items:flex-start">
-      <div style="font-size:24px;width:50px;height:50px;border-radius:13px;background:${cores[cor]}1a;display:grid;place-items:center;flex-shrink:0">${ic}</div>
+      <div style="font-size:24px;width:50px;height:50px;border-radius:13px;background:${cores[cor]}1a;color:${cores[cor]};display:grid;place-items:center;flex-shrink:0">${ic(icone)}</div>
       <div><div style="font-weight:700;font-size:15px;margin-bottom:3px">${titulo}</div><div class="muted" style="font-size:12.5px">${desc}</div></div>
     </div></button>`;
 }
@@ -1455,14 +2078,14 @@ function importarTecnicosPadrao(){
     const chave=t.nome.trim().toLowerCase();
     if(!existentes.has(chave)){ DB.tecnicos.push({id:uid(), nome:t.nome, regiao:t.regiao, matricula:t.matricula}); existentes.add(chave); novos++; }
   });
-  salvar(); render(); flash(`✅ ${novos} técnico(s) importado(s)${TECNICOS_PADRAO.length-novos>0?', '+(TECNICOS_PADRAO.length-novos)+' já existiam':''}`,'green');
+  salvar(); render(); flash(`${novos} técnico(s) importado(s)${TECNICOS_PADRAO.length-novos>0?', '+(TECNICOS_PADRAO.length-novos)+' já existiam':''}`,'green');
 }
 function renderTecnicos(){
   const tecnicosLista = souSupervisor() ? DB.tecnicos.filter(t=>regiaoPermitida(t.regiao)) : DB.tecnicos;
   $('#content').innerHTML = `
   <div class="toolbar">
     <div style="flex:1"></div>
-    ${souAdmin()?`<button class="btn" onclick="importarTecnicosPadrao()">📋 Importar lista oficial</button>`:''}
+    ${souAdmin()?`<button class="btn" onclick="importarTecnicosPadrao()">${ic('clipboard-list')} Importar lista oficial</button>`:''}
     <button class="btn primary" onclick="openTec()">＋ Novo técnico</button>
   </div>
   <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(280px,1fr))">
@@ -1473,7 +2096,7 @@ function renderTecnicos(){
         <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
           <div style="width:44px;height:44px;border-radius:50%;background:var(--brand-soft);color:var(--brand);display:grid;place-items:center;font-weight:800;font-size:17px">${esc((t.nome||'?')[0].toUpperCase())}</div>
           <div style="flex:1"><div style="font-weight:700;font-size:15px">${esc(t.nome)}</div><div class="muted" style="font-size:12px">${esc(t.regiao||'Sem região')} ${t.matricula?'· '+esc(t.matricula):''}</div></div>
-          <button class="btn sm ghost" onclick="event.stopPropagation();openTec('${t.id}')">✏️</button>
+          <button class="btn sm ghost" onclick="event.stopPropagation();openTec('${t.id}')" aria-label="Editar técnico">${ic('pencil')}</button>
         </div>
         <div style="display:flex;align-items:center;gap:8px;padding:10px 12px;background:var(--panel-soft);border-radius:10px">
           <span class="badge ${itens.length?'com_tecnico':'gray'}">${itens.length} em posse</span>
@@ -1481,7 +2104,7 @@ function renderTecnicos(){
           <span class="btn sm ghost" style="margin-left:auto">ver ficha →</span>
         </div>
       </div></div>`;
-    }).join('') : `<div class="panel" style="grid-column:1/-1"><div class="empty"><div class="big">👷</div>Nenhum técnico cadastrado.<br><button class="btn primary" style="margin-top:14px" onclick="openTec()">＋ Cadastrar primeiro técnico</button></div></div>`}
+    }).join('') : `<div class="panel" style="grid-column:1/-1"><div class="empty"><div class="big">${ic('hard-hat')}</div>Nenhum técnico cadastrado.<br><button class="btn primary" style="margin-top:14px" onclick="openTec()">＋ Cadastrar primeiro técnico</button></div></div>`}
   </div>`;
 }
 function verTecItens(id){
@@ -1496,12 +2119,12 @@ let histFiltro={ tipo:'', q:'' };
 function renderHist(){
   $('#content').innerHTML = `
   <div class="toolbar">
-    <div class="search"><span class="si">🔎</span><input placeholder="Buscar por nº de série..." value="${esc(histFiltro.q)}" oninput="histFiltro.q=this.value;renderHistTabela()"></div>
+    <div class="search"><span class="si">${ic('search')}</span><input placeholder="Buscar por nº de série..." value="${esc(histFiltro.q)}" oninput="histFiltro.q=this.value;renderHistTabela()"></div>
     <select class="filter" onchange="histFiltro.tipo=this.value;renderHistTabela()">
       <option value="">Todos os tipos de mov.</option>
       ${Object.entries(MOV_LABEL).map(([k,v])=>`<option value="${k}" ${histFiltro.tipo===k?'selected':''}>${v}</option>`).join('')}
     </select>
-    <button class="btn" onclick="exportarHistCSV()">⬇️ Exportar CSV</button>
+    <button class="btn" onclick="exportarHistCSV()">${ic('download')} Exportar CSV</button>
   </div>
   <div class="panel"><div class="ph"><h3>Histórico de movimentações</h3><span class="count-badge" id="histCount"></span></div>
     <div class="tbl-wrap" id="histTabela"></div></div>`;
@@ -1511,7 +2134,7 @@ function renderHistTabela(){
   const q=histFiltro.q.trim().toLowerCase();
   const lista = DB.movimentacoes.filter(m=>(!histFiltro.tipo||m.tipo===histFiltro.tipo)&&(!q||m.serie.toLowerCase().includes(q))).reverse();
   $('#histCount') && ($('#histCount').textContent = lista.length+' registros');
-  $('#histTabela').innerHTML = lista.length? tabelaMov(lista.slice(0,800)) : `<div class="empty"><div class="big">🕓</div>Nenhuma movimentação registrada.</div>`;
+  $('#histTabela').innerHTML = lista.length? tabelaMov(lista.slice(0,800)) : `<div class="empty"><div class="big">${ic('clock')}</div>Nenhuma movimentação registrada.</div>`;
 }
 function tabelaMov(lista){
   if(!lista.length) return `<div class="empty">Nada por aqui ainda.</div>`;
@@ -1554,12 +2177,12 @@ function corrigirTiposDuplicados(){
   if(!paraRemover.length) return flash('Nenhum tipo duplicado sem uso encontrado','green');
   if(!confirm('Remover '+paraRemover.length+' tipo(s) duplicado(s) sem nenhum equipamento (ex.: "'+paraRemover[0]+'")? Os tipos com equipamentos reais não são afetados.')) return;
   paraRemover.forEach(c=>delete DB.tipos[c]);
-  salvar(); render(); flash(`✅ ${paraRemover.length} tipo(s) duplicado(s) removido(s)`,'green');
+  salvar(); render(); flash(`${paraRemover.length} tipo(s) duplicado(s) removido(s)`,'green');
 }
 function renderTipos(){
   const cods=Object.keys(DB.tipos);
   $('#content').innerHTML = `
-  <div class="panel"><div class="ph"><h3>🏷️ Tipos de equipamento</h3><div class="spacer"></div>${souAdmin()?`<button class="btn sm" onclick="corrigirTiposDuplicados()">🧹 Remover duplicados sem uso</button>`:''}<button class="btn sm primary" onclick="openTipo()">＋ Adicionar tipo</button></div>
+  <div class="panel"><div class="ph"><h3>${ic('tag')} Tipos de equipamento</h3><div class="spacer"></div>${souAdmin()?`<button class="btn sm" onclick="corrigirTiposDuplicados()">${ic('eraser')} Remover duplicados sem uso</button>`:''}<button class="btn sm primary" onclick="openTipo()">＋ Adicionar tipo</button></div>
   <div class="pb">
     <p class="muted" style="margin-bottom:16px">Dê um nome amigável a cada código (ex.: <b>UBI.0001 → "Sirene"</b>). Os nomes aparecem em todo o dashboard.</p>
     ${cods.length? `<div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(260px,1fr))">
@@ -1567,7 +2190,7 @@ function renderTipos(){
         <div class="panel" style="box-shadow:none"><div class="pb" style="display:flex;align-items:center;gap:12px">
           <span style="width:14px;height:14px;border-radius:4px;background:${tipoCor(c)};flex-shrink:0"></span>
           <div style="flex:1"><div style="font-weight:700">${esc(tipoNome(c))}</div><div class="mono muted" style="font-size:12px">${esc(c)} · ${n} itens · ${emEst} em estoque${min>0?` · mín/técnico ${min}`:''}</div></div>
-          <button class="btn sm ghost" onclick="openTipo('${esc(c)}')">✏️</button>
+          <button class="btn sm ghost" onclick="openTipo('${esc(c)}')" aria-label="Editar tipo">${ic('pencil')}</button>
         </div></div>`;}).join('')}
     </div>`: `<div class="empty">Nenhum tipo. Importe dados ou adicione manualmente.</div>`}
   </div></div>`;
@@ -1582,13 +2205,13 @@ function renderFiliais(){
   const alertasPorFilial = {};
   todosAlertasMin.forEach(a=>{ alertasPorFilial[a.filial]=(alertasPorFilial[a.filial]||0)+1; });
   $('#content').innerHTML = `
-  <div class="panel"><div class="ph"><h3>🏢 Filiais / Depósitos</h3><div class="spacer"></div><button class="btn sm primary" onclick="openFilial()">＋ Adicionar filial</button></div>
+  <div class="panel"><div class="ph"><h3>${ic('building-2')} Filiais / Depósitos</h3><div class="spacer"></div><button class="btn sm primary" onclick="openFilial()">＋ Adicionar filial</button></div>
   <div class="pb">
     <p class="muted" style="margin-bottom:16px">Cadastre uma filial mesmo antes dela ter equipamentos ou técnicos — assim ela já aparece nos filtros e telas do sistema.</p>
     ${filiais.length? `<div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(220px,1fr))">
       ${filiais.map(f=>{ const n=DB.equipamentos.filter(e=>e.deposito===f).length; const tecs=DB.tecnicos.filter(t=>t.regiao===f).length; const alertas=alertasPorFilial[f]||0; return `
       <div class="panel" style="box-shadow:none;cursor:pointer" onclick="abrirFilial('${esc(f)}')"><div class="pb">
-        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px"><div style="font-weight:700;font-size:15px">${esc(f)}</div>${alertas?`<span class="badge baixado" style="font-size:10px;margin-left:auto">⚠️ ${alertas}</span>`:''}</div>
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px"><div style="font-weight:700;font-size:15px">${esc(f)}</div>${alertas?`<span class="badge baixado" style="font-size:10px;margin-left:auto">${ic('alert-triangle')} ${alertas}</span>`:''}</div>
         <div class="muted" style="font-size:12px">${n} equipamento(s) · ${tecs} técnico(s)</div>
       </div></div>`;}).join('')}
     </div>` : '<div class="empty">Nenhuma filial cadastrada ainda.</div>'}
@@ -1602,21 +2225,21 @@ function abrirFilial(f){
   const tecs = DB.tecnicos.filter(t=>t.regiao===f);
   const alertasFilial = alertasEstoqueMinPorFilial().filter(a=>a.filial===f);
   const podeExcluir = eqs.length===0 && tecs.length===0;
-  modal('🏢 '+esc(f), `
+  modal(ic('building-2')+' '+esc(f), `
     <div class="grid kpis" style="grid-template-columns:repeat(4,1fr);margin-bottom:18px">
-      ${kpi('b','📦','Total',eqs.length)}
-      ${kpi('g','✅','Em estoque',emEstoque)}
-      ${kpi('a','👷','Com técnicos',comTec)}
-      ${kpi('r','♻️','RMA',rma)}
+      ${kpi('b','package','Total',eqs.length)}
+      ${kpi('g','check','Em estoque',emEstoque)}
+      ${kpi('a','hard-hat','Com técnicos',comTec)}
+      ${kpi('r','recycle','RMA',rma)}
     </div>
-    ${alertasFilial.length?`<div class="badge baixado" style="padding:8px 12px;margin-bottom:16px">⚠️ ${alertasFilial.length} tipo(s) abaixo do estoque mínimo</div>`:''}
-    <h4 style="margin-bottom:8px;font-size:13.5px">👷 Técnicos vinculados (${tecs.length})</h4>
+    ${alertasFilial.length?`<div class="badge baixado" style="padding:8px 12px;margin-bottom:16px">${ic('alert-triangle')} ${alertasFilial.length} tipo(s) abaixo do estoque mínimo</div>`:''}
+    <h4 style="margin-bottom:8px;font-size:13.5px">${ic('hard-hat')} Técnicos vinculados (${tecs.length})</h4>
     <div class="tbl-wrap" style="max-height:220px">${
       tecs.length? `<table><tbody>${tecs.map(t=>{ const n=itensDoTecnico(t.id).length; return `
         <tr style="cursor:pointer" onclick="closeModal();verEstoqueTecnico('${t.id}')"><td>${esc(t.nome)}</td><td class="right"><span class="count-badge">${n} itens</span></td></tr>`;}).join('')}</tbody></table>`
       : '<div class="empty">Nenhum técnico vinculado a essa filial.</div>'
     }</div>`,
-    `${podeExcluir?`<button class="btn red ghost" style="margin-right:auto" onclick="excluirFilial('${esc(f)}')">🗑️ Excluir filial</button>`:`<span class="muted" style="margin-right:auto;font-size:11.5px;max-width:260px">Só é possível excluir filiais sem equipamentos e sem técnicos vinculados.</span>`}
+    `${podeExcluir?`<button class="btn red ghost" style="margin-right:auto" onclick="excluirFilial('${esc(f)}')">${ic('trash-2')} Excluir filial</button>`:`<span class="muted" style="margin-right:auto;font-size:11.5px;max-width:260px">Só é possível excluir filiais sem equipamentos e sem técnicos vinculados.</span>`}
      <button class="btn" onclick="closeModal()">Fechar</button>
      <button class="btn primary" onclick="closeModal();estoqueMinFilial='${esc(f)}';goto('estoquemin')">Ver estoque mínimo →</button>`, 'lg');
 }
@@ -1629,7 +2252,7 @@ function salvarFilial(){
   if(!nome) return flash('Informe a sigla da filial','red');
   if(todasFiliaisConhecidas().includes(nome)) return flash('Essa filial já existe','red');
   DB.filiais = DB.filiais||[]; DB.filiais.push(nome);
-  salvar(); closeModal(); render(); flash('✅ Filial adicionada','green');
+  salvar(); closeModal(); render(); flash('Filial adicionada','green');
 }
 function excluirFilial(f){
   if(!souAdmin()) return flash('Somente administradores podem fazer isso','red');
@@ -1645,45 +2268,59 @@ function renderDados(){
   const c=DB.config.importadoEm;
   $('#content').innerHTML = `
   <div class="grid" style="grid-template-columns:1fr 1fr">
-    <div class="panel"><div class="ph"><h3>📋 Colar dados da planilha</h3></div><div class="pb">
+    <div class="panel"><div class="ph"><h3>${ic('clipboard-list')} Colar dados da planilha</h3></div><div class="pb">
       <p class="muted" style="margin-bottom:12px">Selecione tudo no Excel (com o cabeçalho) → Copiar → cole aqui. Reconhece as colunas <b>Nº Série, Produto, Depósito, Data Entrada</b>.</p>
       <div class="field"><textarea id="pasteArea" rows="8" placeholder="Cole aqui os dados copiados do Excel..." style="font-family:Consolas,monospace;font-size:12px"></textarea></div>
       <label class="checkbox" style="margin-bottom:12px"><input type="checkbox" id="pasteSubstituir"> Substituir todo o inventário (senão, adiciona/atualiza)</label>
       <button class="btn primary" onclick="importarColado()">Importar dados colados</button>
     </div></div>
 
-    <div class="panel"><div class="ph"><h3>📁 Abrir arquivo Excel / CSV</h3></div><div class="pb">
+    <div class="panel"><div class="ph"><h3>${ic('folder-open')} Abrir arquivo Excel / CSV</h3></div><div class="pb">
       <p class="muted" style="margin-bottom:12px">Abra direto o arquivo <b>.xlsx</b> ou <b>.csv</b> do seu inventário.</p>
       <div class="field"><input type="file" id="fileInput" accept=".xlsx,.xls,.csv" onchange="importarArquivo(this)"></div>
-      ${window.__noXLSX?`<div class="badge baixado" style="margin-bottom:10px">⚠️ Leitura de .xlsx indisponível (sem internet). Use CSV ou cole os dados.</div>`:''}
+      ${window.__noXLSX?`<div class="badge baixado" style="margin-bottom:10px">${ic('alert-triangle')} Leitura de .xlsx indisponível (sem internet). Use CSV ou cole os dados.</div>`:''}
       <label class="checkbox"><input type="checkbox" id="fileSubstituir" checked> Substituir todo o inventário ao importar</label>
     </div></div>
   </div>
 
-  ${souAdmin()?`<div class="panel" style="margin-top:18px;border-left:4px solid var(--red)"><div class="pb">
-    <b>🚑 Correção urgente de sincronização</b>
-    <p class="muted" style="margin:6px 0 12px">Se aparecer erro de "documento muito grande" ao movimentar itens, clique aqui uma vez para migrar o histórico de movimentações, auditorias e os equipamentos para um armazenamento sem limite de tamanho.</p>
-    <button class="btn red" onclick="migrarHistoricoParaColecao()">🚑 Corrigir armazenamento (migrar histórico)</button>
-  </div></div>`:''}
-  <div class="panel" style="margin-top:18px"><div class="ph"><h3>💾 Backup & compartilhamento</h3></div><div class="pb">
+  <div class="panel" style="margin-top:18px"><div class="ph"><h3>${ic('save')} Backup & compartilhamento</h3></div><div class="pb">
     <p class="muted" style="margin-bottom:14px">Os dados ficam salvos <b>neste navegador</b>. Para fazer cópia de segurança ou usar em outra máquina/compartilhar via rede, exporte o backup e importe no outro computador.</p>
     <p class="muted" style="margin-bottom:14px;font-size:12.5px">${DB.config.ultimoBackup?`Último backup: <b>${fmtTS(DB.config.ultimoBackup)}</b>`:'Nenhum backup feito ainda.'} — o responsável pelo sistema recebe um backup automático a cada 7 dias ao logar, sem precisar clicar em nada.</p>
     <div style="display:flex;gap:10px;flex-wrap:wrap">
-      <button class="btn green" onclick="exportarBackup()">⬇️ Exportar backup (.json)</button>
-      <label class="btn">⬆️ Importar backup<input type="file" accept=".json" style="display:none" onchange="importarBackup(this)"></label>
-      ${souAdmin()?`<button class="btn" onclick="limparSiglasFiliais()">🧹 Corrigir siglas de filiais (tirar "EPV")</button>`:''}
-      ${souAdmin()?`<button class="btn" onclick="corrigirItensCDO()">🧹 Corrigir itens presos em "CDO"</button>`:''}
-      ${souAdmin()?`<button class="btn" onclick="corrigirTiposPorSerie()">🔎 Corrigir tipos pelo padrão do código</button>`:''}
-      ${souAdmin()?`<button class="btn" onclick="aplicarMinimosOficiais()">🎯 Aplicar estoque mínimo oficial</button>`:''}
-      ${souAdmin()?`<button class="btn" onclick="distribuirEquipamentosTeste()">🧪 Distribuir equipamentos entre técnicos (teste)</button>`:''}
-      ${souAdmin()?`<button class="btn" onclick="gerarCenarioTesteCompleto()">🎲 Gerar cenário de teste completo</button>`:''}
-      ${souAdmin()?`<button class="btn" onclick="reverterCenarioTeste()">↩️ Devolver tudo ao estoque</button>`:''}
-      <button class="btn red" onclick="limparTudo()">🗑️ Apagar tudo</button>
+      <button class="btn green" onclick="exportarBackup()">${ic('download')} Exportar backup (.json)</button>
+      <label class="btn">${ic('upload')} Importar backup<input type="file" accept=".json" style="display:none" onchange="importarBackup(this)"></label>
+      ${souAdmin()?`<button class="btn" onclick="limparSiglasFiliais()">${ic('eraser')} Corrigir siglas de filiais (tirar "EPV")</button>`:''}
+      ${souAdmin()?`<button class="btn" onclick="corrigirItensCDO()">${ic('eraser')} Corrigir itens presos em "CDO"</button>`:''}
+      ${souAdmin()?`<button class="btn" onclick="corrigirTiposPorSerie()">${ic('search')} Corrigir tipos pelo padrão do código</button>`:''}
+      ${souAdmin()?`<button class="btn" onclick="aplicarMinimosOficiais()">${ic('target')} Aplicar estoque mínimo oficial</button>`:''}
+      ${souAdmin()?`<button class="btn" onclick="distribuirEquipamentosTeste()">${ic('flask-conical')} Distribuir equipamentos entre técnicos (teste)</button>`:''}
+      ${souAdmin()?`<button class="btn" onclick="gerarCenarioTesteCompleto()">${ic('shuffle')} Gerar cenário de teste completo</button>`:''}
+      ${souAdmin()?`<button class="btn" onclick="reverterCenarioTeste()">${ic('undo-2')} Devolver tudo ao estoque</button>`:''}
+      <button class="btn red" onclick="limparTudo()">${ic('trash-2')} Apagar tudo</button>
     </div>
     <div class="field" style="margin-top:18px;max-width:340px"><label>Seu nome (registrado nas movimentações)</label>
       <input id="cfgUsuario" value="${esc(DB.config.usuario||'')}" placeholder="Ex.: Cliver" onchange="DB.config.usuario=this.value;salvar()"></div>
     ${c?`<div class="muted" style="font-size:12px;margin-top:8px">Última importação: ${fmtTS(c)} · ${DB.equipamentos.length} itens · ${DB.movimentacoes.length} movimentações</div>`:''}
-  </div></div>`;
+  </div></div>
+  ${souAdmin()?`
+  <div class="panel" style="margin-top:18px"><div class="ph"><h3>${ic('alert-triangle')} Erros recentes (diagnóstico)</h3></div><div class="pb">
+    <p class="muted" style="margin-bottom:12px">Erros de JavaScript capturados automaticamente no navegador de qualquer usuário aprovado — útil pra ver problemas que ninguém chegou a reportar.</p>
+    <button class="btn" onclick="carregarErrosRecentes()">${ic('refresh-cw')} Carregar últimos 50</button>
+    <div id="errosRecentesBox" style="margin-top:14px"></div>
+  </div></div>`:''}`;
+}
+async function carregarErrosRecentes(){
+  if(!souAdmin()) return;
+  const box = $('#errosRecentesBox'); if(!box) return;
+  box.innerHTML = '<p class="muted">Carregando...</p>';
+  try{
+    const { data, error } = await sb.from('erros').select('*').order('ts',{ascending:false}).limit(50);
+    if(error) throw error;
+    if(!data.length){ box.innerHTML = '<p class="muted">Nenhum erro registrado — ótimo sinal.</p>'; return; }
+    box.innerHTML = `<div style="overflow-x:auto"><table><thead><tr><th>Quando</th><th>Usuário</th><th>Tela</th><th>Mensagem</th></tr></thead><tbody>${
+      data.map(e=>`<tr><td class="mono">${fmtTS(e.ts)}</td><td>${esc(e.usuario_email||'—')} <span class="muted">(${esc(e.papel||'—')})</span></td><td>${esc(e.tela||'—')}</td><td title="${esc(e.stack||'')}">${esc(e.mensagem)}</td></tr>`).join('')
+    }</tbody></table></div>`;
+  }catch(err){ box.innerHTML = '<p class="muted">Falha ao carregar: '+esc(err.message)+'</p>'; }
 }
 
 /* =========================================================
@@ -1692,7 +2329,7 @@ function renderDados(){
 function modal(titulo, body, footer='', size=''){
   $('#modal').className = 'modal '+(size||'');
   $('#modal').innerHTML = `
-    <div class="mh"><h3>${titulo}</h3><button class="x" onclick="closeModal()">×</button></div>
+    <div class="mh"><h3>${titulo}</h3><button class="x" onclick="closeModal()" aria-label="Fechar">${ic('x')}</button></div>
     <div class="mb">${body}</div>
     ${footer?`<div class="mf">${footer}</div>`:''}`;
   $('#modalBg').classList.add('show');
@@ -1718,7 +2355,7 @@ function openEquip(serie){
       <div class="field"><label>Data de entrada</label><input id="e_data" value="${e?esc(e.dataEntrada||''):''}" placeholder="dd/mm/aaaa"></div>
     </div>
     <div class="field"><label>Observação</label><input id="e_obs" value="${e?esc(e.obs||''):''}"></div>`,
-    `${e&&souAdmin()?`<button class="btn red ghost" style="margin-right:auto" onclick="excluirEquip('${esc(e.serie)}')">🗑️ Excluir definitivamente</button>`:''}
+    `${e&&souAdmin()?`<button class="btn red ghost" style="margin-right:auto" onclick="excluirEquip('${esc(e.serie)}')">${ic('trash-2')} Excluir definitivamente</button>`:''}
      <button class="btn" onclick="closeModal()">Cancelar</button>
      <button class="btn primary" onclick="salvarEquip(${e?`'${esc(e.serie)}'`:'null'})">Salvar</button>`);
 }
@@ -1743,7 +2380,7 @@ function salvarEquip(serieEdit){
   else { DB.equipamentos.push(Object.assign({serie, local:dados.deposito, tecnicoId:null}, dados)); }
   // garante que o tipo exista
   if(dados.tipo && !DB.tipos[dados.tipo]) DB.tipos[dados.tipo]={nome:dados.tipo,cor:''};
-  salvar(); closeModal(); render(); flash('✅ Equipamento salvo','green');
+  salvar(); closeModal(); render(); flash('Equipamento salvo','green');
 }
 function excluirEquip(serie){
   if(!souAdmin()) return flash('Somente administradores podem excluir equipamentos','red');
@@ -1752,6 +2389,12 @@ function excluirEquip(serie){
   const snapshot = `tipo:${tipoNome(e.tipo)} · status:${STATUS[e.status]||e.status} · local:${e.local||e.deposito||'—'}${e.tecnicoId?' · com '+tecNome(e.tecnicoId):''}`;
   registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:'exclusao', serie, de:snapshot, para:'Excluído do sistema', tecnicoId:e.tecnicoId||null, usuario:nomeUsuarioAtual(), obs:'Exclusão definitiva por administrador' });
   DB.equipamentos = DB.equipamentos.filter(x=>x.serie!==serie);
+  // Exclusão no banco é EXPLÍCITA (a sincronização não infere mais exclusões — ver
+  // sincronizarEquipamentos/BUG-034). Se falhar, o item volta sozinho no próximo
+  // recarregamento (continua existindo no banco) — por isso o aviso claro no erro.
+  excluirEquipamentosNoBanco([serie]).catch(err=>{
+    flash('A exclusão de '+serie+' NÃO foi aplicada na nuvem ('+err.message+') — o item vai reaparecer. Tente de novo com conexão.','red');
+  });
   salvar(); closeModal(); render(); flash('Equipamento excluído — registro mantido no Histórico');
 }
 
@@ -1773,7 +2416,7 @@ function salvarTec(id){
   const dados={nome, regiao:$('#t_regiao').value.trim(), matricula:$('#t_mat').value.trim()};
   if(id){ Object.assign(DB.tecnicos.find(x=>x.id===id),dados); }
   else { DB.tecnicos.push(Object.assign({id:uid()},dados)); }
-  salvar(); closeModal(); render(); flash('✅ Técnico salvo','green');
+  salvar(); closeModal(); render(); flash('Técnico salvo','green');
 }
 function excluirTec(id){
   const n = DB.equipamentos.filter(e=>e.tecnicoId===id && e.status==='com_tecnico').length;
@@ -1798,7 +2441,7 @@ function openTipo(cod){
 function salvarTipo(cod){
   const c = cod || $('#tp_cod').value.trim(); if(!c) return flash('Informe o código','red');
   DB.tipos[c]={ nome:$('#tp_nome').value.trim()||c, cor:$('#tp_cor').value, min:parseInt($('#tp_min').value)||0 };
-  salvar(); closeModal(); render(); flash('✅ Tipo salvo','green');
+  salvar(); closeModal(); render(); flash('Tipo salvo','green');
 }
 
 /* =========================================================
@@ -1835,7 +2478,7 @@ function desenharMov(){
   const tecsOrigemOpt = agruparTecsPorFilialOpt(tecsFiltrados, movTecOrigem);
   const tecsDestino = tecsBase.filter(t=>t.id!==movTecOrigem);
   const tecsDestinoOpt = agruparTecsPorFilialOpt(tecsDestino);
-  modal('🔄 Registrar movimentação', `
+  modal(ic('refresh-cw')+' Registrar movimentação', `
     <div class="field"><label>Tipo de movimentação</label>
       <div class="pill-tabs" style="width:100%">
         ${tiposDisponiveis.map(k=>`<button class="${movTipo===k?'active':''}" style="flex:1" onclick="movTipo='${k}';desenharMov()">${MOV_LABEL[k]}</button>`).join('')}
@@ -1844,7 +2487,7 @@ function desenharMov(){
 
     <div class="field"><label>Equipamentos (nº de série)</label>
       <div style="display:flex;gap:8px;align-items:stretch">
-        <div class="search" style="flex:1"><span class="si">🔎</span><input id="movBusca" placeholder="Digite/scan o nº de série e Enter para adicionar..." onkeydown="if(event.key==='Enter'){addMovSerieBusca();event.preventDefault()}" oninput="filtrarPickMov(this.value)"></div>
+        <div class="search" style="flex:1"><span class="si">${ic('search')}</span><input id="movBusca" placeholder="Digite/scan o nº de série e Enter para adicionar..." onkeydown="if(event.key==='Enter'){addMovSerieBusca();event.preventDefault()}" oninput="filtrarPickMov(this.value)"></div>
         <button class="btn primary" onclick="addMovSerieBusca()">+ Adicionar</button>
       </div>
       <div class="chips" id="movChips"></div>
@@ -1966,12 +2609,12 @@ function addMovSerieBusca(){
   });
   renderMovChips(); filtrarPickMov('');
   $('#movBusca').value='';
-  if(achados) flash(`✅ ${achados} equipamento(s) adicionado(s)`+(naoAchados.length?` — ${naoAchados.length} não encontrado(s)`:''), naoAchados.length?'red':'green');
+  if(achados) flash(`${achados} equipamento(s) adicionado(s)`+(naoAchados.length?` — ${naoAchados.length} não encontrado(s)`:''), naoAchados.length?'red':'green');
   else flash('Nenhum dos códigos colados foi encontrado','red');
 }
 function removeMovSerie(serie){ movSel=movSel.filter(s=>s!==serie); renderMovChips(); filtrarPickMov($('#movBusca')?$('#movBusca').value:''); }
 function renderMovChips(){
-  $('#movChips').innerHTML = movSel.map(s=>`<span class="chip">${esc(s)} <span class="rm" onclick="removeMovSerie('${esc(s)}')">×</span></span>`).join('');
+  $('#movChips').innerHTML = movSel.map(s=>`<span class="chip">${esc(s)} <span class="rm" role="button" tabindex="0" aria-label="Remover ${esc(s)}" onclick="removeMovSerie('${esc(s)}')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();removeMovSerie('${esc(s)}')}">×</span></span>`).join('');
   if($('#movN')) $('#movN').textContent = movSel.length;
 }
 function confirmarMov(){
@@ -2013,7 +2656,7 @@ function confirmarMov(){
     registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:movTipo, serie, de, para:paraTxt, tecnicoId:tecIdMov, tecnicoIdOrigem, usuario, obs:obsFinal, os:numeroOS });
     n++;
   });
-  salvar(); closeModal(); render(); flash(`✅ ${n} ${n===1?'movimentação registrada':'movimentações registradas'}`+((movTipo==='saida'||movTipo==='transferencia')?' — aguardando confirmação do técnico':''),'green');
+  salvar(); closeModal(); render(); flash(`${n} ${n===1?'movimentação registrada':'movimentações registradas'}`+((movTipo==='saida'||movTipo==='transferencia')?' — aguardando confirmação do técnico':''),'green');
 }
 
 /* =========================================================
@@ -2070,12 +2713,21 @@ function parseLinhas(matriz, substituir){
   }
   let removidos=0;
   if(substituir){
-    const antes=DB.equipamentos.length;
+    // Coleta as séries ANTES de filtrar: a exclusão no banco é explícita (a
+    // sincronização não infere mais exclusões — ver sincronizarEquipamentos/BUG-034).
+    const seriesRemovidas = DB.equipamentos
+      .filter(e=> e.status==='estoque' && !seriesNaPlanilha.has(e.serie.toLowerCase()))
+      .map(e=>e.serie);
     DB.equipamentos = DB.equipamentos.filter(e=> e.status!=='estoque' || seriesNaPlanilha.has(e.serie.toLowerCase()));
-    removidos = antes-DB.equipamentos.length;
+    removidos = seriesRemovidas.length;
+    if(removidos){
+      excluirEquipamentosNoBanco(seriesRemovidas).catch(err=>{
+        flash('A remoção dos '+removidos+' item(ns) fora da planilha NÃO foi aplicada na nuvem ('+err.message+') — eles vão reaparecer. Importe de novo com conexão.','red');
+      });
+    }
   }
   DB.config.importadoEm=Date.now(); salvar();
-  flash(`✅ Importado: ${novos} novos, ${atualizados} atualizados`+(removidos?`, ${removidos} removido(s) do estoque (não estavam na planilha)`:''),'green');
+  flash(`Importado: ${novos} novos, ${atualizados} atualizados`+(removidos?`, ${removidos} removido(s) do estoque (não estavam na planilha)`:''),'green');
   goto('dashboard');
 }
 function parseCSVLinha(linha, delim){
@@ -2148,7 +2800,7 @@ function relatorioFilial(){
     .kpi{flex:1;min-width:120px;border:1px solid #ddd;border-radius:8px;padding:12px 14px}
     .kpi b{display:block;font-size:22px;margin-top:4px}
     @media print{button{display:none}}</style></head><body>
-    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">🖨️ Imprimir / Salvar PDF</button>
+    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">Imprimir / Salvar PDF</button>
     <h1>Relatório de Estoque — ${esc(titulo)}</h1>
     <h2>${esc(DB.config.empresa||'A365')} · gerado em ${hoje}</h2>
     <div class="kpis">
@@ -2162,8 +2814,8 @@ function relatorioFilial(){
     ${Object.keys(porTipo).length?Object.entries(porTipo).sort((a,b)=>b[1]-a[1]).map(([t,n])=>linha(esc(tipoNome(t)),n)).join(''):'<i>Sem dados.</i>'}
     <h3>Itens por técnico (em posse)</h3>
     ${Object.keys(porTec).length?Object.entries(porTec).sort((a,b)=>b[1]-a[1]).map(([t,n])=>linha(esc(t),n)).join(''):'<i>Nenhum item com técnico.</i>'}
-    ${alertasMin.length?`<h3>⚠️ Alertas de estoque mínimo</h3>${alertasMin.map(a=>linha(esc(a.filial)+' — '+esc(tipoNome(a.tipo)),a.atual+' / mín. '+a.min,'#dc2626')).join('')}`:''}
-    ${parados.length?`<h3>⏰ Itens parados (${DIAS_PARADO}+ dias)</h3><table><thead><tr><th>Nº Série</th><th>Tipo</th><th>Técnico</th><th>Dias</th></tr></thead><tbody>
+    ${alertasMin.length?`<h3>Alertas de estoque mínimo</h3>${alertasMin.map(a=>linha(esc(a.filial)+' — '+esc(tipoNome(a.tipo)),a.atual+' / mín. '+a.min,'#dc2626')).join('')}`:''}
+    ${parados.length?`<h3>Itens parados (${DIAS_PARADO}+ dias)</h3><table><thead><tr><th>Nº Série</th><th>Tipo</th><th>Técnico</th><th>Dias</th></tr></thead><tbody>
       ${parados.map(e=>`<tr><td>${esc(e.serie)}</td><td>${esc(tipoNome(e.tipo))}</td><td>${esc(tecNome(e.tecnicoId))}</td><td>${diasEmPosse(e)}</td></tr>`).join('')}
     </tbody></table>`:''}
     </body></html>`;
@@ -2172,7 +2824,7 @@ function relatorioFilial(){
 function exportarBackup(automatico){
   baixar('backup_estoque_'+new Date().toISOString().slice(0,10)+'.json', JSON.stringify(DB,null,2),'application/json');
   DB.config.ultimoBackup = Date.now(); salvar();
-  if(!automatico) flash('✅ Backup exportado','green');
+  if(!automatico) flash('Backup exportado','green');
 }
 const RESPONSAVEL_BACKUP_EMAIL = 'cliver.guisolphi@orsegups.com.br';
 let backupAutoChecado = false;
@@ -2182,7 +2834,7 @@ function verificarBackupAutomatico(){
   const dias = (Date.now()-(DB.config.ultimoBackup||0))/86400000;
   if(dias>=7){
     exportarBackup(true);
-    flash('💾 Backup automático gerado (já fazia '+Math.floor(dias)+' dia(s) do último). Confira sua pasta de downloads.','green');
+    flash('Backup automático gerado (já fazia '+Math.floor(dias)+' dia(s) do último). Confira sua pasta de downloads.','green');
   }
 }
 function importarBackup(input){
@@ -2193,49 +2845,34 @@ function importarBackup(input){
       if(!confirm('Substituir TODOS os dados atuais pelo backup?')) return;
       const movsBackup = d.movimentacoes||[];
       const audsBackup = d.auditorias||[];
-      DB=Object.assign(estadoInicial(),d); salvar(); render(); renderNav();
+      DB=Object.assign(estadoInicial(),d); salvarLocal(); render(); renderNav();
       flash('Restaurando histórico, auditorias e equipamentos...','green');
-      await limparColecao(MOVS_REF);
-      await gravarEmLote(MOVS_REF, movsBackup);
-      await limparColecao(AUDS_REF);
-      await gravarEmLote(AUDS_REF, audsBackup);
-      flash('✅ Backup restaurado','green');
+      await limparTabela('movimentacoes');
+      await gravarEmLote('movimentacoes', movsBackup.map(movimentacaoParaSnake));
+      await limparTabela('auditorias');
+      await gravarEmLote('auditorias', audsBackup.map(auditoriaParaSnake));
+      // Equipamentos: substituição total EXPLÍCITA, mesmo padrão de movs/auditorias
+      // acima (a sincronização não infere mais exclusões — ver BUG-034): limpa a
+      // tabela e zera o rastro; o salvar() abaixo re-envia todos os itens do backup
+      // como "alterados" (upsert em lotes), já na ordem certa depois de tipos/filiais/
+      // técnicos por causa das chaves estrangeiras (ver salvar()/BUG-030).
+      const { error: errLimpa } = await sb.from('equipamentos').delete().not('serie','is',null);
+      if(errLimpa) throw errLimpa;
+      ultimoSyncEquip = {};
+      salvar();
+      flash('Backup restaurado','green');
     }catch(err){ flash('Arquivo de backup inválido: '+err.message,'red'); }
   }; r.readAsText(f); input.value='';
 }
-async function gravarEmLote(ref, lista, chave){
-  chave = chave || (m=>m.id);
-  for(let i=0;i<lista.length;i+=400){
-    const batch = window.firestoreDB.batch();
-    lista.slice(i,i+400).forEach(m=>batch.set(ref.doc(chave(m)), m));
-    await batch.commit();
+async function gravarEmLote(tabela, lista){
+  for(let i=0;i<lista.length;i+=500){
+    const { error } = await sb.from(tabela).insert(lista.slice(i,i+500));
+    if(error) throw error;
   }
 }
-async function limparColecao(ref){
-  const snap = await ref.get();
-  const docs = snap.docs;
-  for(let i=0;i<docs.length;i+=400){
-    const batch = window.firestoreDB.batch();
-    docs.slice(i,i+400).forEach(d=>batch.delete(d.ref));
-    await batch.commit();
-  }
-}
-async function migrarHistoricoParaColecao(){
-  if(!souAdmin()) return flash('Somente administradores podem fazer isso','red');
-  if(!confirm('Isso corrige o erro de "documento muito grande": move todo o histórico de movimentações, auditorias e os equipamentos (que estão travados no navegador atual) para um armazenamento sem limite de tamanho. Pode levar alguns segundos. Continuar?')) return;
-  flash('Migrando histórico, aguarde...','green');
-  try{
-    await gravarEmLote(MOVS_REF, DB.movimentacoes);
-    await gravarEmLote(AUDS_REF, DB.auditorias);
-    await gravarEmLote(EQUIPS_REF, DB.equipamentos, e=>e.serie);
-    DB.equipamentos.forEach(e=>{ ultimoSyncEquip[e.serie]=JSON.stringify(e); });
-    await new Promise(r=>setTimeout(r,500));
-    const { movimentacoes, auditorias, equipamentos, ...semMovs } = DB;
-    await DOC_REF.set(semMovs);
-    flash(`✅ Migração concluída! ${DB.movimentacoes.length} movimentação(ões), ${DB.auditorias.length} auditoria(s) e ${DB.equipamentos.length} equipamento(s) migrado(s). Sincronização corrigida.`,'green');
-  }catch(err){
-    flash('⚠️ Erro na migração: '+err.message,'red');
-  }
+async function limparTabela(tabela){
+  const { error } = await sb.from(tabela).delete().not('id','is',null);
+  if(error) throw error;
 }
 function corrigirItensCDO(){
   if(!souAdmin()) return flash('Somente administradores podem fazer isso','red');
@@ -2245,7 +2882,7 @@ function corrigirItensCDO(){
   if(!destino) return;
   const nome = limparFilial(destino);
   presos.forEach(e=>{ e.deposito=nome; if(e.status==='estoque') e.local=nome; });
-  salvar(); render(); flash(`✅ ${presos.length} equipamento(s) movido(s) para ${nome}`,'green');
+  salvar(); render(); flash(`${presos.length} equipamento(s) movido(s) para ${nome}`,'green');
 }
 function limparSiglasFiliais(){
   if(!souAdmin()) return flash('Somente administradores podem fazer isso','red');
@@ -2256,7 +2893,7 @@ function limparSiglasFiliais(){
     if(e.rmaDeposito){ const novoRma=limparFilial(e.rmaDeposito); if(novoRma!==e.rmaDeposito) e.rmaDeposito=novoRma; }
   });
   DB.tecnicos.forEach(t=>{ if(t.regiao){ const novo=limparFilial(t.regiao); if(novo!==t.regiao) t.regiao=novo; } });
-  salvar(); render(); flash(`✅ ${n} equipamento(s) corrigido(s)`,'green');
+  salvar(); render(); flash(`${n} equipamento(s) corrigido(s)`,'green');
 }
 function corrigirTiposPorSerie(){
   if(!souAdmin()) return flash('Somente administradores podem fazer isso','red');
@@ -2273,7 +2910,7 @@ function corrigirTiposPorSerie(){
   });
   if(DB.tipos['Central']) delete DB.tipos['Central'];
   if(!DB.tipos['Modulo']) DB.tipos['Modulo']={nome:'Modulo',cor:''};
-  salvar(); render(); flash(`✅ ${n} equipamento(s) corrigido(s)`,'green');
+  salvar(); render(); flash(`${n} equipamento(s) corrigido(s)`,'green');
 }
 function distribuirEquipamentosTeste(){
   if(!souAdmin()) return flash('Somente administradores podem fazer isso','red');
@@ -2292,11 +2929,11 @@ function distribuirEquipamentosTeste(){
       n++;
     }
   });
-  salvar(); render(); flash(`✅ ${n} equipamento(s) distribuído(s) entre técnicos (dados de teste)`,'green');
+  salvar(); render(); flash(`${n} equipamento(s) distribuído(s) entre técnicos (dados de teste)`,'green');
 }
 function gerarCenarioTesteCompleto(){
   if(!souAdmin()) return flash('Somente administradores podem fazer isso','red');
-  if(!confirm('Isso vai MEXER nos equipamentos reais cadastrados (só nos tipos com mínimo: Controle, Magnetico, Sirene, Foto, Modulo): vai distribuir quantidades aleatórias entre os técnicos, deixar algumas filiais de propósito abaixo do mínimo, e mandar uma parte pra RMA — só para você visualizar as telas. Depois dá pra desfazer no botão "↩️ Devolver tudo ao estoque". Continuar?')) return;
+  if(!confirm('Isso vai MEXER nos equipamentos reais cadastrados (só nos tipos com mínimo: Controle, Magnetico, Sirene, Foto, Modulo): vai distribuir quantidades aleatórias entre os técnicos, deixar algumas filiais de propósito abaixo do mínimo, e mandar uma parte pra RMA — só para você visualizar as telas. Depois dá pra desfazer no botão "Devolver tudo ao estoque". Continuar?')) return;
   const tiposComMin = Object.keys(DB.tipos).filter(tp=>(DB.tipos[tp].min||0)>0);
   const filiais = todasFiliaisConhecidas();
   let nTec=0, nRma=0;
@@ -2325,7 +2962,7 @@ function gerarCenarioTesteCompleto(){
       }
     });
   });
-  salvar(); render(); flash(`✅ Cenário de teste gerado: ${nTec} equipamento(s) com técnicos, ${nRma} em RMA`,'green');
+  salvar(); render(); flash(`Cenário de teste gerado: ${nTec} equipamento(s) com técnicos, ${nRma} em RMA`,'green');
 }
 function reverterCenarioTeste(){
   if(!souAdmin()) return flash('Somente administradores podem fazer isso','red');
@@ -2337,7 +2974,7 @@ function reverterCenarioTeste(){
     e.rmaTecnicoId=null; e.rmaDeposito=null; e.rmaDesde=null; e.rmaOS=null;
     delete e.cenarioTeste;
   });
-  salvar(); render(); flash(`✅ ${afetados.length} equipamento(s) devolvido(s) ao estoque`,'green');
+  salvar(); render(); flash(`${afetados.length} equipamento(s) devolvido(s) ao estoque`,'green');
 }
 function aplicarMinimosOficiais(){
   if(!souAdmin()) return flash('Somente administradores podem fazer isso','red');
@@ -2347,15 +2984,20 @@ function aplicarMinimosOficiais(){
     if(!DB.tipos[t]) DB.tipos[t]={nome:t,cor:''};
     DB.tipos[t].min = min;
   });
-  salvar(); render(); flash('✅ Estoque mínimo aplicado','green');
+  salvar(); render(); flash('Estoque mínimo aplicado','green');
 }
 async function limparTudo(){
   if(!confirm('Apagar TODOS os dados (equipamentos, técnicos, movimentações, auditorias)? Faça backup antes!')) return;
   const digitado = prompt('Esta ação não pode ser desfeita. Digite APAGAR (em maiúsculas) para confirmar:');
   if(digitado!=='APAGAR') return flash('Cancelado — nada foi apagado','red');
   DB=estadoInicial(); salvar(); goto('dados'); flash('Apagando histórico da nuvem...','green');
-  try{ await limparColecao(MOVS_REF); await limparColecao(AUDS_REF); await limparColecao(EQUIPS_REF); ultimoSyncEquip={}; flash('Todos os dados foram apagados'); }
-  catch(err){ flash('⚠️ '+err.message,'red'); }
+  try{
+    await limparTabela('movimentacoes');
+    await limparTabela('auditorias');
+    await sb.from('equipamentos').delete().not('serie','is',null);
+    ultimoSyncEquip={};
+    flash('Todos os dados foram apagados');
+  }catch(err){ flash(''+err.message,'red'); }
 }
 
 /* =========================================================
@@ -2395,7 +3037,7 @@ function fichaTecnico(id){
   const mediaDias = dias.length? Math.round(dias.reduce((a,b)=>a+b,0)/dias.length) : 0;
   const parados = itens.filter(e=>(diasEmPosse(e)||0)>=DIAS_PARADO).length;
   const donutData = Object.entries(porTipo).sort((a,b)=>b[1]-a[1]).map(([tp,n])=>[tipoNome(tp),n,tipoCor(tp)]);
-  modal('👷 '+(t.regiao?'['+esc(t.regiao)+'] ':'')+esc(t.nome), `
+  modal(ic('hard-hat')+' '+(t.regiao?'['+esc(t.regiao)+'] ':'')+esc(t.nome), `
     <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px">
       <span class="badge blue" style="padding:8px 12px">${esc(t.regiao||'Sem região')}</span>
       ${t.matricula?`<span class="badge gray" style="padding:8px 12px">${esc(t.matricula)}</span>`:''}
@@ -2404,7 +3046,7 @@ function fichaTecnico(id){
     </div>
     <div class="chart-row" style="margin-bottom:18px">
       <div class="panel" style="box-shadow:none">
-        <div class="ph"><h3>📊 Equipamentos por tipo</h3></div>
+        <div class="ph"><h3>${ic('bar-chart-3')} Equipamentos por tipo</h3></div>
         <div class="pb"><div class="donut-wrap">
           ${donutData.length? donut(donutData) : '<div class="empty">Nenhum item em posse.</div>'}
         </div></div>
@@ -2413,8 +3055,8 @@ function fichaTecnico(id){
         <div class="ph"><h3>Resumo</h3></div>
         <div class="pb" style="display:flex;flex-direction:column;gap:14px">
           <div class="grid" style="grid-template-columns:1fr 1fr;gap:12px">
-            <div class="kpi a" style="padding:14px 16px"><div class="lbl" style="font-size:10px;letter-spacing:0">👷 EM POSSE</div><div class="val" style="font-size:22px">${itens.length}</div></div>
-            <div class="kpi v" style="padding:14px 16px"><div class="lbl" style="font-size:10px;letter-spacing:0">🕓 MÉDIA POSSE</div><div class="val" style="font-size:22px">${mediaDias}d</div></div>
+            <div class="kpi a" style="padding:14px 16px"><div class="lbl" style="font-size:10px;letter-spacing:0">${ic('hard-hat')} EM POSSE</div><div class="val" style="font-size:22px">${itens.length}</div></div>
+            <div class="kpi v" style="padding:14px 16px"><div class="lbl" style="font-size:10px;letter-spacing:0">${ic('clock')} MÉDIA POSSE</div><div class="val" style="font-size:22px">${mediaDias}d</div></div>
           </div>
           ${Object.keys(porTipo).length?`<div style="display:flex;gap:8px;flex-wrap:wrap">${Object.entries(porTipo).sort((a,b)=>b[1]-a[1]).map(([tp,n])=>`<span class="tag-tipo" style="border-left:3px solid ${tipoCor(tp)}">${esc(tipoNome(tp))}: ${n}</span>`).join('')}</div>`:''}
         </div>
@@ -2430,8 +3072,8 @@ function fichaTecnico(id){
         </tr>`).join('')}</tbody></table>`
       : '<div class="empty">Nenhum equipamento em posse.</div>'
     }</div>`,
-    `<button class="btn" style="margin-right:auto" onclick="termoResponsabilidade('${id}')">🖨️ Termo de responsabilidade</button>
-     <button class="btn primary" onclick="closeModal();iniciarAuditoria('tecnico','${id}')" ${itens.length?'':'disabled'}>🔍 Auditar este técnico</button>`, 'lg');
+    `<button class="btn" style="margin-right:auto" onclick="termoResponsabilidade('${id}')">${ic('printer')} Termo de responsabilidade</button>
+     <button class="btn primary" onclick="closeModal();iniciarAuditoria('tecnico','${id}')" ${itens.length?'':'disabled'}>${ic('search')} Auditar este técnico</button>`, 'lg');
 }
 function termoResponsabilidade(id){
   const t=DB.tecnicos.find(x=>x.id===id); const itens=itensDoTecnico(id);
@@ -2442,7 +3084,7 @@ function termoResponsabilidade(id){
     table{width:100%;border-collapse:collapse;margin:16px 0}th,td{border:1px solid #999;padding:7px 9px;text-align:left;font-size:12px}th{background:#f0f0f0}
     .ass{margin-top:60px;display:flex;justify-content:space-between;gap:40px}.ass div{flex:1;text-align:center;border-top:1px solid #333;padding-top:6px}
     p{text-align:justify}@media print{button{display:none}}</style></head><body>
-    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">🖨️ Imprimir / Salvar PDF</button>
+    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">Imprimir / Salvar PDF</button>
     <h1>TERMO DE RESPONSABILIDADE DE EQUIPAMENTOS</h1>
     <h2>${esc(DB.config.empresa||'')}</h2>
     <p>Eu, <b>${esc(t.nome)}</b>${t.matricula?', matrícula '+esc(t.matricula):''}${t.regiao?', lotado(a) em '+esc(t.regiao):''}, declaro ter recebido os equipamentos relacionados abaixo, comprometendo-me a zelar pela sua guarda e conservação, responsabilizando-me por danos, extravios ou uso indevido, e a devolvê-los quando solicitado.</p>
@@ -2470,45 +3112,45 @@ function renderAuditoria(){
   const audsPerm = auditoriasPermitidas();
   $('#content').innerHTML=`
   <div class="grid" style="grid-template-columns:1fr 1fr;margin-bottom:20px">
-    <div class="panel"><div class="ph"><h3>🔍 Auditar técnico</h3></div><div class="pb">
+    <div class="panel"><div class="ph"><h3>${ic('search')} Auditar técnico</h3></div><div class="pb">
       <p class="muted" style="margin-bottom:12px">Confira fisicamente o que cada especialista tem em mãos. O sistema aponta o que <b>falta</b> e o que está <b>a mais</b>.</p>
       ${tecsComItens.length? `<div style="display:flex;flex-direction:column;gap:8px">${tecsComItens.map(t=>{const aud=ultimaAuditoria('tecnico',t.id);return `
         <button class="btn" style="justify-content:space-between;width:100%" onclick="iniciarAuditoria('tecnico','${t.id}')">
-          <span>👷 ${esc(t.nome)} <span class="count-badge">${itensDoTecnico(t.id).length}</span></span>
+          <span>${ic('hard-hat')} ${esc(t.nome)} <span class="count-badge">${itensDoTecnico(t.id).length}</span></span>
           <span class="muted" style="font-size:11.5px">${aud?'auditado '+new Date(aud.ts).toLocaleDateString('pt-BR'):'nunca auditado'}</span>
         </button>`;}).join('')}</div>` : '<div class="empty">Nenhum técnico com itens em posse.</div>'}
     </div></div>
-    <div class="panel"><div class="ph"><h3>📍 Auditar depósito</h3></div><div class="pb">
+    <div class="panel"><div class="ph"><h3>${ic('map-pin')} Auditar depósito</h3></div><div class="pb">
       <p class="muted" style="margin-bottom:12px">Confira o saldo físico de um depósito contra o sistema.</p>
       ${deps.length? `<div style="display:flex;flex-direction:column;gap:8px">${deps.map(d=>`
         <button class="btn" style="justify-content:space-between;width:100%" onclick="iniciarAuditoria('deposito','${esc(d)}')">
-          <span>📍 ${esc(d)} <span class="count-badge">${itensDoDeposito(d).length}</span></span></button>`).join('')}</div>` : '<div class="empty">Nenhum depósito com itens.</div>'}
+          <span>${ic('map-pin')} ${esc(d)} <span class="count-badge">${itensDoDeposito(d).length}</span></span></button>`).join('')}</div>` : '<div class="empty">Nenhum depósito com itens.</div>'}
     </div></div>
   </div>
-  ${audsPerm.length?`<div class="panel" style="margin-bottom:20px"><div class="ph"><h3>📈 Evolução das divergências</h3><span class="muted" style="font-size:11.5px;margin-left:6px">(clique numa barra para ver o laudo)</span></div>
+  ${audsPerm.length?`<div class="panel" style="margin-bottom:20px"><div class="ph"><h3>${ic('trending-up')} Evolução das divergências</h3><span class="muted" style="font-size:11.5px;margin-left:6px">(clique numa barra para ver o laudo)</span></div>
     <div class="pb">
       ${[...audsPerm].sort((a,b)=>a.ts-b.ts).map(a=>{
         const div=a.faltando.length+a.sobrando.length;
         const max=Math.max(1,...audsPerm.map(x=>x.faltando.length+x.sobrando.length));
         return `<div class="bar-row" style="cursor:pointer" onclick="verLaudo('${a.id}')">
-          <div class="bl" style="width:190px;font-size:12px">${new Date(a.ts).toLocaleDateString('pt-BR')} · ${a.alvoTipo==='tecnico'?'👷':'📍'} ${esc(a.alvoNome)}</div>
+          <div class="bl" style="width:190px;font-size:12px">${new Date(a.ts).toLocaleDateString('pt-BR')} · ${a.alvoTipo==='tecnico'?ic('hard-hat'):ic('map-pin')} ${esc(a.alvoNome)}</div>
           <div class="bar-track"><div class="bar-fill" style="width:${Math.max(6,div/max*100)}%;background:${div?'var(--red)':'var(--green)'}">${div}</div></div>
         </div>`;}).join('')}
     </div>
   </div>`:''}
-  <div class="panel"><div class="ph"><h3>📋 Auditorias realizadas</h3><span class="count-badge">${audsPerm.length}</span></div>
+  <div class="panel"><div class="ph"><h3>${ic('clipboard-list')} Auditorias realizadas</h3><span class="count-badge">${audsPerm.length}</span></div>
     <div class="tbl-wrap">${
       audsPerm.length? `<table><thead><tr><th>Data</th><th>Alvo</th><th>Auditor</th><th class="center">Esperado</th><th class="center">Conferido</th><th class="center">Faltando</th><th class="center">Sobrando</th><th></th></tr></thead><tbody>
         ${[...audsPerm].reverse().map(a=>`<tr>
           <td class="muted">${fmtTS(a.ts)}</td>
-          <td>${a.alvoTipo==='tecnico'?'👷':'📍'} ${esc(a.alvoNome)}</td>
+          <td>${a.alvoTipo==='tecnico'?ic('hard-hat'):ic('map-pin')} ${esc(a.alvoNome)}</td>
           <td class="muted">${esc(a.auditor||'—')}</td>
           <td class="center">${a.esperados.length}</td>
           <td class="center"><b style="color:var(--green)">${a.conferidos.length}</b></td>
           <td class="center">${a.faltando.length?`<b style="color:var(--red)">${a.faltando.length}</b>`:'0'}</td>
           <td class="center">${a.sobrando.length?`<b style="color:var(--amber)">${a.sobrando.length}</b>`:'0'}</td>
           <td class="right"><button class="btn sm ghost" onclick="verLaudo('${a.id}')">Ver laudo</button></td>
-        </tr>`).join('')}</tbody></table>` : '<div class="empty"><div class="big">🔍</div>Nenhuma auditoria realizada ainda.</div>'
+        </tr>`).join('')}</tbody></table>` : '<div class="empty"><div class="big">'+ic('search')+'</div>Nenhuma auditoria realizada ainda.</div>'
     }</div></div>`;
 }
 
@@ -2525,7 +3167,7 @@ function renderAuditoriaEmAndamento(){
   const faltando=esp.filter(s=>!conf.has(s));
   $('#content').innerHTML=`
   <div class="panel" style="margin-bottom:18px"><div class="pb" style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
-    <div style="flex:1;min-width:200px"><div class="muted" style="font-size:12px">Auditando ${AUD.alvoTipo==='tecnico'?'técnico':'depósito'}</div><div style="font-size:20px;font-weight:800">${AUD.alvoTipo==='tecnico'?'👷':'📍'} ${esc(AUD.alvoNome)}</div></div>
+    <div style="flex:1;min-width:200px"><div class="muted" style="font-size:12px">Auditando ${AUD.alvoTipo==='tecnico'?'técnico':'depósito'}</div><div style="font-size:20px;font-weight:800">${AUD.alvoTipo==='tecnico'?ic('hard-hat'):ic('map-pin')} ${esc(AUD.alvoNome)}</div></div>
     <div class="center"><div style="font-size:26px;font-weight:800">${esp.length}</div><div class="muted" style="font-size:11px">ESPERADO</div></div>
     <div class="center"><div style="font-size:26px;font-weight:800;color:var(--green)">${conf.size}</div><div class="muted" style="font-size:11px">CONFERIDO</div></div>
     <div class="center"><div style="font-size:26px;font-weight:800;color:var(--red)">${faltando.length}</div><div class="muted" style="font-size:11px">FALTANDO</div></div>
@@ -2535,7 +3177,7 @@ function renderAuditoriaEmAndamento(){
   <div class="panel" style="margin-bottom:18px"><div class="pb">
     <div class="field" style="margin-bottom:0"><label>Escaneie ou digite o nº de série e tecle Enter</label>
       <div style="display:flex;gap:8px;align-items:stretch">
-        <div class="search" style="flex:1"><span class="si">📷</span><input id="audInput" autofocus placeholder="Bipe o código do equipamento..." onkeydown="if(event.key==='Enter'){audBipar();event.preventDefault()}"></div>
+        <div class="search" style="flex:1"><span class="si">${ic('camera')}</span><input id="audInput" autofocus placeholder="Bipe o código do equipamento..." onkeydown="if(event.key==='Enter'){audBipar();event.preventDefault()}"></div>
         <button class="btn primary" onclick="audBipar()">+ Adicionar</button>
       </div>
       <div class="hint">Item esperado → marca como conferido. Item não esperado → registrado como "sobrando" (divergência).</div>
@@ -2547,14 +3189,14 @@ function renderAuditoriaEmAndamento(){
       <div class="tbl-wrap" style="max-height:360px"><table><tbody>
         ${esp.length?esp.map(s=>{const e=DB.equipamentos.find(x=>x.serie===s);const ok=conf.has(s);return `
           <tr onclick="audToggle('${esc(s)}')" style="cursor:pointer">
-            <td style="width:30px">${ok?'✅':'⬜'}</td>
+            <td style="width:30px">${ok?ic('check'):ic('square')}</td>
             <td class="mono"><b>${esc(s)}</b></td>
             <td>${e?`<span class="tag-tipo">${esc(tipoNome(e.tipo))}</span>`:''}</td>
             <td class="right">${ok?'<span class="badge estoque">conferido</span>':'<span class="badge gray">pendente</span>'}</td>
           </tr>`;}).join(''):'<tr><td class="empty">Nada esperado aqui.</td></tr>'}
       </tbody></table></div>
     </div>
-    <div class="panel"><div class="ph"><h3>⚠️ Sobrando (não esperado)</h3></div>
+    <div class="panel"><div class="ph"><h3>${ic('alert-triangle')} Sobrando (não esperado)</h3></div>
       <div class="tbl-wrap" style="max-height:360px"><table><tbody>
         ${AUD.sobra.length?AUD.sobra.map(s=>{const e=DB.equipamentos.find(x=>x.serie===s);return `
           <tr><td class="mono"><b>${esc(s)}</b></td>
@@ -2566,15 +3208,15 @@ function renderAuditoriaEmAndamento(){
 
   <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:18px">
     <button class="btn" onclick="cancelarAuditoria()">Cancelar</button>
-    <button class="btn green" onclick="finalizarAuditoria()">✅ Finalizar e salvar laudo</button>
+    <button class="btn green" onclick="finalizarAuditoria()">${ic('check')} Finalizar e salvar laudo</button>
   </div>`;
   setTimeout(()=>{const i=$('#audInput');if(i)i.focus();},50);
 }
 function audBipar(){
   const inp=$('#audInput'); const v=inp.value.trim(); if(!v) return;
   const serie=(DB.equipamentos.find(x=>x.serie.toLowerCase()===v.toLowerCase())||{}).serie || v;
-  if(AUD.esperados.includes(serie)){ AUD.conf.add(serie); flash('✅ Conferido','green'); }
-  else if(!AUD.sobra.includes(serie)){ AUD.sobra.push(serie); flash('⚠️ Item não esperado (sobrando)','red'); }
+  if(AUD.esperados.includes(serie)){ AUD.conf.add(serie); flash('Conferido','green'); }
+  else if(!AUD.sobra.includes(serie)){ AUD.sobra.push(serie); flash('Item não esperado (sobrando)','red'); }
   inp.value=''; renderAuditoriaEmAndamento();
 }
 function audToggle(s){ if(AUD.conf.has(s))AUD.conf.delete(s); else AUD.conf.add(s); renderAuditoriaEmAndamento(); }
@@ -2586,23 +3228,23 @@ function finalizarAuditoria(){
   registrarAuditoria(reg); salvar();
   const divergencias=faltando.length+AUD.sobra.length;
   AUD=null; goto('auditoria');
-  flash(divergencias? `Auditoria salva — ${divergencias} divergência(s)`:'✅ Auditoria salva — tudo conferido!', divergencias?'red':'green');
+  flash(divergencias? `Auditoria salva — ${divergencias} divergência(s)`:'Auditoria salva — tudo conferido!', divergencias?'red':'green');
   verLaudo(reg.id);
 }
 function verLaudo(id){
   const a=DB.auditorias.find(x=>x.id===id); if(!a) return;
-  const sec=(titulo,arr,cor,vazio)=>`<div style="margin-bottom:12px"><div style="font-weight:700;margin-bottom:6px;color:${cor}">${titulo} (${arr.length})</div>${arr.length?`<div style="display:flex;flex-wrap:wrap;gap:6px">${arr.map(s=>`<span class="mono" style="background:#f1f5f9;padding:3px 8px;border-radius:6px;font-size:11.5px">${esc(s)}</span>`).join('')}</div>`:`<div class="muted" style="font-size:12.5px">${vazio}</div>`}</div>`;
-  modal('📋 Laudo de auditoria', `
+  const sec=(titulo,arr,cor,vazio)=>`<div style="margin-bottom:12px"><div style="font-weight:700;margin-bottom:6px;color:${cor}">${titulo} (${arr.length})</div>${arr.length?`<div style="display:flex;flex-wrap:wrap;gap:6px">${arr.map(s=>`<span class="mono" style="background:var(--surface-2);padding:3px 8px;border-radius:6px;font-size:11.5px">${esc(s)}</span>`).join('')}</div>`:`<div class="muted" style="font-size:12.5px">${vazio}</div>`}</div>`;
+  modal(ic('clipboard-list')+' Laudo de auditoria', `
     <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px">
-      <span class="badge blue" style="padding:8px 12px">${a.alvoTipo==='tecnico'?'👷':'📍'} ${esc(a.alvoNome)}</span>
+      <span class="badge blue" style="padding:8px 12px">${a.alvoTipo==='tecnico'?ic('hard-hat'):ic('map-pin')} ${esc(a.alvoNome)}</span>
       <span class="badge gray" style="padding:8px 12px">${fmtTS(a.ts)}</span>
       <span class="badge gray" style="padding:8px 12px">Auditor: ${esc(a.auditor||'—')}</span>
       <span class="badge ${(a.faltando.length+a.sobrando.length)?'baixado':'estoque'}" style="padding:8px 12px">${(a.faltando.length+a.sobrando.length)?(a.faltando.length+a.sobrando.length)+' divergência(s)':'Sem divergências'}</span>
     </div>
-    ${sec('✅ Conferidos',a.conferidos,'var(--green)','—')}
-    ${sec('❌ Faltando (esperado, não encontrado)',a.faltando,'var(--red)','Nenhum item faltando.')}
-    ${sec('⚠️ Sobrando (encontrado, não esperado)',a.sobrando,'var(--amber)','Nenhum item a mais.')}`,
-    `<button class="btn" onclick="exportarLaudoExcel('${a.id}')">📊 Exportar Excel</button><button class="btn" onclick="gerarRelatorioLaudo('${a.id}')">🖨️ Gerar relatório</button><button class="btn" onclick="closeModal()">Fechar</button>`, 'lg');
+    ${sec(ic('check')+' Conferidos',a.conferidos,'var(--green)','—')}
+    ${sec(ic('x-circle')+' Faltando (esperado, não encontrado)',a.faltando,'var(--red)','Nenhum item faltando.')}
+    ${sec(ic('alert-triangle')+' Sobrando (encontrado, não esperado)',a.sobrando,'var(--amber)','Nenhum item a mais.')}`,
+    `<button class="btn" onclick="exportarLaudoExcel('${a.id}')">${ic('bar-chart-3')} Exportar Excel</button><button class="btn" onclick="gerarRelatorioLaudo('${a.id}')">${ic('printer')} Gerar relatório</button><button class="btn" onclick="closeModal()">Fechar</button>`, 'lg');
 }
 function exportarLaudoExcel(id){
   const a=DB.auditorias.find(x=>x.id===id); if(!a) return;
@@ -2636,9 +3278,9 @@ function gerarRelatorioLaudo(id){
     .kpi{flex:1;min-width:110px;border:1px solid #ddd;border-radius:8px;padding:12px 14px}
     .kpi b{display:block;font-size:22px;margin-top:4px}
     @media print{button{display:none}}</style></head><body>
-    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">🖨️ Imprimir / Salvar PDF</button>
+    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">Imprimir / Salvar PDF</button>
     <h1>Laudo de Auditoria</h1>
-    <h2>${a.alvoTipo==='tecnico'?'👷':'📍'} ${esc(a.alvoNome)} · auditor: ${esc(a.auditor||'—')} · ${fmtTS(a.ts)} · gerado em ${hoje}</h2>
+    <h2>${esc(a.alvoNome)} · auditor: ${esc(a.auditor||'—')} · ${fmtTS(a.ts)} · gerado em ${hoje}</h2>
     <div class="kpis">
       <div class="kpi">Esperado<b>${a.esperados.length}</b></div>
       <div class="kpi">Conferido<b style="color:#16a34a">${a.conferidos.length}</b></div>
@@ -2648,7 +3290,7 @@ function gerarRelatorioLaudo(id){
     <table><thead><tr><th>Nº Série</th><th>Tipo</th><th>Situação</th></tr></thead><tbody>
       ${linhas.length?linhas.join(''):'<tr><td colspan="3">Nenhum item.</td></tr>'}
     </tbody></table>
-    <p style="margin-top:20px">${divergencias?`⚠️ ${divergencias} divergência(s) encontrada(s).`:'✅ Tudo conferido, sem divergências.'}</p>
+    <p style="margin-top:20px">${divergencias?`${divergencias} divergência(s) encontrada(s).`:'Tudo conferido, sem divergências.'}</p>
     </body></html>`;
   const w=window.open('','_blank'); if(!w) return flash('Permita pop-ups para gerar o relatório','red'); w.document.write(html); w.document.close();
 }
@@ -2658,7 +3300,7 @@ function gerarRelatorioLaudo(id){
    ========================================================= */
 function meuTecnico(){ return MEU_PERFIL && MEU_PERFIL.tecnicoId ? DB.tecnicos.find(t=>t.id===MEU_PERFIL.tecnicoId) : null; }
 function semVinculoHtml(){
-  return `<div class="panel"><div class="pb"><div class="empty"><div class="big">🔗</div>
+  return `<div class="panel"><div class="pb"><div class="empty"><div class="big">${ic('link')}</div>
     <h2 style="margin-bottom:8px">Seu acesso ainda não foi vinculado</h2>
     <p class="muted" style="max-width:420px;margin:0 auto">Peça para o administrador vincular seu login a um técnico cadastrado, na página <b>Usuários</b>.</p>
   </div></div></div>`;
@@ -2670,16 +3312,16 @@ function renderMeusItens(){
   const confirmados = itensDoTecnico(t.id);
   $('#content').innerHTML = `
   <div class="grid kpis" style="margin-bottom:20px">
-    ${kpi('a','📦','Itens em posse',confirmados.length)}
-    ${kpi('r','⏳','Aguardando confirmação',pendentes.length)}
+    ${kpi('a','package','Itens em posse',confirmados.length)}
+    ${kpi('r','hourglass','Aguardando confirmação',pendentes.length)}
   </div>
   <div class="panel" style="margin-bottom:20px;${pendentes.length?'border-left:4px solid var(--amber)':''}">
-    <div class="ph"><h3>📥 Recebimento de equipamentos</h3><span class="count-badge">${pendentes.length} pendente${pendentes.length===1?'':'s'}</span></div>
+    <div class="ph"><h3>${ic('inbox')} Recebimento de equipamentos</h3><span class="count-badge">${pendentes.length} pendente${pendentes.length===1?'':'s'}</span></div>
     <div class="pb">
       ${pendentes.length?`
       <div class="field" style="margin-bottom:16px"><label>Bipe ou digite o nº de série e Enter para confirmar</label>
         <div style="display:flex;gap:8px;align-items:stretch">
-          <div class="search" style="flex:1"><span class="si">📷</span><input id="recInput" autofocus placeholder="Bipe o código do equipamento..." onkeydown="if(event.key==='Enter'){recBipar();event.preventDefault()}"></div>
+          <div class="search" style="flex:1"><span class="si">${ic('camera')}</span><input id="recInput" autofocus placeholder="Bipe o código do equipamento..." onkeydown="if(event.key==='Enter'){recBipar();event.preventDefault()}"></div>
           <button class="btn primary" onclick="recBipar()">+ Adicionar</button>
         </div>
       </div>
@@ -2687,12 +3329,12 @@ function renderMeusItens(){
         ${pendentes.map(e=>`
           <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 12px;background:var(--amber-soft);border-radius:10px">
             <div style="flex:1;min-width:160px"><span class="mono"><b>${esc(e.serie)}</b></span> <span class="tag-tipo" style="margin-left:6px">${esc(tipoNome(e.tipo))}</span> <span class="muted" style="font-size:11.5px">de ${esc(e.transitoDe||'—')}</span></div>
-            <button class="btn green sm" onclick="confirmarRecebimento('${esc(e.serie)}')">✅ Confirmar</button>
+            <button class="btn green sm" onclick="confirmarRecebimento('${esc(e.serie)}')">${ic('check')} Confirmar</button>
           </div>`).join('')}
       </div>` : '<div class="empty">Nenhum equipamento aguardando confirmação no momento.</div>'}
     </div>
   </div>
-  <div class="panel"><div class="ph"><h3>📦 Meus equipamentos</h3><span class="count-badge">${confirmados.length}</span></div>
+  <div class="panel"><div class="ph"><h3>${ic('package')} Meus equipamentos</h3><span class="count-badge">${confirmados.length}</span></div>
     <div class="tbl-wrap">${
       confirmados.length? `<table><thead><tr><th>Nº Série</th><th>Tipo</th><th>Há quanto tempo</th></tr></thead><tbody>
         ${confirmados.map(e=>`<tr>
@@ -2708,7 +3350,7 @@ function recBipar(){
   const inp=$('#recInput'); const v=(inp.value||'').trim(); if(!v) return;
   const t = meuTecnico(); if(!t) return;
   const e = DB.equipamentos.find(x=>x.serie.toLowerCase()===v.toLowerCase() && x.emTransito && x.transitoPara===t.id);
-  if(!e){ flash('⚠️ Esse nº de série não está na sua lista de pendentes','red'); inp.value=''; return; }
+  if(!e){ flash('Esse nº de série não está na sua lista de pendentes','red'); inp.value=''; return; }
   confirmarRecebimento(e.serie, true);
   inp.value='';
 }
@@ -2728,10 +3370,10 @@ function desenharRegistrarForm(){
   const tiposOpt = Object.keys(DB.tipos).map(cod=>`<option value="${cod}">${esc(tipoNome(cod))}</option>`).join('');
   const novos = formSel.filter(s=>!acharEquipParaForm(s));
   const novosSemDeteccao = novos.filter(s=>!detectarTipoPorSerie(s));
-  modal('📝 Registrar retirada em campo', `
+  modal(ic('file-text')+' Registrar retirada em campo', `
     <div class="field"><label>Bipe ou digite o nº de série e Enter</label>
       <div style="display:flex;gap:8px;align-items:stretch">
-        <div class="search" style="flex:1"><span class="si">📷</span><input id="formBusca" autofocus placeholder="Nº de série do equipamento..." onkeydown="if(event.key==='Enter'){formAddSerieBusca();event.preventDefault()}"></div>
+        <div class="search" style="flex:1"><span class="si">${ic('camera')}</span><input id="formBusca" autofocus placeholder="Nº de série do equipamento..." onkeydown="if(event.key==='Enter'){formAddSerieBusca();event.preventDefault()}"></div>
         <button class="btn primary" onclick="formAddSerieBusca()">+ Adicionar</button>
       </div>
       <div class="chips" id="formChips" style="margin-top:8px"></div>
@@ -2744,8 +3386,8 @@ function desenharRegistrarForm(){
     </div>
     <div class="field"><label>Foto(s) de comprovação</label>
       <div style="display:flex;gap:10px;flex-wrap:wrap">
-        <label class="btn" style="cursor:pointer">📷 Tirar foto<input type="file" accept="image/*" capture="environment" multiple style="display:none" onchange="formAddFotos(this)"></label>
-        <label class="btn" style="cursor:pointer">🖼️ Anexar da galeria<input type="file" accept="image/*" multiple style="display:none" onchange="formAddFotos(this)"></label>
+        <label class="btn" style="cursor:pointer">${ic('camera')} Tirar foto<input type="file" accept="image/*" capture="environment" multiple style="display:none" onchange="formAddFotos(this)"></label>
+        <label class="btn" style="cursor:pointer">${ic('image')} Anexar da galeria<input type="file" accept="image/*" multiple style="display:none" onchange="formAddFotos(this)"></label>
       </div>
       <div id="formFotosPreview" style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px"></div>
     </div>
@@ -2766,8 +3408,8 @@ function renderFormFotosPreview(){
   const el = $('#formFotosPreview'); if(!el) return;
   el.innerHTML = formFotos.map((f,i)=>`
     <div style="position:relative;width:72px;height:72px">
-      <img src="${f.url}" style="width:100%;height:100%;object-fit:cover;border-radius:9px;border:1px solid var(--line)">
-      <button onclick="formRemoveFoto(${i})" style="position:absolute;top:-7px;right:-7px;width:22px;height:22px;border-radius:50%;background:var(--red);color:#fff;font-weight:700;font-size:13px;line-height:1;cursor:pointer">×</button>
+      <img src="${f.url}" style="width:100%;height:100%;object-fit:cover;border-radius:var(--radius-md);border:1px solid var(--line)">
+      <button onclick="formRemoveFoto(${i})" aria-label="Remover foto" style="position:absolute;top:-7px;right:-7px;width:22px;height:22px;border-radius:50%;background:var(--red);color:#fff;font-weight:700;font-size:13px;line-height:1;cursor:pointer">×</button>
     </div>`).join('');
 }
 async function formAddSerieBusca(){
@@ -2777,7 +3419,7 @@ async function formAddSerieBusca(){
   const novosTokens=[];
   tokens.forEach(v=>{ if(formSel.includes(v)) dup++; else { formSel.push(v); add++; novosTokens.push(v); } });
   desenharRegistrarForm();
-  if(tokens.length>1) flash(`✅ ${add} adicionado(s)`+(dup?` — ${dup} já bipado(s)`:''), 'green');
+  if(tokens.length>1) flash(`${add} adicionado(s)`+(dup?` — ${dup} já bipado(s)`:''), 'green');
   else if(dup) flash('Esse item já foi bipado','red');
   // consulta o servidor em segundo plano pra reconhecer itens de outros técnicos (não estão no recorte local)
   for(const v of novosTokens){
@@ -2794,20 +3436,14 @@ function renderFormChips(){
     const existe = acharEquipParaForm(s);
     const deOutroTecnico = existe && existe.status==='com_tecnico' && t && existe.tecnicoId!==t.id;
     const rotulo = !existe? ' · novo' : (deOutroTecnico? ' · atual: '+esc(tecNome(existe.tecnicoId)) : '');
-    return `<span class="chip" style="${(!existe||deOutroTecnico)?'background:var(--amber-soft);color:var(--amber)':''}">${esc(s)}${rotulo} <span class="rm" onclick="formRemoveSerie('${esc(s)}')">×</span></span>`;
+    return `<span class="chip" style="${(!existe||deOutroTecnico)?'background:var(--amber-soft);color:var(--amber)':''}">${esc(s)}${rotulo} <span class="rm" role="button" tabindex="0" aria-label="Remover ${esc(s)}" onclick="formRemoveSerie('${esc(s)}')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();formRemoveSerie('${esc(s)}')}">×</span></span>`;
   }).join('');
   if($('#formN')) $('#formN').textContent = formSel.length;
 }
 async function proximoCodigoRetirada(){
-  const ref = window.firestoreDB.collection('contadores').doc('retiradas');
-  const novo = await window.firestoreDB.runTransaction(async tx=>{
-    const snap = await tx.get(ref);
-    const atual = (snap.exists && snap.data().valor) || 0;
-    const val = atual+1;
-    tx.set(ref, {valor:val});
-    return val;
-  });
-  return 'RET-'+String(novo).padStart(4,'0');
+  const { data, error } = await sb.rpc('proximo_codigo_retirada');
+  if(error) throw error;
+  return data;
 }
 async function confirmarRegistrarForm(){
   if(!formSel.length) return flash('Bipe ao menos um equipamento','red');
@@ -2815,6 +3451,7 @@ async function confirmarRegistrarForm(){
   const servico = $('#formServico').value;
   const servicoLabel = servico==='manutencao'?'Manutenção':'Desinstalação';
   const obs = $('#formObs').value.trim();
+  const obsCombinada = [servicoLabel, obs].filter(Boolean).join(' · ');
   const novos = formSel.filter(s=>!acharEquipParaForm(s));
   const novosSemDeteccao = novos.filter(s=>!detectarTipoPorSerie(s));
   let tipoManual = '';
@@ -2834,32 +3471,47 @@ async function confirmarRegistrarForm(){
   if(btn){ btn.disabled=true; btn.textContent='Gerando código...'; }
   let codigoRetirada;
   try{ codigoRetirada = await proximoCodigoRetirada(); }
-  catch(err){ if(btn){ btn.disabled=false; btn.textContent='Registrar ('+formSel.length+')'; } return flash('⚠️ Falha ao gerar código: '+err.message,'red'); }
+  catch(err){ if(btn){ btn.disabled=false; btn.textContent='Registrar ('+formSel.length+')'; } return flash('Falha ao gerar código: '+err.message,'red'); }
+  if(btn) btn.textContent='Registrando...';
 
+  // Cada item passa pela função registrar_retirada_campo() no banco — ela roda com
+  // privilégio elevado só pra essa ação, porque a política normal de UPDATE não deixaria
+  // reivindicar um item que hoje pertence a outro técnico (ver BUG-029/MAPA_DO_SISTEMA.md).
   let n=0;
   for(const serie of formSel){
     // Busca autoritativa no servidor (não só no array local, que pro técnico agora é um recorte)
-    // — evita criar um equipamento duplicado por cima de um que já existe com outro técnico.
+    // — só pra montar os textos de exibição da movimentação; quem decide de verdade é a função no banco.
     let e = await acharEquipPorSerieAsync(serie);
-    const jaEstavaLocal = !!acharEquipPorSerie(serie);
     const de = e ? (e.status==='com_tecnico'?tecNome(e.tecnicoId):(e.local||e.deposito||'Estoque')) : 'Campo (novo no sistema)';
+    const tipoNovo = e ? null : (detectarTipoPorSerie(serie) || tipoManual);
+    const para = tecNome(t.id);
+    let resp;
+    try{
+      const { data, error } = await sb.rpc('registrar_retirada_campo', {
+        p_serie:serie, p_codigo:codigoRetirada, p_tipo:tipoNovo, p_os:null,
+        p_obs:obsCombinada, p_de:de, p_para:para, p_usuario:nomeUsuarioAtual()
+      });
+      if(error) throw error;
+      resp = data;
+    }catch(err){ flash('Falha ao registrar '+serie+': '+err.message,'red'); continue; }
+
+    // Atualiza o estado local na hora (sem esperar o tempo real confirmar) — mesmo
+    // princípio do BUG-028: evita o item sumir/demorar a aparecer na tela.
     if(!e){
-      const tipoNovo = detectarTipoPorSerie(serie) || tipoManual;
-      e = { serie, tipo:tipoNovo, deposito:t.regiao||'', local:tecNome(t.id), status:'com_tecnico', tecnicoId:t.id, dataEntrada:'', origem:'campo', familia:'', derivacao:'', um:'', obs:'', confirmado:true };
+      e = { serie, tipo:tipoNovo, deposito:t.regiao||'', local:para, status:'com_tecnico', tecnicoId:t.id, dataEntrada:'', origem:'campo', familia:'', derivacao:'', um:'', obs:'', confirmado:true, desde:Date.now() };
       DB.equipamentos.push(e);
       if(!DB.tipos[tipoNovo]) DB.tipos[tipoNovo]={nome:tipoNovo,cor:''};
     } else {
-      if(!jaEstavaLocal) DB.equipamentos.push(e); // achado só no servidor (era de outro técnico) — traz pro array local pra sincronizar
-      e.status='com_tecnico'; e.tecnicoId=t.id; e.local=tecNome(t.id); e.confirmado=true; e.emTransito=false; e.transitoPara=null; e.transitoDesde=null; e.transitoDe=null;
+      if(!DB.equipamentos.some(x=>x.serie===e.serie)) DB.equipamentos.push(e); // achado só no servidor (era de outro técnico) — traz pro array local pra sincronizar
+      e.status='com_tecnico'; e.tecnicoId=t.id; e.local=para; e.confirmado=true; e.emTransito=false; e.transitoPara=null; e.transitoDesde=null; e.transitoDe=null; e.desde=Date.now();
     }
-    e.desde = Date.now();
     if(souTecnico()){ delete equipsIncomingMap[e.serie]; equipsOwnMap[e.serie]=e; } // já é meu agora, atualiza os mapas na hora
-    registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:'registro_campo', serie, de, para:tecNome(t.id), tecnicoId:t.id, usuario:nomeUsuarioAtual(), obs:[servicoLabel, obs].filter(Boolean).join(' · '), fotos:[], retiradaId:codigoRetirada, temFotosLocais });
+    DB.movimentacoes.push({ id:resp.movimentacao_id, ts:Date.now(), tipo:'registro_campo', serie, de, para, tecnicoId:t.id, usuario:nomeUsuarioAtual(), obs:obsCombinada, fotos:[], retiradaId:codigoRetirada, temFotosLocais });
     n++;
   }
   formFotos.forEach(f=>URL.revokeObjectURL(f.url)); formFotos=[];
   salvar(); render();
-  modal('✅ Retirada registrada', `
+  modal(ic('check')+' Retirada registrada', `
     <div style="text-align:center;padding:10px 0">
       <div class="muted" style="font-size:12.5px;margin-bottom:6px">Código desta retirada</div>
       <div style="font-size:32px;font-weight:800;color:var(--brand);letter-spacing:1px;margin-bottom:14px">${codigoRetirada}</div>
@@ -2874,17 +3526,17 @@ function confirmarRecebimento(serie, semConfirm){
   e.status='com_tecnico'; e.tecnicoId=destinoId; e.local=tecNome(destinoId); e.confirmado=true; e.desde=Date.now();
   e.emTransito=false; e.transitoPara=null; e.transitoDesde=null; e.transitoDe=null; e.transitoUsuario=null; e.transitoDeTecnicoId=null;
   // O item muda de categoria (de "a caminho" pra "meu"); atualiza os mapas na hora, sem
-  // esperar os dois listeners do Firestore confirmarem — evita ele sumir da tela por um instante.
+  // esperar os dois canais de tempo real (Supabase Realtime) confirmarem — evita ele sumir da tela por um instante.
   if(souTecnico()){ delete equipsIncomingMap[e.serie]; equipsOwnMap[e.serie]=e; }
   registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:'confirmacao', serie, de:'Em trânsito', para:tecNome(destinoId), tecnicoId:destinoId, tecnicoIdOrigem:origemTecId, usuario:nomeUsuarioAtual(), obs:'Recebimento confirmado pelo técnico' });
-  salvar(); render(); flash('✅ Recebimento de '+serie+' confirmado','green');
+  salvar(); render(); flash('Recebimento de '+serie+' confirmado','green');
 }
 function renderMeuHistorico(){
   const t = meuTecnico();
   if(!t) return $('#content').innerHTML = semVinculoHtml();
   const movs = DB.movimentacoes.filter(m=>m.tecnicoId===t.id || m.tecnicoIdOrigem===t.id).sort((a,b)=>b.ts-a.ts);
   $('#content').innerHTML = `
-  <div class="panel"><div class="ph"><h3>🕓 Meu histórico</h3><span class="count-badge">${movs.length}</span></div>
+  <div class="panel"><div class="ph"><h3>${ic('clock')} Meu histórico</h3><span class="count-badge">${movs.length}</span></div>
     <div class="tbl-wrap">${movs.length?tabelaMov(movs.slice(0,300)):'<div class="empty">Nenhuma movimentação ainda.</div>'}</div>
   </div>`;
 }
@@ -2907,9 +3559,9 @@ let retiradaBusca = '';
 function renderRetiradas(){
   $('#content').innerHTML = `
   <div class="toolbar">
-    <div class="search"><span class="si">🔎</span><input placeholder="Buscar por código (ex.: RET-0001)..." value="${esc(retiradaBusca)}" oninput="retiradaBusca=this.value;renderRetiradasLista()"></div>
+    <div class="search"><span class="si">${ic('search')}</span><input placeholder="Buscar por código (ex.: RET-0001)..." value="${esc(retiradaBusca)}" oninput="retiradaBusca=this.value;renderRetiradasLista()"></div>
   </div>
-  <div class="panel"><div class="ph"><h3>🔎 Retiradas em campo</h3><span class="count-badge" id="retiradasCount"></span></div>
+  <div class="panel"><div class="ph"><h3>${ic('search')} Retiradas em campo</h3><span class="count-badge" id="retiradasCount"></span></div>
     <div class="pb" style="display:flex;flex-direction:column;gap:10px" id="retiradasLista"></div>
   </div>`;
   renderRetiradasLista();
@@ -2927,19 +3579,19 @@ function renderRetiradasLista(){
             <div class="muted" style="font-size:12px">${esc(r.obs||'—')} · ${r.itens.length} item(ns)</div>
           </div>
           <div class="muted" style="font-size:11.5px">${fmtTS(r.ts)}</div>
-          ${r.temFotosLocais?'<span class="badge" style="background:var(--amber-soft);color:var(--amber)">📷 tem foto local</span>':''}
-        </div></div>`).join('') : '<div class="empty"><div class="big">🔎</div>Nenhuma retirada encontrada.</div>';
+          ${r.temFotosLocais?`<span class="badge" style="background:var(--amber-soft);color:var(--amber)">${ic('camera')} tem foto local</span>`:''}
+        </div></div>`).join('') : '<div class="empty"><div class="big">'+ic('search')+'</div>Nenhuma retirada encontrada.</div>';
 }
 function verRetirada(codigo){
   const r = listaRetiradas().find(x=>x.codigo===codigo); if(!r) return;
-  modal('🔎 Retirada '+esc(codigo), `
+  modal(ic('search')+' Retirada '+esc(codigo), `
     <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px">
-      <span class="badge blue" style="padding:8px 12px">👷 ${esc(tecNome(r.tecnicoId))}</span>
+      <span class="badge blue" style="padding:8px 12px">${ic('hard-hat')} ${esc(tecNome(r.tecnicoId))}</span>
       <span class="badge gray" style="padding:8px 12px">${fmtTS(r.ts)}</span>
       <span class="badge gray" style="padding:8px 12px">Registrado por ${esc(r.usuario||'—')}</span>
     </div>
     <p class="muted" style="margin-bottom:14px">${esc(r.obs||'Sem observação.')}</p>
-    ${r.temFotosLocais?`<div class="badge com_tecnico" style="padding:8px 12px;margin-bottom:14px">📷 Fotos foram tiradas no momento do registro e ficam salvas no celular do técnico, organizadas pelo código ${esc(codigo)}</div>`:''}
+    ${r.temFotosLocais?`<div class="badge com_tecnico" style="padding:8px 12px;margin-bottom:14px">${ic('camera')} Fotos foram tiradas no momento do registro e ficam salvas no celular do técnico, organizadas pelo código ${esc(codigo)}</div>`:''}
     <div class="tbl-wrap" style="max-height:320px"><table><thead><tr><th>Nº Série</th><th>Tipo</th></tr></thead><tbody>
       ${r.itens.map(serie=>{ const e=DB.equipamentos.find(x=>x.serie===serie); return `<tr>
         <td class="mono"><a href="#" onclick="abrirKardex('${esc(serie)}');return false"><b>${esc(serie)}</b></a></td>
@@ -2952,20 +3604,28 @@ function verRetirada(codigo){
    ADMINISTRAÇÃO DE USUÁRIOS (só admin)
    ========================================================= */
 let USUARIOS_LISTA = [];
-let usuariosListenerAtivo = null;
+let usuariosCanalAtivo = null;
+let usuariosCarregados = false;
+async function carregarUsuariosLista(){
+  try{
+    const data = await selecionarTudo('usuarios');
+    USUARIOS_LISTA = data.map(usuarioParaCamel);
+    usuariosCarregados = true;
+    if(PAGE==='usuarios') renderUsuarios();
+  }catch(err){ flash('Erro ao carregar usuários: '+err.message,'red'); }
+}
 function renderUsuarios(){
   if(!souAdmin()){ $('#content').innerHTML='<div class="empty">Acesso restrito.</div>'; return; }
-  if(!usuariosListenerAtivo){
-    usuariosListenerAtivo = USERS_REF.onSnapshot(snap=>{
-      USUARIOS_LISTA = snap.docs.map(d=>Object.assign({uid:d.id}, d.data()));
-      if(PAGE==='usuarios') renderUsuarios();
-    });
-    return; // vai re-renderizar assim que o snapshot chegar
+  if(!usuariosCanalAtivo){
+    usuariosCanalAtivo = sb.channel('usuarios-rt').on('postgres_changes', {event:'*',schema:'public',table:'usuarios'}, carregarUsuariosLista).subscribe();
+    carregarUsuariosLista();
+    return; // vai re-renderizar assim que a lista carregar
   }
+  if(!usuariosCarregados) return; // ainda carregando
   const regioesConhecidas = todasFiliaisConhecidas();
   const ordenados = [...USUARIOS_LISTA].sort((a,b)=>(a.papel==='pendente'?0:1)-(b.papel==='pendente'?0:1) || (a.criadoEm||0)-(b.criadoEm||0));
   $('#content').innerHTML = `
-  <div class="panel"><div class="ph"><h3>🔐 Usuários e permissões</h3><span class="count-badge">${USUARIOS_LISTA.length}</span></div>
+  <div class="panel"><div class="ph"><h3>${ic('lock')} Usuários e permissões</h3><span class="count-badge">${USUARIOS_LISTA.length}</span></div>
     <div class="pb" style="display:flex;flex-direction:column;gap:12px">
       ${ordenados.map(u=>`
         <div class="panel" style="box-shadow:none;${u.papel==='pendente'?'border-color:var(--amber)':''}"><div class="pb" style="display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end">
@@ -2985,7 +3645,7 @@ function renderUsuarios(){
           ${u.papel==='supervisor'?`
           <div class="field" style="margin:0;min-width:220px"><label>Filiais permitidas</label>
             <button class="btn sm" onclick='abrirEditarFiliaisSupervisor(${JSON.stringify(u.uid)},${JSON.stringify(u.nome||u.email)},${JSON.stringify(u.regioes||[])})'>
-              🏢 ${(u.regioes||[]).length? (u.regioes||[]).length+' filial(is) — editar' : 'Nenhuma filial — editar'}
+              ${ic('building-2')} ${(u.regioes||[]).length? (u.regioes||[]).length+' filial(is) — editar' : 'Nenhuma filial — editar'}
             </button>
           </div>`:''}
           ${u.papel==='tecnico'?`
@@ -3001,26 +3661,29 @@ function renderUsuarios(){
   </div>`;
 }
 function contarAdmins(){ return USUARIOS_LISTA.filter(u=>u.papel==='admin').length; }
+const CAMPO_USUARIO_SNAKE = { tecnicoId:'tecnico_id' };
 function usuarioAtualizarCampo(uid, campo, valor){
   const alvo = USUARIOS_LISTA.find(u=>u.uid===uid);
   if(campo==='papel' && alvo && alvo.papel==='admin' && valor!=='admin' && contarAdmins()<=1){
-    flash('⚠️ Não é possível rebaixar o único administrador do sistema. Promova outra pessoa a admin antes.','red');
+    flash('Não é possível rebaixar o único administrador do sistema. Promova outra pessoa a admin antes.','red');
     return renderUsuarios();
   }
-  const updates = {[campo]:valor};
+  const updates = {[CAMPO_USUARIO_SNAKE[campo]||campo]:valor};
   if(campo==='papel'){
     if(valor!=='supervisor') updates.regioes=[];
-    if(valor!=='tecnico') updates.tecnicoId=null;
+    if(valor!=='tecnico') updates.tecnico_id=null;
   }
-  USERS_REF.doc(uid).update(updates).then(()=>flash('✅ Atualizado','green')).catch(e=>flash('⚠️ '+e.message,'red'));
+  sb.from('usuarios').update(updates).eq('id',uid).then(({error})=>{
+    if(error) flash(''+error.message,'red'); else flash('Atualizado','green');
+  });
 }
 function abrirEditarFiliaisSupervisor(uid, nome, regioesAtuais){
   const todas = todasFiliaisConhecidas();
-  modal('🏢 Filiais de '+esc(nome), `
+  modal(ic('building-2')+' Filiais de '+esc(nome), `
     <p class="muted" style="margin-bottom:12px">Marque as filiais que esse supervisor pode acessar.</p>
     <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:8px;max-height:340px;overflow:auto">
       ${todas.length? todas.map(f=>`
-        <label class="checkbox" style="background:var(--panel-soft);padding:8px 10px;border-radius:9px">
+        <label class="checkbox" style="background:var(--panel-soft);padding:8px 10px;border-radius:var(--radius-md)">
           <input type="checkbox" class="filialChk" value="${esc(f)}" ${regioesAtuais.includes(f)?'checked':''}> ${esc(f)}
         </label>`).join('') : '<div class="empty">Nenhuma filial cadastrada ainda.</div>'}
     </div>`,
@@ -3029,13 +3692,17 @@ function abrirEditarFiliaisSupervisor(uid, nome, regioesAtuais){
 }
 function salvarFiliaisSupervisor(uid){
   const vals = Array.from(document.querySelectorAll('.filialChk:checked')).map(c=>c.value);
-  USERS_REF.doc(uid).update({regioes:vals}).then(()=>{ closeModal(); flash('✅ Filiais atualizadas','green'); }).catch(e=>flash('⚠️ '+e.message,'red'));
+  sb.from('usuarios').update({regioes:vals}).eq('id',uid).then(({error})=>{
+    if(error) flash(''+error.message,'red'); else { closeModal(); flash('Filiais atualizadas','green'); }
+  });
 }
 function usuarioRemover(uid, email){
   const alvo = USUARIOS_LISTA.find(u=>u.uid===uid);
-  if(alvo && alvo.papel==='admin' && contarAdmins()<=1) return flash('⚠️ Não é possível remover o único administrador do sistema. Promova outra pessoa a admin antes.','red');
+  if(alvo && alvo.papel==='admin' && contarAdmins()<=1) return flash('Não é possível remover o único administrador do sistema. Promova outra pessoa a admin antes.','red');
   if(!confirm('Remover o acesso de '+email+'? A pessoa poderá criar uma conta nova, mas terá que ser aprovada de novo.')) return;
-  USERS_REF.doc(uid).delete().then(()=>flash('Usuário removido')).catch(e=>flash('⚠️ '+e.message,'red'));
+  sb.from('usuarios').delete().eq('id',uid).then(({error})=>{
+    if(error) flash(''+error.message,'red'); else flash('Usuário removido');
+  });
 }
 
 /* ---------- Boot ---------- */
