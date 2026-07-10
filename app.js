@@ -583,11 +583,21 @@ async function iniciarSyncNuvem(){
   atualizarIndicadorFilaOffline(lerFilaOffline().length);
   tentarEsvaziarFilaOffline();
 
-  // movimentações/auditorias: log append-only — carga inicial ordenada + só acrescenta no INSERT
-  DB.movimentacoes = (await selecionarTudo('movimentacoes', q=>q.order('ts',{ascending:true}))).map(movimentacaoParaCamel);
-  salvarLocal(); movsCarregadas = true; render();
-  DB.auditorias = (await selecionarTudo('auditorias', q=>q.order('ts',{ascending:true}))).map(auditoriaParaCamel);
-  salvarLocal(); audsCarregadas = true; render();
+  // movimentações/auditorias: log append-only — carga inicial ordenada + só acrescenta no INSERT.
+  // BUG-042 (continuação): cada uma tem seu próprio try/catch — sem isso, uma falha aqui
+  // (ex.: offline) derrubava a função inteira sem tratamento, e nem chegava a chamar
+  // iniciarListenerEquipamentos() logo abaixo, deixando a tela presa em "Carregando..."
+  // mesmo com a correção feita lá (o código nunca era alcançado).
+  try{
+    DB.movimentacoes = (await selecionarTudo('movimentacoes', q=>q.order('ts',{ascending:true}))).map(movimentacaoParaCamel);
+    salvarLocal();
+  }catch(err){ /* offline: mantém o que já tinha no cache local (carregado no início do arquivo) */ }
+  movsCarregadas = true; render();
+  try{
+    DB.auditorias = (await selecionarTudo('auditorias', q=>q.order('ts',{ascending:true}))).map(auditoriaParaCamel);
+    salvarLocal();
+  }catch(err){ /* offline: mantém o que já tinha no cache local */ }
+  audsCarregadas = true; render();
 
   // Tempo real: tipos/filiais/técnicos/config/movimentações/auditorias iam cada um num
   // canal (WebSocket) próprio — com 63 usuários isso sozinho já chegava perto do limite
@@ -683,7 +693,14 @@ function iniciarListenerEquipamentos(canal){
       equipsOwnMap = {}; ownData.forEach(r=>{ const e=equipamentoParaCamel(r); equipsOwnMap[e.serie]=e; });
       equipsIncomingMap = {}; incData.forEach(r=>{ const e=equipamentoParaCamel(r); equipsIncomingMap[e.serie]=e; });
       mesclarEquipamentosTecnico();
-    }).catch(err=>flash('Erro ao carregar equipamentos: '+err.message,'red'));
+    }).catch(err=>{
+      flash('Erro ao carregar equipamentos: '+err.message,'red');
+      // BUG-042 (continuação): sem isso, uma falha aqui (ex.: offline) deixava
+      // equipsCarregados sempre false, e a tela ficava presa em "Carregando..." pra
+      // sempre — mesmo já havendo dados da última sincronização salvos localmente
+      // (DB.equipamentos já veio do localStorage no carregar() do topo do arquivo).
+      if(!equipsCarregados){ equipsCarregados=true; render(); }
+    });
     canal
       .on('postgres_changes',
         {event:'*',schema:'public',table:'equipamentos',filter:`tecnico_id=eq.${meuId}`},
@@ -697,7 +714,13 @@ function iniciarListenerEquipamentos(canal){
       ultimoSyncEquip = {}; lista.forEach(e=>{ ultimoSyncEquip[e.serie]=JSON.stringify(e); });
       DB.equipamentos = lista; salvarLocal();
       equipsCarregados = true; render();
-    }).catch(err=>flash('Erro ao carregar equipamentos: '+err.message,'red'));
+    }).catch(err=>{
+      flash('Erro ao carregar equipamentos: '+err.message,'red');
+      // BUG-042 (continuação): mesmo raciocínio do ramo do técnico acima — sem isso,
+      // a tela ficava presa em "Carregando..." pra sempre quando offline, apesar de
+      // DB.equipamentos já ter os dados da última sincronização (vindos do localStorage).
+      if(!equipsCarregados){ equipsCarregados=true; render(); }
+    });
     canal.on('postgres_changes',
       {event:'*',schema:'public',table:'equipamentos'}, aplicarEventoEquipGeral);
   }
