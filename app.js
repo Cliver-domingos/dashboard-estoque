@@ -32,6 +32,13 @@ function carregar(){
 }
 function salvarLocal(){ try{ localStorage.setItem(STORE_KEY, JSON.stringify(DB)); }catch(e){ console.warn('Falha ao salvar cache local:', e); } }
 
+// Cache local do PERFIL do usuário (papel/nome/regiões/técnico), separado do cache de
+// dados (DB) acima — usado só pra abrir o app offline com uma sessão já salva, quando a
+// consulta de perfil não consegue completar por falta de rede (ver BUG-042).
+function chavePerfilCache(uid){ return STORE_KEY_BASE+'_perfil_'+uid; }
+function salvarPerfilCache(uid, perfil){ try{ localStorage.setItem(chavePerfilCache(uid), JSON.stringify(perfil)); }catch(e){} }
+function lerPerfilCache(uid){ try{ const r = localStorage.getItem(chavePerfilCache(uid)); return r ? JSON.parse(r) : null; }catch(e){ return null; } }
+
 /* ---------- Supabase: cliente e conversão de campos ----------
    Postgres usa snake_case e timestamptz; o resto do app (renderização,
    regras de negócio) continua 100% em camelCase e timestamps em ms
@@ -162,6 +169,17 @@ async function carregarPerfil(user){
     // aprovada cair na tela "Aguardando aprovação", porque o código tratava "não
     // consegui perguntar ao banco" como "esse usuário é novo". Não mexe no MEU_PERFIL
     // atual (mantém a tela como estava) e só tenta de novo em alguns segundos.
+    //
+    // BUG-042: se esta é a PRIMEIRA tentativa da sessão (MEU_PERFIL ainda nulo — ex.:
+    // app aberto offline, pelo PWA, com uma sessão já salva), nenhuma tela chega a
+    // aparecer: onAuthStateChange já escondeu o login esperando aplicarPerfil(), que só
+    // roda em caso de sucesso — sem essa consulta nunca completar offline, a tela fica
+    // em branco pra sempre (nem login, nem app). Usa o último perfil salvo localmente
+    // (se existir) pra abrir o app com os dados já sincronizados, mesmo sem rede.
+    if(!MEU_PERFIL){
+      const cache = lerPerfilCache(user.id);
+      if(cache){ MEU_PERFIL = cache; aplicarPerfil(user); }
+    }
     setTimeout(()=>carregarPerfil(user), 3000);
     return;
   }
@@ -172,6 +190,7 @@ async function carregarPerfil(user){
     linha = ins.data;
   }
   MEU_PERFIL = linha ? usuarioParaCamel(linha) : MEU_PERFIL;
+  salvarPerfilCache(user.id, MEU_PERFIL);
   aplicarPerfil(user);
   if(perfilCanalAtivo) sb.removeChannel(perfilCanalAtivo);
   perfilCanalAtivo = sb.channel('perfil-'+user.id)
