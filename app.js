@@ -857,7 +857,10 @@ function auditoriasPermitidas(){
     return t && regiaoPermitida(t.regiao);
   });
 }
-function itensDoTecnico(id){ return DB.equipamentos.filter(e=>e.tecnicoId===id && e.status==='com_tecnico'); }
+// Mais recente primeiro (por refTS — desde, ou data de importação se nunca foi
+// movimentado), pra listas como "Meus equipamentos"/"Ficha do técnico" ficarem
+// organizadas por quem mexeu por último, não na ordem de importação da planilha.
+function itensDoTecnico(id){ return DB.equipamentos.filter(e=>e.tecnicoId===id && e.status==='com_tecnico').sort((a,b)=>(refTS(b)||0)-(refTS(a)||0)); }
 function itensDoDeposito(dep){ return DB.equipamentos.filter(e=>e.status==='estoque' && (e.local||e.deposito||'')===dep); }
 function acharEquipPorSerie(serie){ const s=(serie||'').toLowerCase(); return DB.equipamentos.find(e=>e.serie.toLowerCase()===s); }
 
@@ -922,14 +925,17 @@ function render(){
 }
 
 function renderCarregando(){
+  // Skeleton no formato da tela real (KPIs + tabela fantasma), em vez de spinner
+  // genérico — a estrutura "aparece" antes dos dados e a carga parece mais rápida.
+  const kpiGhost = `<div class="panel"><div class="skel-kpi"><div class="skel skel-line" style="width:55%"></div><div class="skel skel-line lg" style="width:38%"></div></div></div>`;
+  const larguras = [100,92,97,88,95,90]; // variação sutil pra parecer conteúdo de verdade, não blocos idênticos
   $('#content').innerHTML = `
-  <div class="panel"><div class="pb">
-    <div class="empty">
-      <div class="big spin">${ic('refresh-cw')}</div>
-      <h2 style="margin-bottom:8px">Carregando...</h2>
-      <p class="muted">Buscando os dados mais recentes da nuvem.</p>
-    </div>
-  </div></div>`;
+  <div class="grid kpis" style="margin-bottom:20px">${kpiGhost.repeat(4)}</div>
+  <div class="panel">
+    <div class="ph"><div class="skel skel-line" style="width:170px"></div></div>
+    <div class="pb">${larguras.map(w=>`<div class="skel skel-row" style="width:${w}%"></div>`).join('')}</div>
+  </div>
+  <p class="muted" style="text-align:center;margin-top:16px;font-size:var(--text-sm)">Buscando os dados mais recentes da nuvem...</p>`;
 }
 
 function renderVazio(){
@@ -950,16 +956,29 @@ function renderVazio(){
    VISÃO GERAL
    ========================================================= */
 let dashFiliais = []; // array de depósitos selecionados; vazio = todas
+let dashTecnicoFiltro = ''; // id do técnico selecionado no dropdown; vazio = todos
 function dashToggleFilial(d){
   const i = dashFiliais.indexOf(d);
   if(i>=0) dashFiliais.splice(i,1); else dashFiliais.push(d);
   renderDashboard();
 }
+// Aplica os filtros de filial + técnico atuais — reaproveitado tanto pela tela quanto
+// pela exportação (Excel/relatório), pra exportar sempre bater com o que está na tela
+// (mesmo princípio de paradosFiltrados() em Itens Parados).
+function dashboardFiltrado(){
+  const baseEq = souSupervisor() ? DB.equipamentos.filter(e=>regiaoPermitida(e.deposito)) : DB.equipamentos;
+  const eqPorFilial = dashFiliais.length ? baseEq.filter(e=>dashFiliais.includes(e.deposito)) : baseEq;
+  return dashTecnicoFiltro ? eqPorFilial.filter(e=>e.tecnicoId===dashTecnicoFiltro) : eqPorFilial;
+}
 function renderDashboard(){
   let todasFiliais = todasFiliaisConhecidas();
   if(souSupervisor()) todasFiliais = todasFiliais.filter(regiaoPermitida);
   const baseEq = souSupervisor() ? DB.equipamentos.filter(e=>regiaoPermitida(e.deposito)) : DB.equipamentos;
-  const eq = dashFiliais.length ? baseEq.filter(e=>dashFiliais.includes(e.deposito)) : baseEq;
+  const eqPorFilial = dashFiliais.length ? baseEq.filter(e=>dashFiliais.includes(e.deposito)) : baseEq;
+  const tecnicosDisponiveis = [...new Map(eqPorFilial.filter(e=>e.tecnicoId).map(e=>[e.tecnicoId, e.tecnicoId])).keys()]
+    .map(id=>DB.tecnicos.find(t=>t.id===id)).filter(Boolean).sort((a,b)=>a.nome.localeCompare(b.nome));
+  if(dashTecnicoFiltro && !tecnicosDisponiveis.some(t=>t.id===dashTecnicoFiltro)) dashTecnicoFiltro='';
+  const eq = dashTecnicoFiltro ? eqPorFilial.filter(e=>e.tecnicoId===dashTecnicoFiltro) : eqPorFilial;
   const total = eq.length;
   const emEstoque = eq.filter(e=>e.status==='estoque').length;
   const comTec = eq.filter(e=>e.status==='com_tecnico').length;
@@ -1018,6 +1037,13 @@ function renderDashboard(){
         <button class="${on?'active':''}" style="background:${on?'var(--brand)':'var(--panel-soft)'};color:${on?'#fff':'var(--txt)'};border-radius:var(--radius-md)" onclick="dashToggleFilial('${esc(d)}')">${on?ic('check')+' ':''}${esc(d)} <span class="count-badge" style="background:${on?'rgba(255,255,255,.25)':'var(--surface-2)'};color:inherit;margin-left:4px">${n}</span></button>`;}).join('')}
     </div>
     <div class="spacer"></div>
+    <div class="field" style="margin:0;min-width:200px"><label style="font-size:11px">${ic('hard-hat')} Filtrar por técnico</label>
+      <select onchange="dashTecnicoFiltro=this.value;renderDashboard()">
+        <option value="">Todos os técnicos (${tecnicosDisponiveis.length})</option>
+        ${tecnicosDisponiveis.map(t=>`<option value="${t.id}" ${dashTecnicoFiltro===t.id?'selected':''}>${t.regiao?'['+esc(t.regiao)+'] ':''}${esc(t.nome)}</option>`).join('')}
+      </select>
+    </div>
+    <button class="btn sm" onclick="exportarFilialExcel()">${ic('bar-chart-3')} Exportar Excel</button>
     <button class="btn sm" onclick="relatorioFilial()">${ic('printer')} Gerar relatório</button>
   </div></div>
 
@@ -1196,8 +1222,8 @@ function renderParados(){
   const faixas = [
     { label:`${DIAS_PARADO}-30 dias`, min:DIAS_PARADO, max:30, cor:corVar('--amber') },
     { label:'31-60 dias', min:31, max:60, cor:corVar('--red') },
-    { label:'61-90 dias', min:61, max:90, cor:'#991b1b' },
-    { label:'90+ dias', min:91, max:Infinity, cor:'#7f1d1d' }
+    { label:'61-90 dias', min:61, max:90, cor:corVar('--red-2') },
+    { label:'90+ dias', min:91, max:Infinity, cor:corVar('--red-3') }
   ];
   const porFaixa = faixas.map(f=>[f.label, parados.filter(e=>{ const d=diasEmPosse(e)||0; return d>=f.min && d<=f.max; }).length, f.cor]);
 
@@ -1691,11 +1717,14 @@ function renderRMA(){
     <div class="panel">
       <div class="ph"><h3>${ic('map-pin')} RMA por filial</h3></div>
       <div class="pb">
-        ${depArr.length?depArr.map(([d,n])=>`
+        ${depArr.length?depArr.map(([d,n])=>{
+          const intensidade = n/maxDep; // 0 a 1 — mais itens em RMA = vermelho mais forte/escuro
+          const cor = `rgb(${220-Math.round(60*(1-intensidade))},${38+Math.round(90*(1-intensidade))},${38+Math.round(90*(1-intensidade))})`;
+          return `
           <div class="bar-row" style="cursor:pointer" onclick="rmaFiliais=['${esc(d)}'];renderRMA()">
             <div class="bl">${esc(d)}</div>
-            <div class="bar-track"><div class="bar-fill" style="width:${n/maxDep*100}%;background:${corVar('--brand')}">${n}</div></div>
-          </div>`).join(''):'<div class="empty">Sem dados</div>'}
+            <div class="bar-track"><div class="bar-fill" style="width:${n/maxDep*100}%;background:${cor}">${n}</div></div>
+          </div>`;}).join(''):'<div class="empty">Sem dados</div>'}
       </div>
     </div>
   </div>
@@ -2848,10 +2877,19 @@ function exportarHistCSV(){
   const linhas=[...DB.movimentacoes].reverse().map(m=>[fmtTS(m.ts),MOV_LABEL[m.tipo],m.serie,m.de,m.para,m.usuario,m.obs]);
   baixar('historico_movimentacoes.csv','﻿'+[csvLinha(head),...linhas.map(csvLinha)].join('\n'),'text/csv');
 }
+function exportarFilialExcel(){
+  const eq = dashboardFiltrado();
+  if(window.__noXLSX||typeof XLSX==='undefined') return flash('Exportação para Excel indisponível (sem internet). Use "Gerar relatório" e imprima como PDF.','red');
+  const linhas = eq.map(e=>({ 'Nº Série':e.serie, 'Tipo':tipoNome(e.tipo), 'Depósito':e.deposito||'—', 'Status':STATUS[e.status]||e.status, 'Técnico':e.status==='com_tecnico'?tecNome(e.tecnicoId):'—', 'Desde':e.desde?fmtTS(e.desde):'—' }));
+  const ws = XLSX.utils.json_to_sheet(linhas.length?linhas:[{'Nº Série':'','Tipo':'','Depósito':'','Status':'','Técnico':'','Desde':'Nenhum item'}]);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Equipamentos');
+  const sufixoTec = dashTecnicoFiltro ? '_'+tecNome(dashTecnicoFiltro) : '';
+  XLSX.writeFile(wb, 'equipamentos_'+(dashFiliais.length?dashFiliais.join('_'):'todas_filiais').replace(/[^\w-]+/g,'_')+sufixoTec.replace(/[^\w-]+/g,'_')+'_'+new Date().toISOString().slice(0,10)+'.xlsx');
+}
 function relatorioFilial(){
-  const baseEqRel = souSupervisor() ? DB.equipamentos.filter(e=>regiaoPermitida(e.deposito)) : DB.equipamentos;
-  const eq = dashFiliais.length ? baseEqRel.filter(e=>dashFiliais.includes(e.deposito)) : baseEqRel;
-  const titulo = dashFiliais.length ? dashFiliais.join(', ') : 'Todas as filiais';
+  const eq = dashboardFiltrado();
+  const titulo = (dashFiliais.length ? dashFiliais.join(', ') : 'Todas as filiais') + (dashTecnicoFiltro ? ' — '+tecNome(dashTecnicoFiltro) : '');
   const total=eq.length, emEstoque=eq.filter(e=>e.status==='estoque').length, comTec=eq.filter(e=>e.status==='com_tecnico').length, baixados=eq.filter(e=>e.status==='baixado').length;
   const porTipo={}; eq.forEach(e=>porTipo[e.tipo]=(porTipo[e.tipo]||0)+1);
   const porTec={}; eq.filter(e=>e.status==='com_tecnico').forEach(e=>{ const n=tecNome(e.tecnicoId); porTec[n]=(porTec[n]||0)+1; });
@@ -3373,14 +3411,24 @@ function semVinculoHtml(){
     <p class="muted" style="max-width:420px;margin:0 auto">Peça para o administrador vincular seu login a um técnico cadastrado, na página <b>Usuários</b>.</p>
   </div></div></div>`;
 }
+let meusItensTipos = []; // array de tipos selecionados; vazio = todos
+function meusItensToggleTipo(tp){
+  const i = meusItensTipos.indexOf(tp);
+  if(i>=0) meusItensTipos.splice(i,1); else meusItensTipos.push(tp);
+  renderMeusItens();
+}
 function renderMeusItens(){
   const t = meuTecnico();
   if(!t) return $('#content').innerHTML = semVinculoHtml();
   const pendentes = DB.equipamentos.filter(e=>e.emTransito && e.transitoPara===t.id);
-  const confirmados = itensDoTecnico(t.id);
+  const todosConfirmados = itensDoTecnico(t.id);
+  const porTipoCount = {}; todosConfirmados.forEach(e=>{ porTipoCount[e.tipo]=(porTipoCount[e.tipo]||0)+1; });
+  const tiposDisponiveis = Object.keys(porTipoCount).sort((a,b)=>tipoNome(a).localeCompare(tipoNome(b)));
+  meusItensTipos = meusItensTipos.filter(tp=>tiposDisponiveis.includes(tp)); // limpa tipo que sumiu (item movimentado)
+  const confirmados = meusItensTipos.length ? todosConfirmados.filter(e=>meusItensTipos.includes(e.tipo)) : todosConfirmados;
   $('#content').innerHTML = `
   <div class="grid kpis" style="margin-bottom:20px">
-    ${kpi('a','package','Itens em posse',confirmados.length)}
+    ${kpi('a','package','Itens em posse',todosConfirmados.length)}
     ${kpi('r','hourglass','Aguardando confirmação',pendentes.length)}
   </div>
   <div class="panel" style="margin-bottom:20px;${pendentes.length?'border-left:4px solid var(--amber)':''}">
@@ -3395,14 +3443,21 @@ function renderMeusItens(){
       </div>
       <div style="display:flex;flex-direction:column;gap:10px">
         ${pendentes.map(e=>`
-          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 12px;background:var(--amber-soft);border-radius:10px">
-            <div style="flex:1;min-width:160px"><span class="mono"><b>${esc(e.serie)}</b></span> <span class="tag-tipo" style="margin-left:6px">${esc(tipoNome(e.tipo))}</span> <span class="muted" style="font-size:11.5px">de ${esc(e.transitoDe||'—')}</span></div>
+          <div class="rec-card">
+            <div class="rec-info"><span class="mono rec-serie"><b>${esc(e.serie)}</b></span><span class="rec-meta"><span class="tag-tipo">${esc(tipoNome(e.tipo))}</span><span class="muted" style="font-size:11.5px">de ${esc(e.transitoDe||'—')}</span></span></div>
             <button class="btn green sm" onclick="confirmarRecebimento('${esc(e.serie)}')">${ic('check')} Confirmar</button>
           </div>`).join('')}
       </div>` : '<div class="empty">Nenhum equipamento aguardando confirmação no momento.</div>'}
     </div>
   </div>
   <div class="panel"><div class="ph"><h3>${ic('package')} Meus equipamentos</h3><span class="count-badge">${confirmados.length}</span></div>
+    ${tiposDisponiveis.length?`<div class="pb" style="padding-bottom:0">
+      <div class="pill-tabs" style="flex-wrap:wrap;background:transparent;padding:0 0 14px;gap:8px">
+        <button class="${!meusItensTipos.length?'active':''}" style="background:${!meusItensTipos.length?'var(--brand)':'var(--panel-soft)'};color:${!meusItensTipos.length?'#fff':'var(--txt)'};border-radius:var(--radius-md)" onclick="meusItensTipos=[];renderMeusItens()">Todos <span class="count-badge" style="background:rgba(255,255,255,.25);color:inherit;margin-left:4px">${todosConfirmados.length}</span></button>
+        ${tiposDisponiveis.map(tp=>{ const on=meusItensTipos.includes(tp); return `
+          <button class="${on?'active':''}" style="background:${on?'var(--brand)':'var(--panel-soft)'};color:${on?'#fff':'var(--txt)'};border-radius:var(--radius-md)" onclick="meusItensToggleTipo('${tp}')">${on?ic('check')+' ':''}${esc(tipoNome(tp))} <span class="count-badge" style="background:${on?'rgba(255,255,255,.25)':'var(--surface-2)'};color:inherit;margin-left:4px">${porTipoCount[tp]}</span></button>`;}).join('')}
+      </div>
+    </div>`:''}
     <div class="tbl-wrap">${
       confirmados.length? `<table><thead><tr><th>Nº Série</th><th>Tipo</th><th>Há quanto tempo</th></tr></thead><tbody>
         ${confirmados.map(e=>`<tr>
@@ -3410,9 +3465,12 @@ function renderMeusItens(){
           <td><span class="tag-tipo" style="border-left:3px solid ${tipoCor(e.tipo)}">${esc(tipoNome(e.tipo))}</span></td>
           <td>${fmtDias(diasEmPosse(e))} ${(diasEmPosse(e)||0)>=DIAS_PARADO?`<span class="badge com_tecnico" style="font-size:10px">parado</span>`:''}</td>
         </tr>`).join('')}</tbody></table>`
-      : '<div class="empty">Nenhum equipamento confirmado ainda.</div>'
+      : '<div class="empty">Nenhum equipamento com esse filtro.</div>'
     }</div></div>`;
-  const i=$('#recInput'); if(i) i.focus();
+  // preventScroll: sem isso, focar o campo rolava a tela de volta pro topo toda vez
+  // que a página renderiza de novo — inclusive ao clicar num filtro de tipo lá embaixo
+  // (renderMeusItens roda de novo, e o navegador rola até o campo focado aparecer).
+  const i=$('#recInput'); if(i) i.focus({preventScroll:true});
 }
 function recBipar(){
   const inp=$('#recInput'); const v=(inp.value||'').trim(); if(!v) return;

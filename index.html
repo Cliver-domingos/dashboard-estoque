@@ -31,6 +31,10 @@
     --green:#15803d; --green-soft:#dcf5e3;
     --amber:#b45309; --amber-soft:#fdf1dc;
     --red:#c0293d; --red-soft:#fbe2e6;
+    /* escala de severidade do vermelho (faixas 61-90 / 90+ dias dos gráficos):
+       no claro, mais grave = mais escuro; no escuro, mais grave = mais saturado
+       (um vermelho escuro fixo sumiria contra o painel escuro) */
+    --red-2:#991b1b; --red-3:#7f1d1d;
     --violet:#6d3fc4; --violet-soft:#ece3fb;
     --chart-1:#0e7c8c; --chart-2:#6d3fc4; --chart-3:#15803d; --chart-4:#b45309;
     --chart-5:#c0293d; --chart-6:#2a6fae; --chart-7:#a8326d; --chart-8:#4d7c0f;
@@ -56,6 +60,7 @@
       --green:#4ade80; --green-soft:#123321;
       --amber:#f2b84f; --amber-soft:#3a2a10;
       --red:#f2687f; --red-soft:#3a1620;
+      --red-2:#ee3d5c; --red-3:#d61e42;
       --violet:#b592f0; --violet-soft:#2a1f45;
       --chart-1:#22d3e5; --chart-2:#b592f0; --chart-3:#4ade80; --chart-4:#f2b84f;
       --chart-5:#f2687f; --chart-6:#7bb3e8; --chart-7:#e07fb0; --chart-8:#a3d24a;
@@ -69,6 +74,7 @@
     --green:#4ade80; --green-soft:#123321;
     --amber:#f2b84f; --amber-soft:#3a2a10;
     --red:#f2687f; --red-soft:#3a1620;
+    --red-2:#ee3d5c; --red-3:#d61e42;
     --violet:#b592f0; --violet-soft:#2a1f45;
     --chart-1:#22d3e5; --chart-2:#b592f0; --chart-3:#4ade80; --chart-4:#f2b84f;
     --chart-5:#f2687f; --chart-6:#7bb3e8; --chart-7:#e07fb0; --chart-8:#a3d24a;
@@ -81,6 +87,7 @@
     --green:#15803d; --green-soft:#dcf5e3;
     --amber:#b45309; --amber-soft:#fdf1dc;
     --red:#c0293d; --red-soft:#fbe2e6;
+    --red-2:#991b1b; --red-3:#7f1d1d;
     --violet:#6d3fc4; --violet-soft:#ece3fb;
     --chart-1:#0e7c8c; --chart-2:#6d3fc4; --chart-3:#15803d; --chart-4:#b45309;
     --chart-5:#c0293d; --chart-6:#2a6fae; --chart-7:#a8326d; --chart-8:#4d7c0f;
@@ -255,13 +262,40 @@
   .chip .rm{cursor:pointer;font-weight:700}
 
   /* ---- Login ---- */
-  .login-bg{position:fixed;inset:0;background:linear-gradient(160deg,var(--bg),var(--bg2));display:flex;align-items:center;justify-content:center;z-index:200}
-  .login-box{background:var(--panel);border-radius:var(--radius-lg);box-shadow:0 20px 60px rgba(0,0,0,.35);width:100%;max-width:380px;padding:30px 28px}
-  .login-box h2{font-size:var(--text-xl);margin-bottom:4px;text-align:center;display:flex;align-items:center;justify-content:center;gap:8px}
-  .login-box .sub{color:var(--txt-soft);font-size:var(--text-sm);text-align:center;margin-bottom:20px}
+  /* Fundo do login: gradiente escuro de sempre + dois brilhos radiais discretos na
+     cor da marca (teal), pra tela de entrada ter identidade sem virar poluição */
+  .login-bg{position:fixed;inset:0;padding:20px;background:
+    radial-gradient(820px 460px at 78% -8%, rgba(34,211,229,.13), transparent 60%),
+    radial-gradient(640px 460px at 6% 108%, rgba(14,124,140,.22), transparent 55%),
+    linear-gradient(160deg,var(--bg),var(--bg2));
+    display:flex;align-items:center;justify-content:center;z-index:200}
+  .login-box{background:var(--panel);border-radius:14px;box-shadow:0 20px 60px rgba(0,0,0,.35);width:100%;max-width:392px;padding:34px 30px 30px;animation:login-in .45s var(--ease) both}
+  @keyframes login-in{from{opacity:0;transform:translateY(14px) scale(.985)}to{opacity:1;transform:none}}
+  /* Selo do logo: teal fixo de propósito (é a marca — igual à sidebar, que também é
+     sempre escura), pra não depender do --brand claro do tema escuro sob ícone branco */
+  .login-logo{width:56px;height:56px;border-radius:15px;background:linear-gradient(135deg,#0e7c8c,#0a5f6c);color:#fff;display:flex;align-items:center;justify-content:center;margin:0 auto 14px;box-shadow:0 10px 24px rgba(14,124,140,.35)}
+  .login-logo svg{width:28px;height:28px}
+  .login-box h2{font-size:var(--text-xl);margin-bottom:4px;text-align:center;display:flex;align-items:center;justify-content:center;gap:8px;letter-spacing:.2px}
+  .login-box .sub{color:var(--txt-soft);font-size:var(--text-sm);text-align:center;margin-bottom:22px}
   .login-box .err{background:var(--red-soft);color:var(--red);padding:9px 12px;border-radius:var(--radius-md);font-size:var(--text-sm);margin-bottom:12px;display:none}
   .login-box .switch{text-align:center;font-size:var(--text-sm);margin-top:14px;color:var(--txt-soft)}
   .login-box .switch a{cursor:pointer;font-weight:600}
+
+  /* ---- Skeleton (tela de carregamento) — formas cinzas pulsando no formato da
+     tela real, em vez de um spinner genérico. O bloco prefers-reduced-motion lá em
+     cima já desliga a pulsação pra quem pediu menos movimento. ---- */
+  .skel{background:var(--surface-2);border-radius:var(--radius-sm);animation:skel-pulse 1.3s var(--ease) infinite}
+  @keyframes skel-pulse{0%,100%{opacity:1}50%{opacity:.45}}
+  .skel-line{height:12px}
+  .skel-line.lg{height:28px}
+  .skel-kpi{display:flex;flex-direction:column;gap:12px;padding:18px 16px}
+  .skel-row{height:40px;border-radius:var(--radius-md);margin-bottom:10px}
+
+  /* ---- Cards de recebimento pendente (Meus Equipamentos do técnico) ---- */
+  .rec-card{display:flex;align-items:center;gap:12px;padding:10px 12px;background:var(--amber-soft);border-radius:var(--radius-md)}
+  .rec-info{flex:1;min-width:0;display:flex;align-items:center;gap:6px 10px;flex-wrap:wrap}
+  .rec-serie{word-break:break-all}
+  .rec-meta{display:flex;align-items:center;gap:8px;white-space:nowrap}
 
   /* ---- Alternador de tema (sol/lua) ---- */
   .theme-toggle{position:relative;width:32px;height:32px;padding:0!important}
@@ -308,7 +342,15 @@
   @media (max-width:480px){
     .kpis{grid-template-columns:repeat(2,1fr)}
     .kpi .val{font-size:24px}
-    .login-box{margin:0 16px;padding:24px 20px}
+    .login-box{margin:0 16px;padding:26px 20px 22px}
+    /* tabelas mais compactas em tela bem estreita */
+    table{font-size:12px}
+    th,td{padding:8px 8px}
+    /* card de recebimento empilha: série em cima, tipo/origem no meio, botão
+       Confirmar em largura total embaixo (mais fácil de tocar no celular) */
+    .rec-card{flex-direction:column;align-items:stretch;gap:10px}
+    .rec-info{flex-direction:column;align-items:flex-start;gap:6px}
+    .rec-card .btn{justify-content:center}
   }
 </style>
 </head>
@@ -316,7 +358,8 @@
 <div class="login-bg" id="loginBg">
   <div class="login-box">
     <!-- SVG bruto (ICONS.package) porque esta tela renderiza antes do app.js carregar — manter em sincronia com o mapa ICONS em app.js -->
-    <h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="22" height="22" aria-hidden="true"><path d="M16.5 9.4 7.5 4.21"/><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4a2 2 0 0 0 1-1.73Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg> Estoque A365</h2>
+    <div class="login-logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16.5 9.4 7.5 4.21"/><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4a2 2 0 0 0 1-1.73Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg></div>
+    <h2>Estoque A365</h2>
     <div class="sub" id="loginSub">Entre com seu e-mail e senha</div>
     <div class="err" id="loginErr"></div>
     <div class="field"><label>E-mail</label><input id="loginEmail" type="email" placeholder="seuemail@empresa.com"></div>
