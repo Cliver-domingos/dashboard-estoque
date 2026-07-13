@@ -5,6 +5,11 @@
    a fonte de verdade é o banco Postgres.
    ========================================================= */
 
+// PAINEL DE RASTREIO TEMPORÁRIO (10/07/2026) — REMOVER junto com #tracePanel do
+// index.html depois de identificar por que a tela fica presa em "Carregando..."
+// offline pra alguns técnicos.
+function tr(msg){ try{ const p=document.getElementById('tracePanel'); if(p) p.textContent += new Date().toLocaleTimeString('pt-BR')+' '+msg+'\n'; }catch(e){} }
+
 const STORE_KEY_BASE = 'estoque_a365_v1';
 let STORE_KEY = STORE_KEY_BASE; // isolado por conta assim que o login resolver (ver onAuthStateChanged)
 const DIAS_PARADO = 20; // a partir de quantos dias com técnico um item é considerado "parado"
@@ -175,8 +180,10 @@ function regiaoPermitida(dep){
 }
 
 async function carregarPerfil(user){
+  tr('carregarPerfil() chamado');
   const { data, error } = await sb.from('usuarios').select('*').eq('id', user.id).maybeSingle();
   if(error){
+    tr('carregarPerfil(): consulta falhou — '+error.message);
     // Falha de rede/servidor ao consultar o perfil — MUITO diferente de "o perfil não
     // existe ainda". Achado ao vivo (BUG-033): sem essa checagem, uma instabilidade
     // momentânea de conexão (ex.: wi-fi voltando) fazia até uma conta de ADMIN já
@@ -192,6 +199,7 @@ async function carregarPerfil(user){
     // (se existir) pra abrir o app com os dados já sincronizados, mesmo sem rede.
     if(!MEU_PERFIL){
       const cache = lerPerfilCache(user.id);
+      tr('carregarPerfil(): cache local '+(cache?('encontrado, papel='+cache.papel+' tecnicoId='+cache.tecnicoId):'NAO encontrado'));
       if(cache){ MEU_PERFIL = cache; aplicarPerfil(user); }
     }
     setTimeout(()=>carregarPerfil(user), 3000);
@@ -234,6 +242,7 @@ sb.auth.onAuthStateChange((event, session)=>{
 });
 
 function aplicarPerfil(user){
+  tr('aplicarPerfil() rodou — papel='+(MEU_PERFIL&&MEU_PERFIL.papel)+' tecnicoId='+(MEU_PERFIL&&MEU_PERFIL.tecnicoId)+' syncIniciado='+syncIniciado);
   if(!MEU_PERFIL || MEU_PERFIL.papel==='pendente'){
     $('#appRoot').style.display='none';
     $('#pendingBg').style.display='flex';
@@ -578,6 +587,7 @@ function salvar(){
 }
 
 async function iniciarSyncNuvem(){
+  tr('iniciarSyncNuvem() iniciou');
   const foot = document.getElementById('footSync');
   try{
     const [tiposLista, filiaisLista, tecnicosLista, configRes] = await Promise.all([
@@ -601,6 +611,7 @@ async function iniciarSyncNuvem(){
     renderNav(); render();
     verificarBackupAutomatico();
   }catch(err){
+    tr('iniciarSyncNuvem(): 1o Promise.all (tipos/filiais/tecnicos/config) FALHOU — '+err.message);
     if(foot) foot.innerHTML = ic('alert-triangle')+' Sem conexão com a nuvem<br>Usando dados locais.';
     flash('Erro de sincronização: '+err.message,'red');
   }
@@ -662,6 +673,7 @@ async function iniciarSyncNuvem(){
       const a = auditoriaParaCamel(payload.new);
       if(!DB.auditorias.some(x=>x.id===a.id)){ DB.auditorias.push(a); salvarLocal(); if(audsCarregadas) render(); }
     });
+  tr('iniciarSyncNuvem(): chegou até o final, chamando iniciarListenerEquipamentos()');
   // iniciarListenerEquipamentos() encadeia mais 1-2 .on() no MESMO cadastrosCanalAtivo
   // (equipamentos também divide essa conexão) — por isso o .subscribe() só acontece
   // depois dela, nunca antes: todo listener precisa estar registrado antes de assinar.
@@ -709,17 +721,21 @@ function iniciarListenerEquipamentos(canal){
   // Os listeners de equipamentos entram no MESMO canal recebido por parâmetro (mais .on()
   // encadeados) em vez de abrir canal próprio — só o .subscribe() final (chamado por
   // quem chama esta função) é que efetivamente abre a conexão.
+  tr('iniciarListenerEquipamentos() rodou — souTecnico='+souTecnico());
   if(souTecnico()){
     const meuId = MEU_PERFIL.tecnicoId;
-    if(!meuId){ equipsCarregados=true; render(); return; }
+    if(!meuId){ tr('tecnico sem meuId — equipsCarregados=true direto'); equipsCarregados=true; render(); return; }
+    tr('disparando Promise.all (equipamentos proprios + a caminho), meuId='+meuId);
     Promise.all([
       selecionarTudo('equipamentos', q=>q.eq('tecnico_id', meuId)),
       selecionarTudo('equipamentos', q=>q.eq('transito_para', meuId))
     ]).then(([ownData, incData])=>{
+      tr('Promise.all do tecnico OK — '+ownData.length+' proprios, '+incData.length+' a caminho');
       equipsOwnMap = {}; ownData.forEach(r=>{ const e=equipamentoParaCamel(r); equipsOwnMap[e.serie]=e; });
       equipsIncomingMap = {}; incData.forEach(r=>{ const e=equipamentoParaCamel(r); equipsIncomingMap[e.serie]=e; });
       mesclarEquipamentosTecnico();
     }).catch(err=>{
+      tr('Promise.all do tecnico FALHOU — '+err.message+' — forcando equipsCarregados=true');
       flash('Erro ao carregar equipamentos: '+err.message,'red');
       // BUG-042 (continuação): sem isso, uma falha aqui (ex.: offline) deixava
       // equipsCarregados sempre false, e a tela ficava presa em "Carregando..." pra
@@ -903,9 +919,15 @@ function renderNav(){
       <span class="ic">${ic(p.icon)}</span> ${p.titulo}
     </button>`).join('');
 }
+// Sinaliza pra renderMeusItens() que ESTA é uma navegação de verdade (usuário entrando
+// na tela agora), não um re-render provocado por um filtro ou por um evento de tempo
+// real — só nesse caso o campo de bipar deve ganhar foco automaticamente. Em celular,
+// dar foco sempre abre o teclado (mesmo com preventScroll), o que parecia com o antigo
+// bug de "rolar pro topo" sempre que o técnico só clicava num filtro de tipo.
+let veioDeNavegacao = false;
 function goto(id){
   const p = paginasDisponiveis().find(x=>x.id===id); if(!p) return;
-  PAGE=id; $('#pageTitle').textContent=p.titulo; $('#pageSub').textContent=p.sub; renderNav(); render(); window.scrollTo(0,0); toggleSidebar(false);
+  PAGE=id; veioDeNavegacao = true; $('#pageTitle').textContent=p.titulo; $('#pageSub').textContent=p.sub; renderNav(); render(); window.scrollTo(0,0); toggleSidebar(false);
 }
 function toggleSidebar(force){
   const open = typeof force==='boolean' ? force : !document.querySelector('.sidebar').classList.contains('open');
@@ -918,7 +940,7 @@ function render(){
   // Enquanto a carga inicial de equipamentos ainda não terminou de verdade (ex.: logo
   // depois de um F5), mostra "carregando" em vez de renderizar com o que sobrou no
   // localStorage de uma sessão anterior — evita o "flash" de números desatualizados.
-  if(!equipsCarregados) return renderCarregando();
+  if(!equipsCarregados){ tr('render(): equipsCarregados=false, mostrando skeleton'); return renderCarregando(); }
   const semDados = ['dados','tipos','filiais','usuarios','meusItens','meuHistorico','rma','retiradas','estoquemin'];
   if(DB.equipamentos.length===0 && !semDados.includes(PAGE)){ return renderVazio(); }
   RENDERERS[PAGE]();
@@ -3467,10 +3489,14 @@ function renderMeusItens(){
         </tr>`).join('')}</tbody></table>`
       : '<div class="empty">Nenhum equipamento com esse filtro.</div>'
     }</div></div>`;
-  // preventScroll: sem isso, focar o campo rolava a tela de volta pro topo toda vez
-  // que a página renderiza de novo — inclusive ao clicar num filtro de tipo lá embaixo
-  // (renderMeusItens roda de novo, e o navegador rola até o campo focado aparecer).
-  const i=$('#recInput'); if(i) i.focus({preventScroll:true});
+  // Só foca o campo (e abre o teclado no celular) quando o técnico está ENTRANDO na
+  // tela agora — nunca num re-render provocado por filtro/tempo real, senão o teclado
+  // abre sozinho a cada clique num filtro (mesmo com preventScroll, que só evita a
+  // rolagem — o teclado aparecendo já dá a mesma sensação incômoda de "pular pro topo").
+  if(veioDeNavegacao){
+    veioDeNavegacao = false;
+    const i=$('#recInput'); if(i) i.focus({preventScroll:true});
+  }
 }
 function recBipar(){
   const inp=$('#recInput'); const v=(inp.value||'').trim(); if(!v) return;
