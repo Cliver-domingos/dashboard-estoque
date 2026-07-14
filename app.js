@@ -8,9 +8,9 @@
 const STORE_KEY_BASE = 'estoque_a365_v1';
 let STORE_KEY = STORE_KEY_BASE; // isolado por conta assim que o login resolver (ver onAuthStateChanged)
 const DIAS_PARADO = 20; // a partir de quantos dias com técnico um item é considerado "parado"
-const STATUS = { estoque:'Em estoque', com_tecnico:'Com técnico', baixado:'RMA' };
+const STATUS = { estoque:'Em estoque', com_tecnico:'Com técnico', baixado:'RMA', instalado:'Instalado' };
 const CHART_VARS = ['--chart-1','--chart-2','--chart-3','--chart-4','--chart-5','--chart-6','--chart-7','--chart-8'];
-const MOV_LABEL = { entrada:'Entrada', saida:'Saída p/ técnico', transferencia:'Transferência', baixa:'Envio p/ RMA', retorno_rma:'Retorno de RMA', confirmacao:'Confirmação de recebimento', exclusao:'Exclusão definitiva', cancelamento:'Envio cancelado', registro_campo:'Registro em campo' };
+const MOV_LABEL = { entrada:'Entrada', saida:'Saída p/ técnico', transferencia:'Transferência', baixa:'Envio p/ RMA', retorno_rma:'Retorno de RMA', confirmacao:'Confirmação de recebimento', exclusao:'Exclusão definitiva', cancelamento:'Envio cancelado', registro_campo:'Registro em campo', uso_campo:'Uso em campo' };
 
 /* ---------- Estado ---------- */
 let DB = carregar();
@@ -72,7 +72,9 @@ function equipamentoParaCamel(r){
     transitoDesde:tsToMs(r.transito_desde), transitoDe:r.transito_de,
     transitoUsuario:r.transito_usuario, transitoDeTecnicoId:r.transito_de_tecnico_id,
     rmaTecnicoId:r.rma_tecnico_id, rmaDeposito:r.rma_deposito,
-    rmaDesde:tsToMs(r.rma_desde), rmaOS:r.rma_os, cenarioTeste:r.cenario_teste
+    rmaDesde:tsToMs(r.rma_desde), rmaOS:r.rma_os, cenarioTeste:r.cenario_teste,
+    instaladoTecnicoId:r.instalado_tecnico_id, instaladoOS:r.instalado_os,
+    instaladoDesde:tsToMs(r.instalado_desde)
   };
 }
 function equipamentoParaSnake(e){
@@ -85,7 +87,9 @@ function equipamentoParaSnake(e){
     transito_desde:msToTs(e.transitoDesde), transito_de:e.transitoDe||null,
     transito_usuario:e.transitoUsuario||null, transito_de_tecnico_id:e.transitoDeTecnicoId||null,
     rma_tecnico_id:e.rmaTecnicoId||null, rma_deposito:e.rmaDeposito||null,
-    rma_desde:msToTs(e.rmaDesde), rma_os:e.rmaOS||null, cenario_teste:!!e.cenarioTeste
+    rma_desde:msToTs(e.rmaDesde), rma_os:e.rmaOS||null, cenario_teste:!!e.cenarioTeste,
+    instalado_tecnico_id:e.instaladoTecnicoId||null, instalado_os:e.instaladoOS||null,
+    instalado_desde:msToTs(e.instaladoDesde)
   };
 }
 function movimentacaoParaCamel(r){
@@ -415,7 +419,11 @@ async function sincronizarEquipamentos(){
   // vazio ao abrir offline), o upsert do lote inteiro violava a RLS e NADA era salvo.
   if(souTecnico()){
     const meuId = MEU_PERFIL.tecnicoId;
-    alterados = alterados.filter(e=> e.tecnicoId===meuId || (e.status==='baixado' && e.rmaTecnicoId===meuId));
+    // As 3 exceções espelham exatamente a política de INSERT/UPDATE do banco:
+    // meu, baixado-por-mim (RMA), ou instalado-por-mim (uso em campo).
+    alterados = alterados.filter(e=> e.tecnicoId===meuId
+      || (e.status==='baixado' && e.rmaTecnicoId===meuId)
+      || (e.status==='instalado' && e.instaladoTecnicoId===meuId));
   }
   if(!alterados.length) return;
   try{
@@ -830,6 +838,7 @@ const ICONS = {
   eraser:'<path d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21"/><path d="M22 21H7"/><path d="m5 11 9 9"/>',
   save:'<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/>',
   'file-text':'<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v6h6"/><path d="M16 13H8"/><path d="M16 17H8"/><path d="M10 9H8"/>',
+  wrench:'<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>',
   lock:'<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
   cloud:'<path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/>',
   tag:'<path d="M12.586 2.586A2 2 0 0 0 11.172 2H4a2 2 0 0 0-2 2v7.172a2 2 0 0 0 .586 1.414l8.704 8.704a2.426 2.426 0 0 0 3.42 0l6.58-6.58a2.426 2.426 0 0 0 0-3.42Z"/><circle cx="7.5" cy="7.5" r="1.5"/>',
@@ -999,6 +1008,7 @@ function renderDashboard(){
   const emEstoque = eq.filter(e=>e.status==='estoque').length;
   const comTec = eq.filter(e=>e.status==='com_tecnico').length;
   const baixados = eq.filter(e=>e.status==='baixado').length;
+  const instalados = eq.filter(e=>e.status==='instalado').length;
   const seriesEq = new Set(eq.map(e=>e.serie));
   const auditoriasFiltradas = (dashFiliais.length ? auditoriasPermitidas().filter(a=>a.alvoTipo==='deposito'&&dashFiliais.includes(a.alvoId)) : auditoriasPermitidas());
 
@@ -1020,7 +1030,8 @@ function renderDashboard(){
     painel2PorTecnico=true;
   } else {
     const porDep = {};
-    eq.filter(e=>e.status!=='baixado').forEach(e=>{ const d=e.local||e.deposito||'—'; porDep[d]=(porDep[d]||0)+1; });
+    // instalado não conta como "ativo no depósito": o item está fisicamente no cliente
+    eq.filter(e=>e.status!=='baixado'&&e.status!=='instalado').forEach(e=>{ const d=e.local||e.deposito||'—'; porDep[d]=(porDep[d]||0)+1; });
     painel2Titulo = ic('map-pin')+' Itens ativos por depósito/local';
     painel2Arr = Object.entries(porDep).sort((a,b)=>b[1]-a[1]).slice(0,8);
     painel2Max = Math.max(1,...painel2Arr.map(d=>d[1]));
@@ -1067,8 +1078,9 @@ function renderDashboard(){
     ${kpi('b','package','Total de itens',total)}
     ${kpi('g','check','Em estoque',emEstoque)}
     ${kpi('a','hard-hat','Com técnicos',comTec)}
+    ${kpi('v','wrench','Instalados',instalados)}
     ${kpi('r','recycle','RMA',baixados)}
-    ${kpi('v','search','Auditorias',auditoriasFiltradas.length)}
+    ${kpi('b','search','Auditorias',auditoriasFiltradas.length)}
   </div>
 
   <div class="chart-row" style="margin-bottom:20px">
@@ -1085,7 +1097,7 @@ function renderDashboard(){
     <div class="panel">
       <div class="ph"><h3>Distribuição (status)</h3></div>
       <div class="pb"><div class="donut-wrap">
-        ${donut([['Em estoque',emEstoque,corVar('--green')],['Com técnico',comTec,corVar('--amber')],['RMA',baixados,corVar('--red')]])}
+        ${donut([['Em estoque',emEstoque,corVar('--green')],['Com técnico',comTec,corVar('--amber')],['Instalados',instalados,corVar('--violet')],['RMA',baixados,corVar('--red')]])}
       </div></div>
     </div>
   </div>
@@ -1949,6 +1961,7 @@ function renderMovPageTecnico(){
   const enviadosPorMim = DB.equipamentos.filter(e=>e.emTransito && e.transitoDeTecnicoId===t.id);
   $('#content').innerHTML = `
   <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(230px,1fr));margin-bottom:18px">
+    ${movCard('uso_campo','wrench','Registrar uso em campo','Equipamento aplicado no cliente — dá baixa do seu estoque','green')}
     ${actionCard('file-text','Registrar retirada em campo','Equipamento de manutenção ou desinstalação','b','abrirRegistrarForm()')}
     ${movCard('transferencia','repeat','Transferir para outro técnico','Passar um item seu para outro técnico','v')}
     ${movCard('baixa','recycle','Enviar para RMA','Defeito, garantia ou devolução ao fabricante','r')}
@@ -2577,7 +2590,7 @@ function openMov(serie, tipo){
   desenharMov();
 }
 function desenharMov(){
-  const tiposDisponiveis = souTecnico() ? ['transferencia','baixa'] : ['entrada','saida','transferencia','baixa'];
+  const tiposDisponiveis = souTecnico() ? ['uso_campo','transferencia','baixa'] : ['entrada','saida','transferencia','baixa'];
   if(!tiposDisponiveis.includes(movTipo)) movTipo = tiposDisponiveis[0];
   let regioesTec = [...new Set(DB.tecnicos.map(t=>t.regiao).filter(Boolean))].sort();
   if(souSupervisor()) regioesTec = regioesTec.filter(regiaoPermitida);
@@ -2660,7 +2673,16 @@ function desenharMov(){
           </select>
         </div>
       </div>`:''}
-    ${movTipo==='baixa'? `
+    ${movTipo==='uso_campo'? `
+      <div class="field"><label>Tipo de atendimento *</label>
+        <select id="movAtend">
+          <option value="">— selecione —</option>
+          <option value="Manutenção">Manutenção</option>
+          <option value="Instalação">Instalação</option>
+        </select>
+      </div>
+      <div class="hint" style="margin-top:-6px;margin-bottom:12px">A OS identifica o cliente onde o equipamento foi usado.</div>`:''}
+    ${movTipo==='baixa'||movTipo==='uso_campo'? `
       <div class="field"><label>Número da OS (Ordem de Serviço) *</label>
         <input id="movOS" inputmode="numeric" maxlength="6" placeholder="Ex.: 123456" oninput="this.value=this.value.replace(/\\D/g,'').slice(0,6)">
         <div class="hint">Exatamente 6 números.</div>
@@ -2669,7 +2691,7 @@ function desenharMov(){
       <div class="hint">Só funciona para equipamento que <b>já existe</b> no sistema (com técnico ou baixado, retornando ao estoque). Pra cadastrar um equipamento novo, use <b>Equipamentos → ＋ Adicionar</b>.</div></div>`:''}
     ${movTipo==='baixa'? `<div class="field"><label>Motivo do envio para RMA</label><input id="movMotivo" placeholder="Ex.: Defeito, garantia, devolução ao fabricante..."></div>`:''}
 
-    <div class="field"><label>Observação${movTipo==='transferencia'?' *':''}</label><input id="movObs" placeholder="${movTipo==='transferencia'?'Obrigatório':'Opcional'}"></div>
+    <div class="field"><label>Observação${movTipo==='transferencia'||movTipo==='uso_campo'?' *':''}</label><input id="movObs" placeholder="${movTipo==='transferencia'||movTipo==='uso_campo'?'Obrigatório':'Opcional'}"></div>
   `, `<button class="btn" onclick="closeModal()">Cancelar</button>
       <button class="btn primary" onclick="confirmarMov()">Confirmar (<span id="movN">${movSel.length}</span> ${movSel.length===1?'item':'itens'})</button>`, 'lg');
   renderMovChips(); filtrarPickMov('');
@@ -2740,11 +2762,21 @@ function confirmarMov(){
     destinoTxt=tecNome(tecId);
   } else if(movTipo==='entrada'){ destinoTxt=($('#movDep')?limparFilial($('#movDep').value):'')||'Estoque'; }
   else if(movTipo==='baixa'){ destinoTxt='RMA'; }
+  else if(movTipo==='uso_campo'){ destinoTxt='Instalado no cliente'; }
 
   if(movTipo==='transferencia' && !obs) return flash('Informe a observação para registrar a transferência','red');
 
+  // Uso em campo: nada pode ficar pela metade — atendimento, OS e observação
+  // são todos obrigatórios (regra de negócio confirmada em 11/07/2026).
+  let atendimento = '';
+  if(movTipo==='uso_campo'){
+    atendimento = $('#movAtend')?$('#movAtend').value:'';
+    if(!atendimento) return flash('Selecione o tipo de atendimento (Manutenção ou Instalação)','red');
+    if(!obs) return flash('Informe a observação para registrar o uso em campo','red');
+  }
+
   let numeroOS = '';
-  if(movTipo==='baixa'){
+  if(movTipo==='baixa'||movTipo==='uso_campo'){
     numeroOS = $('#movOS')?$('#movOS').value.trim():'';
     if(!/^\d{6}$/.test(numeroOS)) return flash('Informe o número da OS com exatamente 6 números','red');
   }
@@ -2760,12 +2792,16 @@ function confirmarMov(){
     }
     else if(movTipo==='entrada'){ e.status='estoque'; e.tecnicoId=null; e.confirmado=true; e.emTransito=false; if($('#movDep')&&$('#movDep').value.trim()){e.deposito=limparFilial($('#movDep').value);} e.local=e.deposito; }
     else if(movTipo==='baixa'){ e.status='baixado'; e.tecnicoId=null; e.local='RMA'; e.confirmado=true; e.emTransito=false; e.rmaTecnicoId=tecnicoAnterior||null; e.rmaDeposito=e.deposito||null; e.rmaDesde=Date.now(); e.rmaOS=numeroOS; }
+    else if(movTipo==='uso_campo'){ e.status='instalado'; e.tecnicoId=null; e.local='Cliente — OS '+numeroOS; e.confirmado=true; e.emTransito=false; e.instaladoTecnicoId=tecnicoAnterior||null; e.instaladoOS=numeroOS; e.instaladoDesde=Date.now(); }
     e.desde = Date.now();
     const motivo = movTipo==='baixa' && $('#movMotivo')? $('#movMotivo').value.trim() : '';
-    const tecIdMov = movTipo==='baixa' ? tecnicoAnterior : tecId;
+    const tecIdMov = (movTipo==='baixa'||movTipo==='uso_campo') ? tecnicoAnterior : tecId;
     const tecnicoIdOrigem = movTipo==='transferencia' ? (tecnicoAnterior||null) : null;
-    const paraTxt = (movTipo==='saida'||movTipo==='transferencia') ? destinoTxt+' (aguardando confirmação)' : destinoTxt;
-    const obsFinal = movTipo==='baixa' ? ['OS '+numeroOS,obs,motivo].filter(Boolean).join(' · ') : [obs,motivo].filter(Boolean).join(' · ');
+    const paraTxt = (movTipo==='saida'||movTipo==='transferencia') ? destinoTxt+' (aguardando confirmação)'
+      : movTipo==='uso_campo' ? destinoTxt+' — OS '+numeroOS+' ('+atendimento+')' : destinoTxt;
+    const obsFinal = movTipo==='baixa' ? ['OS '+numeroOS,obs,motivo].filter(Boolean).join(' · ')
+      : movTipo==='uso_campo' ? ['OS '+numeroOS,atendimento,obs].filter(Boolean).join(' · ')
+      : [obs,motivo].filter(Boolean).join(' · ');
     registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:movTipo, serie, de, para:paraTxt, tecnicoId:tecIdMov, tecnicoIdOrigem, usuario, obs:obsFinal, os:numeroOS });
     n++;
   });
