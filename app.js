@@ -982,28 +982,62 @@ function renderVazio(){
    ========================================================= */
 let dashFiliais = []; // array de depósitos selecionados; vazio = todas
 let dashTecnicoFiltro = ''; // id do técnico selecionado no dropdown; vazio = todos
+let dashStatusFiltro = ''; // 'estoque'|'com_tecnico'|'instalado'|'baixado'; vazio = todos
 function dashToggleFilial(d){
   const i = dashFiliais.indexOf(d);
   if(i>=0) dashFiliais.splice(i,1); else dashFiliais.push(d);
   renderDashboard();
 }
+function dashToggleStatus(status){
+  dashStatusFiltro = dashStatusFiltro===status ? '' : status;
+  renderDashboard();
+}
 // Aplica os filtros de filial + técnico atuais — reaproveitado tanto pela tela quanto
 // pela exportação (Excel/relatório), pra exportar sempre bater com o que está na tela
 // (mesmo princípio de paradosFiltrados() em Itens Parados).
+// "Ampliado": um técnico não tem mais tecnicoId depois que o item vai pra RMA ou é
+// instalado (esses estados guardam o dono em rma_tecnico_id/instalado_tecnico_id, não
+// em tecnico_id) — sem isso, filtrar por técnico + status RMA/Instalado sempre dava 0
+// resultados, mesmo quando o item era mesmo desse técnico. Olha o campo certo conforme
+// o status ATUAL do item, então funciona em qualquer combinação com o filtro de status.
+function dashItemBateTecnico(e, tecId){
+  if(e.status==='com_tecnico') return e.tecnicoId===tecId;
+  if(e.status==='baixado') return e.rmaTecnicoId===tecId;
+  if(e.status==='instalado') return e.instaladoTecnicoId===tecId;
+  return false; // 'estoque' não tem técnico associado
+}
 function dashboardFiltrado(){
   const baseEq = souSupervisor() ? DB.equipamentos.filter(e=>regiaoPermitida(e.deposito)) : DB.equipamentos;
   const eqPorFilial = dashFiliais.length ? baseEq.filter(e=>dashFiliais.includes(e.deposito)) : baseEq;
-  return dashTecnicoFiltro ? eqPorFilial.filter(e=>e.tecnicoId===dashTecnicoFiltro) : eqPorFilial;
+  let eq = dashTecnicoFiltro ? eqPorFilial.filter(e=>dashItemBateTecnico(e, dashTecnicoFiltro)) : eqPorFilial;
+  if(dashStatusFiltro) eq = eq.filter(e=>e.status===dashStatusFiltro);
+  return eq;
 }
 function renderDashboard(){
   let todasFiliais = todasFiliaisConhecidas();
   if(souSupervisor()) todasFiliais = todasFiliais.filter(regiaoPermitida);
   const baseEq = souSupervisor() ? DB.equipamentos.filter(e=>regiaoPermitida(e.deposito)) : DB.equipamentos;
   const eqPorFilial = dashFiliais.length ? baseEq.filter(e=>dashFiliais.includes(e.deposito)) : baseEq;
-  const tecnicosDisponiveis = [...new Map(eqPorFilial.filter(e=>e.tecnicoId).map(e=>[e.tecnicoId, e.tecnicoId])).keys()]
+  // Considera os 3 campos de "dono" (tecnico_id/rma_tecnico_id/instalado_tecnico_id) —
+  // um técnico que só tem itens em RMA ou instalados nesta filial também deve aparecer
+  // na lista, senão o dropdown "esconde" ele assim que o item muda de status.
+  const tecnicosDisponiveis = [...new Set(eqPorFilial.flatMap(e=>[e.tecnicoId,e.rmaTecnicoId,e.instaladoTecnicoId]).filter(Boolean))]
     .map(id=>DB.tecnicos.find(t=>t.id===id)).filter(Boolean).sort((a,b)=>a.nome.localeCompare(b.nome));
   if(dashTecnicoFiltro && !tecnicosDisponiveis.some(t=>t.id===dashTecnicoFiltro)) dashTecnicoFiltro='';
-  const eq = dashTecnicoFiltro ? eqPorFilial.filter(e=>e.tecnicoId===dashTecnicoFiltro) : eqPorFilial;
+  const eqPorTecnico = dashTecnicoFiltro ? eqPorFilial.filter(e=>dashItemBateTecnico(e, dashTecnicoFiltro)) : eqPorFilial;
+  // Contagens do filtro de status (pílulas) — refletem filial + técnico já aplicados,
+  // mas ANTES do próprio filtro de status (pra pílula mostrar "quantos teria se eu
+  // escolhesse essa opção", mesmo princípio das pílulas de filial/tipo já existentes).
+  const statusContagem = {
+    estoque: eqPorTecnico.filter(e=>e.status==='estoque').length,
+    com_tecnico: eqPorTecnico.filter(e=>e.status==='com_tecnico').length,
+    instalado: eqPorTecnico.filter(e=>e.status==='instalado').length,
+    baixado: eqPorTecnico.filter(e=>e.status==='baixado').length,
+  };
+  // (Sem auto-reset aqui: diferente do técnico — que pode deixar de existir como opção
+  // válida — os 4 status são categorias fixas; contagem 0 é um resultado legítimo, não
+  // motivo pra descartar a escolha do usuário.)
+  const eq = dashStatusFiltro ? eqPorTecnico.filter(e=>e.status===dashStatusFiltro) : eqPorTecnico;
   const total = eq.length;
   const emEstoque = eq.filter(e=>e.status==='estoque').length;
   const comTec = eq.filter(e=>e.status==='com_tecnico').length;
@@ -1069,6 +1103,12 @@ function renderDashboard(){
         <option value="">Todos os técnicos (${tecnicosDisponiveis.length})</option>
         ${tecnicosDisponiveis.map(t=>`<option value="${t.id}" ${dashTecnicoFiltro===t.id?'selected':''}>${t.regiao?'['+esc(t.regiao)+'] ':''}${esc(t.nome)}</option>`).join('')}
       </select>
+    </div>
+    <span style="font-weight:700;font-size:12.5px;color:var(--txt-soft);white-space:nowrap">${ic('list-checks')} STATUS</span>
+    <div class="pill-tabs" style="flex-wrap:wrap;background:transparent;padding:0;gap:8px">
+      <button class="${!dashStatusFiltro?'active':''}" style="background:${!dashStatusFiltro?'var(--brand)':'var(--panel-soft)'};color:${!dashStatusFiltro?'#fff':'var(--txt)'};border-radius:var(--radius-md)" onclick="dashStatusFiltro='';renderDashboard()">Todos <span class="count-badge" style="background:rgba(255,255,255,.25);color:inherit;margin-left:4px">${eqPorTecnico.length}</span></button>
+      ${[['estoque','Em estoque'],['com_tecnico','Com técnico'],['instalado','Instalados'],['baixado','RMA']].map(([st,label])=>{ const on=dashStatusFiltro===st; return `
+        <button class="${on?'active':''}" style="background:${on?'var(--brand)':'var(--panel-soft)'};color:${on?'#fff':'var(--txt)'};border-radius:var(--radius-md)" onclick="dashToggleStatus('${st}')">${on?ic('check')+' ':''}${label} <span class="count-badge" style="background:${on?'rgba(255,255,255,.25)':'var(--surface-2)'};color:inherit;margin-left:4px">${statusContagem[st]}</span></button>`;}).join('')}
     </div>
     <button class="btn sm" onclick="exportarFilialExcel()">${ic('bar-chart-3')} Exportar Excel</button>
     <button class="btn sm" onclick="relatorioFilial()">${ic('printer')} Gerar relatório</button>
@@ -1515,7 +1555,7 @@ function gerarRelatorioEstoqueMinTecnico(tecnicoId){
     <h1>Relatório de Estoque Mínimo por Técnico</h1>
     <h2>${esc(t.nome)} · ${esc(t.regiao||'—')} · gerado em ${hoje}</h2>
     <table><thead><tr><th>Tipo</th><th>Atual</th><th>Mínimo</th><th>Faltam</th></tr></thead><tbody>
-      ${tiposComMin.length? tiposComMin.map(tp=>{ const atual=porTipo[tp]||0; const min=DB.tipos[tp].min||0; const falta=Math.max(0,min-atual); return `<tr><td>${esc(tipoNome(tp))}</td><td>${atual}</td><td>${min}</td><td>${falta>0?falta:ic('check')}</td></tr>`; }).join('') : '<tr><td colspan="4">Nenhum tipo com mínimo configurado.</td></tr>'}
+      ${tiposComMin.length? tiposComMin.map(tp=>{ const atual=porTipo[tp]||0; const min=DB.tipos[tp].min||0; const falta=Math.max(0,min-atual); return `<tr><td>${esc(tipoNome(tp))}</td><td>${atual}</td><td>${min}</td><td>${falta>0?falta:'OK'}</td></tr>`; }).join('') : '<tr><td colspan="4">Nenhum tipo com mínimo configurado.</td></tr>'}
     </tbody></table>
     </body></html>`;
   const w=window.open('','_blank'); if(!w) return flash('Permita pop-ups para gerar o relatório','red'); w.document.write(html); w.document.close();
@@ -1687,7 +1727,7 @@ function gerarRelatorioEstoqueMinTec(){
     <h1>Relatório de Técnicos Abaixo do Mínimo Pessoal</h1>
     <h2>${esc(titulo)} · ${linhas.length} técnico(s) · gerado em ${hoje}</h2>
     ${linhas.length? linhas.map(l=>`
-      <h3>${ic('hard-hat')} ${esc(l.tecnico.nome)} — ${esc(l.tecnico.regiao||'—')}</h3>
+      <h3>${esc(l.tecnico.nome)} — ${esc(l.tecnico.regiao||'—')}</h3>
       <table><thead><tr><th>Tipo</th><th>Atual</th><th>Mínimo</th><th>Faltam</th></tr></thead><tbody>
         ${l.itens.map(a=>`<tr><td>${esc(tipoNome(a.tipo))}</td><td>${a.atual}</td><td>${a.min}</td><td>${a.deficit}</td></tr>`).join('')}
       </tbody></table>`).join('') : '<p>Nenhum técnico abaixo do mínimo.</p>'}
@@ -1699,21 +1739,38 @@ function gerarRelatorioEstoqueMinTec(){
    ESTOQUE RMA
    ========================================================= */
 let rmaFiliais = [];
+let rmaTecnicoFiltro = ''; // id do técnico selecionado no dropdown; vazio = todos
 function rmaToggleFilial(d){ const i=rmaFiliais.indexOf(d); if(i>=0) rmaFiliais.splice(i,1); else rmaFiliais.push(d); renderRMA(); }
+// Aplica os filtros de filial + técnico atuais — reaproveitado pela tela e pelas
+// exportações (Excel/relatório/modal "ver tudo"), mesmo princípio de dashboardFiltrado().
+function rmaFiltrado(){
+  const baseRma = DB.equipamentos.filter(e=>e.status==='baixado' && (!souSupervisor()||regiaoPermitida(e.rmaDeposito||e.deposito)));
+  const rma = rmaFiliais.length ? baseRma.filter(e=>rmaFiliais.includes(e.rmaDeposito||e.deposito)) : baseRma;
+  return rmaTecnicoFiltro ? rma.filter(e=>e.rmaTecnicoId===rmaTecnicoFiltro) : rma;
+}
 function renderRMA(){
   let todasFiliais = [...new Set(DB.equipamentos.filter(e=>e.status==='baixado').map(e=>e.rmaDeposito||e.deposito).filter(Boolean))].sort();
   if(souSupervisor()) todasFiliais = todasFiliais.filter(regiaoPermitida);
   const baseRma = DB.equipamentos.filter(e=>e.status==='baixado' && (!souSupervisor()||regiaoPermitida(e.rmaDeposito||e.deposito)));
-  const rma = rmaFiliais.length ? baseRma.filter(e=>rmaFiliais.includes(e.rmaDeposito||e.deposito)) : baseRma;
+  const rmaPorFilial = rmaFiliais.length ? baseRma.filter(e=>rmaFiliais.includes(e.rmaDeposito||e.deposito)) : baseRma;
+  const tecnicosDisponiveis = [...new Map(rmaPorFilial.filter(e=>e.rmaTecnicoId).map(e=>[e.rmaTecnicoId, e.rmaTecnicoId])).keys()]
+    .map(id=>DB.tecnicos.find(t=>t.id===id)).filter(Boolean).sort((a,b)=>a.nome.localeCompare(b.nome));
+  if(rmaTecnicoFiltro && !tecnicosDisponiveis.some(t=>t.id===rmaTecnicoFiltro)) rmaTecnicoFiltro='';
+  const rma = rmaTecnicoFiltro ? rmaPorFilial.filter(e=>e.rmaTecnicoId===rmaTecnicoFiltro) : rmaPorFilial;
 
   const porTipo={}; rma.forEach(e=>porTipo[e.tipo]=(porTipo[e.tipo]||0)+1);
   const donutTipo = Object.entries(porTipo).sort((a,b)=>b[1]-a[1]).map(([t,n])=>[tipoNome(t),n,tipoCor(t)]);
 
-  const porDep={}; baseRma.forEach(e=>{ const d=e.rmaDeposito||e.deposito||'—'; porDep[d]=(porDep[d]||0)+1; });
+  // "RMA por filial" tem a filial no próprio eixo, então ignora o filtro de filial (pra
+  // continuar servindo de seletor clicável) mas RESPEITA o filtro de técnico, se ativo.
+  const baseRmaParaDep = rmaTecnicoFiltro ? baseRma.filter(e=>e.rmaTecnicoId===rmaTecnicoFiltro) : baseRma;
+  const porDep={}; baseRmaParaDep.forEach(e=>{ const d=e.rmaDeposito||e.deposito||'—'; porDep[d]=(porDep[d]||0)+1; });
   const depArr = Object.entries(porDep).sort((a,b)=>b[1]-a[1]);
   const maxDep = Math.max(1,...depArr.map(d=>d[1]));
 
-  const porTec={}; rma.forEach(e=>{ const id=e.rmaTecnicoId||'__sem__'; porTec[id]=(porTec[id]||0)+1; });
+  // "RMA por técnico" tem o técnico no próprio eixo — ignora o filtro de técnico (senão
+  // colapsaria pra 1 barra só quando um já está selecionado), mas respeita o de filial.
+  const porTec={}; rmaPorFilial.forEach(e=>{ const id=e.rmaTecnicoId||'__sem__'; porTec[id]=(porTec[id]||0)+1; });
   const tecArr = Object.entries(porTec).sort((a,b)=>b[1]-a[1]);
   const maxTec = Math.max(1,...tecArr.map(d=>d[1]));
 
@@ -1728,6 +1785,12 @@ function renderRMA(){
         <button class="${on?'active':''}" style="background:${on?'var(--brand)':'var(--panel-soft)'};color:${on?'#fff':'var(--txt)'};border-radius:var(--radius-md)" onclick="rmaToggleFilial('${esc(d)}')">${on?ic('check')+' ':''}${esc(d)} <span class="count-badge" style="background:${on?'rgba(255,255,255,.25)':'var(--surface-2)'};color:inherit;margin-left:4px">${n}</span></button>`;}).join('')}
     </div>
     <div class="spacer"></div>
+    <div class="field" style="margin:0;min-width:200px"><label style="font-size:11px">${ic('hard-hat')} Filtrar por técnico</label>
+      <select onchange="rmaTecnicoFiltro=this.value;renderRMA()">
+        <option value="">Todos os técnicos (${tecnicosDisponiveis.length})</option>
+        ${tecnicosDisponiveis.map(t=>`<option value="${t.id}" ${rmaTecnicoFiltro===t.id?'selected':''}>${t.regiao?'['+esc(t.regiao)+'] ':''}${esc(t.nome)}</option>`).join('')}
+      </select>
+    </div>
     ${rma.length?`<button class="btn sm" onclick="exportarRMAExcel()">${ic('bar-chart-3')} Exportar Excel</button><button class="btn sm" onclick="gerarRelatorioRMA()">${ic('printer')} Gerar relatório</button>`:''}
   </div></div>
 
@@ -1785,17 +1848,18 @@ function renderRMA(){
   </div>`;
 }
 function exportarRMAExcel(){
-  const rma = DB.equipamentos.filter(e=>e.status==='baixado' && (!souSupervisor()||regiaoPermitida(e.rmaDeposito||e.deposito)) && (!rmaFiliais.length||rmaFiliais.includes(e.rmaDeposito||e.deposito)));
+  const rma = rmaFiltrado();
   if(window.__noXLSX||typeof XLSX==='undefined') return flash('Exportação para Excel indisponível (sem internet). Use "Gerar relatório" e imprima como PDF.','red');
   const linhas = rma.map(e=>({ 'Nº Série':e.serie, 'Tipo':tipoNome(e.tipo), 'Filial':e.rmaDeposito||e.deposito||'—', 'Técnico':e.rmaTecnicoId?tecNome(e.rmaTecnicoId):'—', 'Desde':e.rmaDesde?fmtTS(e.rmaDesde):'—' }));
   const ws = XLSX.utils.json_to_sheet(linhas.length?linhas:[{'Nº Série':'','Tipo':'','Filial':'','Técnico':'','Desde':'Nenhum item'}]);
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Estoque RMA');
-  XLSX.writeFile(wb, 'estoque_rma_'+(rmaFiliais.length?rmaFiliais.join('_'):'todas_filiais').replace(/[^\w-]+/g,'_')+'_'+new Date().toISOString().slice(0,10)+'.xlsx');
+  const sufixoTec = rmaTecnicoFiltro ? '_'+tecNome(rmaTecnicoFiltro) : '';
+  XLSX.writeFile(wb, 'estoque_rma_'+(rmaFiliais.length?rmaFiliais.join('_'):'todas_filiais').replace(/[^\w-]+/g,'_')+sufixoTec.replace(/[^\w-]+/g,'_')+'_'+new Date().toISOString().slice(0,10)+'.xlsx');
 }
 function gerarRelatorioRMA(){
-  const rma = DB.equipamentos.filter(e=>e.status==='baixado' && (!souSupervisor()||regiaoPermitida(e.rmaDeposito||e.deposito)) && (!rmaFiliais.length||rmaFiliais.includes(e.rmaDeposito||e.deposito)));
-  const titulo = rmaFiliais.length ? rmaFiliais.join(', ') : 'Todas as filiais';
+  const rma = rmaFiltrado();
+  const titulo = (rmaFiliais.length ? rmaFiliais.join(', ') : 'Todas as filiais') + (rmaTecnicoFiltro ? ' — '+tecNome(rmaTecnicoFiltro) : '');
   const hoje = new Date().toLocaleDateString('pt-BR')+' '+new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
   const html=`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="utf-8"><title>Relatório de Estoque RMA</title>
     <style>body{font-family:Arial,sans-serif;max-width:820px;margin:30px auto;padding:0 24px;color:#111;font-size:13px;line-height:1.5}
@@ -1812,8 +1876,7 @@ function gerarRelatorioRMA(){
   const w=window.open('','_blank'); if(!w) return flash('Permita pop-ups para gerar o relatório','red'); w.document.write(html); w.document.close();
 }
 function verTodosRMA(){
-  const rma = DB.equipamentos.filter(e=>e.status==='baixado' && (!souSupervisor()||regiaoPermitida(e.rmaDeposito||e.deposito)) && (!rmaFiliais.length||rmaFiliais.includes(e.rmaDeposito||e.deposito)))
-    .sort((a,b)=>(b.rmaDesde||0)-(a.rmaDesde||0));
+  const rma = rmaFiltrado().sort((a,b)=>(b.rmaDesde||0)-(a.rmaDesde||0));
   modal(ic('recycle')+' Todos os itens em RMA', `
     <div class="tbl-wrap" style="max-height:480px">${
       rma.length? `<table><thead><tr><th>Nº Série</th><th>Tipo</th><th>Técnico</th><th>Filial</th><th>Data</th>${souAdmin()?'<th></th>':''}</tr></thead><tbody>
@@ -2098,7 +2161,7 @@ function gerarRelatorioPendentes(){
     <h1>Relatório de Equipamentos Pendentes de Confirmação</h1>
     <h2>${esc(titulo)} · ${totalItens} item(ns) · gerado em ${hoje}</h2>
     ${grupos.length? grupos.map(([destId,lista])=>`
-      <h3>${ic('hard-hat')} ${esc(tecNome(destId))} — ${lista.length} item(ns)</h3>
+      <h3>${esc(tecNome(destId))} — ${lista.length} item(ns)</h3>
       <table><thead><tr><th>Nº Série</th><th>Tipo</th><th>De</th><th>Para</th><th>Enviado por</th><th>Data</th></tr></thead><tbody>
         ${lista.map(e=>`<tr><td>${esc(e.serie)}</td><td>${esc(tipoNome(e.tipo))}</td><td>${esc(e.transitoDe||'—')}</td><td>${esc(tecNome(destId))}</td><td>${esc(e.transitoUsuario||'—')}</td><td>${fmtTS(e.transitoDesde)}</td></tr>`).join('')}
       </tbody></table>`).join('') : '<p>Nenhuma pendência encontrada.</p>'}
@@ -2241,8 +2304,14 @@ function verTecItens(id){
 /* =========================================================
    HISTÓRICO
    ========================================================= */
-let histFiltro={ tipo:'', q:'' };
+// eqTipo/eqStatus/eqDep filtram pelo estado ATUAL do equipamento (resolvido pela série —
+// movimentações não guardam tipo/status/depósito próprios, só o snapshot de "de"/"para"
+// em texto). tec filtra pelo técnico envolvido na movimentação (tecnicoId OU tecnicoIdOrigem
+// — mesmo critério de "meu" usado na política de RLS de movimentacoes).
+let histFiltro={ tipo:'', q:'', eqTipo:'', eqStatus:'', eqDep:'', tec:'' };
 function renderHist(){
+  const deps = [...new Set(DB.equipamentos.map(e=>e.deposito).filter(Boolean))].sort();
+  const tecsOpt = agruparTecsPorFilialOpt([...DB.tecnicos].sort((a,b)=>a.nome.localeCompare(b.nome)), histFiltro.tec);
   $('#content').innerHTML = `
   <div class="toolbar">
     <div class="search"><span class="si">${ic('search')}</span><input placeholder="Buscar por nº de série..." value="${esc(histFiltro.q)}" oninput="histFiltro.q=this.value;renderHistTabela()"></div>
@@ -2250,15 +2319,50 @@ function renderHist(){
       <option value="">Todos os tipos de mov.</option>
       ${Object.entries(MOV_LABEL).map(([k,v])=>`<option value="${k}" ${histFiltro.tipo===k?'selected':''}>${v}</option>`).join('')}
     </select>
+    <select class="filter" onchange="histFiltro.eqTipo=this.value;renderHistTabela()">
+      <option value="">Todos os tipos</option>
+      ${Object.keys(DB.tipos).map(t=>`<option value="${t}" ${histFiltro.eqTipo===t?'selected':''}>${esc(tipoNome(t))}</option>`).join('')}
+    </select>
+    <select class="filter" onchange="histFiltro.eqStatus=this.value;renderHistTabela()">
+      <option value="">Todos os status</option>
+      ${Object.entries(STATUS).map(([k,v])=>`<option value="${k}" ${histFiltro.eqStatus===k?'selected':''}>${v}</option>`).join('')}
+    </select>
+    <select class="filter" onchange="histFiltro.eqDep=this.value;renderHistTabela()">
+      <option value="">Todos os depósitos</option>
+      ${deps.map(d=>`<option value="${d}" ${histFiltro.eqDep===d?'selected':''}>${esc(d)}</option>`).join('')}
+    </select>
+    <select class="filter" onchange="histFiltro.tec=this.value;renderHistTabela()">
+      <option value="">Todos os técnicos</option>
+      ${tecsOpt}
+    </select>
     <button class="btn" onclick="exportarHistCSV()">${ic('download')} Exportar CSV</button>
   </div>
   <div class="panel"><div class="ph"><h3>Histórico de movimentações</h3><span class="count-badge" id="histCount"></span></div>
     <div class="tbl-wrap" id="histTabela"></div></div>`;
   renderHistTabela();
 }
-function renderHistTabela(){
+// Aplica todos os filtros de Histórico atuais — reaproveitado pela tela e pela
+// exportação CSV, pra exportar sempre bater com o que está na tela.
+function historicoFiltrado(){
   const q=histFiltro.q.trim().toLowerCase();
-  const lista = DB.movimentacoes.filter(m=>(!histFiltro.tipo||m.tipo===histFiltro.tipo)&&(!q||m.serie.toLowerCase().includes(q))).reverse();
+  // eqTipo/eqStatus/eqDep olham o estado ATUAL do equipamento (achado pela série) — a
+  // movimentação em si não guarda essas 3 colunas, só "de"/"para" em texto livre.
+  return DB.movimentacoes.filter(m=>{
+    if(histFiltro.tipo && m.tipo!==histFiltro.tipo) return false;
+    if(q && !m.serie.toLowerCase().includes(q)) return false;
+    if(histFiltro.tec && m.tecnicoId!==histFiltro.tec && m.tecnicoIdOrigem!==histFiltro.tec) return false;
+    if(histFiltro.eqTipo || histFiltro.eqStatus || histFiltro.eqDep){
+      const e = acharEquipPorSerie(m.serie);
+      if(!e) return false;
+      if(histFiltro.eqTipo && e.tipo!==histFiltro.eqTipo) return false;
+      if(histFiltro.eqStatus && e.status!==histFiltro.eqStatus) return false;
+      if(histFiltro.eqDep && e.deposito!==histFiltro.eqDep) return false;
+    }
+    return true;
+  }).reverse();
+}
+function renderHistTabela(){
+  const lista = historicoFiltrado();
   $('#histCount') && ($('#histCount').textContent = lista.length+' registros');
   $('#histTabela').innerHTML = lista.length? tabelaMov(lista.slice(0,800)) : `<div class="empty"><div class="big">${ic('clock')}</div>Nenhuma movimentação registrada.</div>`;
 }
@@ -2926,7 +3030,7 @@ function exportarEquipCSV(){
 }
 function exportarHistCSV(){
   const head=['Data/Hora','Tipo','Nº Série','De','Para','Usuário','Obs'];
-  const linhas=[...DB.movimentacoes].reverse().map(m=>[fmtTS(m.ts),MOV_LABEL[m.tipo],m.serie,m.de,m.para,m.usuario,m.obs]);
+  const linhas=historicoFiltrado().map(m=>[fmtTS(m.ts),MOV_LABEL[m.tipo],m.serie,m.de,m.para,m.usuario,m.obs]);
   baixar('historico_movimentacoes.csv','﻿'+[csvLinha(head),...linhas.map(csvLinha)].join('\n'),'text/csv');
 }
 function exportarFilialExcel(){
@@ -2937,11 +3041,12 @@ function exportarFilialExcel(){
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Equipamentos');
   const sufixoTec = dashTecnicoFiltro ? '_'+tecNome(dashTecnicoFiltro) : '';
-  XLSX.writeFile(wb, 'equipamentos_'+(dashFiliais.length?dashFiliais.join('_'):'todas_filiais').replace(/[^\w-]+/g,'_')+sufixoTec.replace(/[^\w-]+/g,'_')+'_'+new Date().toISOString().slice(0,10)+'.xlsx');
+  const sufixoStatus = dashStatusFiltro ? '_'+(STATUS[dashStatusFiltro]||dashStatusFiltro) : '';
+  XLSX.writeFile(wb, 'equipamentos_'+(dashFiliais.length?dashFiliais.join('_'):'todas_filiais').replace(/[^\w-]+/g,'_')+sufixoTec.replace(/[^\w-]+/g,'_')+sufixoStatus.replace(/[^\w-]+/g,'_')+'_'+new Date().toISOString().slice(0,10)+'.xlsx');
 }
 function relatorioFilial(){
   const eq = dashboardFiltrado();
-  const titulo = (dashFiliais.length ? dashFiliais.join(', ') : 'Todas as filiais') + (dashTecnicoFiltro ? ' — '+tecNome(dashTecnicoFiltro) : '');
+  const titulo = (dashFiliais.length ? dashFiliais.join(', ') : 'Todas as filiais') + (dashTecnicoFiltro ? ' — '+tecNome(dashTecnicoFiltro) : '') + (dashStatusFiltro ? ' — '+(STATUS[dashStatusFiltro]||dashStatusFiltro) : '');
   const total=eq.length, emEstoque=eq.filter(e=>e.status==='estoque').length, comTec=eq.filter(e=>e.status==='com_tecnico').length, baixados=eq.filter(e=>e.status==='baixado').length;
   const porTipo={}; eq.forEach(e=>porTipo[e.tipo]=(porTipo[e.tipo]||0)+1);
   const porTec={}; eq.filter(e=>e.status==='com_tecnico').forEach(e=>{ const n=tecNome(e.tecnicoId); porTec[n]=(porTec[n]||0)+1; });
