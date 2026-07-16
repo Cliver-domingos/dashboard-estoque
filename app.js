@@ -123,10 +123,22 @@ function usuarioParaCamel(r){ return { uid:r.id, email:r.email, nome:r.nome, pap
 let loginModo = 'entrar'; // ou 'criar'
 function loginAlternar(){
   loginModo = loginModo==='entrar' ? 'criar' : 'entrar';
-  $('#loginSub').textContent = loginModo==='entrar' ? 'Entre com seu e-mail e senha' : 'Crie sua conta com e-mail e senha';
-  $('#loginBtn').textContent = loginModo==='entrar' ? 'Entrar' : 'Criar conta';
-  $('#loginAlternarLink').textContent = loginModo==='entrar' ? 'Criar conta' : 'Já tenho conta';
+  const criar = loginModo==='criar';
+  $('#loginSub').textContent = criar ? 'Crie sua conta com e-mail e senha' : 'Entre com seu e-mail e senha';
+  $('#loginBtn').textContent = criar ? 'Criar conta' : 'Entrar';
+  $('#loginAlternarLink').textContent = criar ? 'Já tenho conta' : 'Criar conta';
+  // Só no cadastro mostramos a exigência de senha forte — quem já tem conta antiga
+  // (senha de 6 dígitos, criada antes desta regra) não deve ser bloqueado ao entrar.
+  const inp = $('#loginSenha'); if(inp) inp.placeholder = criar ? 'Mínimo 8 caracteres, com letras e números' : 'Sua senha';
+  const hint = $('#loginSenhaHint'); if(hint) hint.style.display = criar ? 'block' : 'none';
   $('#loginErr').style.display='none';
+}
+// Força mínima da senha, exigida no CADASTRO (defesa em profundidade junto com a
+// política do Supabase Auth no servidor). Não se aplica ao login de contas já existentes.
+function validarForcaSenha(senha){
+  if((senha||'').length < 8) return 'A senha precisa ter ao menos 8 caracteres.';
+  if(!/[A-Za-z]/.test(senha) || !/[0-9]/.test(senha)) return 'A senha precisa ter letras e números.';
+  return null;
 }
 function loginErro(msg){ const e=$('#loginErr'); e.textContent=msg; e.style.display='block'; }
 function traduzirErroAuth(err){
@@ -145,6 +157,10 @@ function loginSubmit(){
   const email = $('#loginEmail').value.trim();
   const senha = $('#loginSenha').value;
   if(!email||!senha) return loginErro('Preencha e-mail e senha.');
+  if(loginModo==='criar'){
+    const fraca = validarForcaSenha(senha);
+    if(fraca) return loginErro(fraca);
+  }
   $('#loginErr').style.display='none';
   const acao = loginModo==='entrar'
     ? sb.auth.signInWithPassword({ email, password:senha })
@@ -3941,7 +3957,7 @@ function renderUsuarios(){
           </div>
           ${u.papel==='supervisor'?`
           <div class="field" style="margin:0;min-width:220px"><label>Filiais permitidas</label>
-            <button class="btn sm" onclick='abrirEditarFiliaisSupervisor(${JSON.stringify(u.uid)},${JSON.stringify(u.nome||u.email)},${JSON.stringify(u.regioes||[])})'>
+            <button class="btn sm" onclick="abrirEditarFiliaisSupervisor('${u.uid}')">
               ${ic('building-2')} ${(u.regioes||[]).length? (u.regioes||[]).length+' filial(is) — editar' : 'Nenhuma filial — editar'}
             </button>
           </div>`:''}
@@ -3952,7 +3968,7 @@ function renderUsuarios(){
               ${DB.tecnicos.map(t=>`<option value="${t.id}" ${u.tecnicoId===t.id?'selected':''}>${t.regiao?'['+esc(t.regiao)+'] ':''}${esc(t.nome)}</option>`).join('')}
             </select>
           </div>`:''}
-          <button class="btn sm red ghost" onclick="usuarioRemover('${u.uid}','${esc(u.email)}')">Remover</button>
+          <button class="btn sm red ghost" onclick="usuarioRemover('${u.uid}')">Remover</button>
         </div></div>`).join('')}
     </div>
   </div>`;
@@ -3974,7 +3990,15 @@ function usuarioAtualizarCampo(uid, campo, valor){
     if(error) flash(''+error.message,'red'); else flash('Atualizado','green');
   });
 }
-function abrirEditarFiliaisSupervisor(uid, nome, regioesAtuais){
+function abrirEditarFiliaisSupervisor(uid){
+  // Segurança (BUG-048): recebe SÓ o uid (UUID, sem caractere perigoso) e busca nome/
+  // regiões na lista já carregada — em vez de receber nome/regiões interpolados no HTML.
+  // Antes, o nome do usuário (controlável no cadastro) ia num onclick via JSON.stringify,
+  // que não escapa aspas simples nem HTML dentro de atributo → XSS armazenado.
+  const alvo = USUARIOS_LISTA.find(u=>u.uid===uid);
+  if(!alvo) return;
+  const nome = alvo.nome||alvo.email;
+  const regioesAtuais = alvo.regioes||[];
   const todas = todasFiliaisConhecidas();
   modal(ic('building-2')+' Filiais de '+esc(nome), `
     <p class="muted" style="margin-bottom:12px">Marque as filiais que esse supervisor pode acessar.</p>
@@ -3993,9 +4017,13 @@ function salvarFiliaisSupervisor(uid){
     if(error) flash(''+error.message,'red'); else { closeModal(); flash('Filiais atualizadas','green'); }
   });
 }
-function usuarioRemover(uid, email){
+function usuarioRemover(uid){
+  // Segurança (BUG-048): recebe só o uid e busca o e-mail na lista, em vez de recebê-lo
+  // interpolado no HTML do onclick (ver abrirEditarFiliaisSupervisor).
   const alvo = USUARIOS_LISTA.find(u=>u.uid===uid);
-  if(alvo && alvo.papel==='admin' && contarAdmins()<=1) return flash('Não é possível remover o único administrador do sistema. Promova outra pessoa a admin antes.','red');
+  if(!alvo) return;
+  if(alvo.papel==='admin' && contarAdmins()<=1) return flash('Não é possível remover o único administrador do sistema. Promova outra pessoa a admin antes.','red');
+  const email = alvo.email;
   if(!confirm('Remover o acesso de '+email+'? A pessoa poderá criar uma conta nova, mas terá que ser aprovada de novo.')) return;
   sb.from('usuarios').delete().eq('id',uid).then(({error})=>{
     if(error) flash(''+error.message,'red'); else flash('Usuário removido');

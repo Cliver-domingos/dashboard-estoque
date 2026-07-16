@@ -196,6 +196,16 @@
   .field input,.field select,.field textarea{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:var(--radius-md);background:var(--panel);color:var(--txt);transition:border-color var(--dur-fast) var(--ease),box-shadow var(--dur-fast) var(--ease)}
   .field input:focus,.field select:focus,.field textarea:focus{outline:none;border-color:var(--brand);box-shadow:var(--focus-ring)}
   .field .hint{font-size:var(--text-xs);color:var(--txt-soft);margin-top:4px}
+  /* Campo de senha com botão de mostrar/ocultar (olho) */
+  .senha-wrap{position:relative;display:flex;align-items:center}
+  .senha-wrap input{padding-right:44px}
+  .senha-olho{position:absolute;right:4px;top:50%;transform:translateY(-50%);display:flex;align-items:center;justify-content:center;width:34px;height:34px;padding:0;border:none;background:transparent;color:var(--txt-soft);cursor:pointer;border-radius:var(--radius-md)}
+  .senha-olho:hover{color:var(--txt);background:var(--panel-soft)}
+  .senha-olho:focus-visible{outline:none;box-shadow:var(--focus-ring)}
+  .senha-olho .olho{width:19px;height:19px}
+  .senha-olho .olho-off{display:none}
+  .senha-olho.ver .olho-on{display:none}
+  .senha-olho.ver .olho-off{display:block}
   .row2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
   .row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
 
@@ -364,7 +374,16 @@
     <div class="sub" id="loginSub">Entre com seu e-mail e senha</div>
     <div class="err" id="loginErr"></div>
     <div class="field"><label>E-mail</label><input id="loginEmail" type="email" placeholder="seuemail@empresa.com"></div>
-    <div class="field"><label>Senha</label><input id="loginSenha" type="password" placeholder="Mínimo 6 caracteres" onkeydown="if(event.key==='Enter')loginSubmit()"></div>
+    <div class="field"><label>Senha</label>
+      <div class="senha-wrap">
+        <input id="loginSenha" type="password" placeholder="Sua senha" onkeydown="if(event.key==='Enter')loginSubmit()">
+        <button type="button" class="senha-olho" aria-label="Mostrar senha" onclick="var i=document.getElementById('loginSenha');var m=i.type==='password';i.type=m?'text':'password';this.classList.toggle('ver',m);this.setAttribute('aria-label',m?'Ocultar senha':'Mostrar senha');i.focus();">
+          <svg class="olho olho-on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
+          <svg class="olho olho-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.88 9.88a3 3 0 1 0 4.24 4.24"/><path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68"/><path d="M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61"/><line x1="2" x2="22" y1="2" y2="22"/></svg>
+        </button>
+      </div>
+      <div class="hint" id="loginSenhaHint" style="display:none">Mínimo 8 caracteres, com letras e números.</div>
+    </div>
     <button class="btn primary" style="width:100%;justify-content:center" onclick="loginSubmit()" id="loginBtn">Entrar</button>
     <div class="switch">Ainda não tem conta? <a onclick="loginAlternar()" id="loginAlternarLink">Criar conta</a></div>
     <div class="switch"><a onclick="loginEsqueciSenha()">Esqueci minha senha</a></div>
