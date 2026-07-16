@@ -680,6 +680,16 @@ async function iniciarSyncNuvem(){
       const a = auditoriaParaCamel(payload.new);
       if(!DB.auditorias.some(x=>x.id===a.id)){ DB.auditorias.push(a); salvarLocal(); if(audsCarregadas) render(); }
     });
+  // BUG-047: empurra ANTES de puxar. Se o usuário mexeu em equipamentos offline (RMA,
+  // uso em campo) e fechou o app antes de reconectar, o diff pendente fica só no cache
+  // local (ultimoSyncEquip carregado do localStorage já reflete isso). Sem este push,
+  // iniciarListenerEquipamentos() logo abaixo busca a lista FRESCA do servidor e
+  // SOBRESCREVE DB.equipamentos + reconstrói ultimoSyncEquip a partir dela — como o
+  // servidor ainda tem o estado antigo, a mudança pendente é descartada em silêncio
+  // (o item "volta" pro estoque do técnico) mesmo já tendo sido feita de verdade.
+  // sincronizarEquipamentos() nunca lança (tem try/catch próprio), e é sempre seguro
+  // chamar aqui mesmo sem nada pendente (upsert vazio ou não faz nada).
+  await sincronizarEquipamentos();
   // iniciarListenerEquipamentos() encadeia mais 1-2 .on() no MESMO cadastrosCanalAtivo
   // (equipamentos também divide essa conexão) — por isso o .subscribe() só acontece
   // depois dela, nunca antes: todo listener precisa estar registrado antes de assinar.
