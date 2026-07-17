@@ -2367,21 +2367,38 @@ function renderHist(){
     <div class="tbl-wrap" id="histTabela"></div></div>`;
   renderHistTabela();
 }
+// Mapeia o TIPO da movimentação pro status que ELA PRÓPRIA produziu no equipamento —
+// usado pelo filtro de status do Histórico (BUG-049). 'saida'/'transferencia' ficam de
+// fora do mapa de propósito: são um estado PENDENTE (aguardando confirmação) — o campo
+// status do equipamento nem chega a mudar nessa hora (só muda quando confirmado, via
+// 'confirmacao'/'registro_campo'), então não corresponde de verdade a nenhum dos 4
+// status fixos; o mesmo vale pra 'cancelamento' (reverte o trânsito, não define um
+// status novo) e 'exclusao' (o item deixou de existir, não tem status). Essas ficam
+// visíveis só em "Todos os status", nunca num filtro de status específico.
+function movStatusResultante(m){
+  const MAPA = { entrada:'estoque', retorno_rma:'estoque', confirmacao:'com_tecnico', registro_campo:'com_tecnico', baixa:'baixado', uso_campo:'instalado' };
+  return MAPA[m.tipo] || null;
+}
 // Aplica todos os filtros de Histórico atuais — reaproveitado pela tela e pela
 // exportação CSV, pra exportar sempre bater com o que está na tela.
 function historicoFiltrado(){
   const q=histFiltro.q.trim().toLowerCase();
-  // eqTipo/eqStatus/eqDep olham o estado ATUAL do equipamento (achado pela série) — a
-  // movimentação em si não guarda essas 3 colunas, só "de"/"para" em texto livre.
+  // eqTipo/eqDep olham o estado ATUAL do equipamento (achado pela série) — são
+  // propriedades que não mudam a cada movimentação (tipo nunca muda; depósito raramente).
+  // eqStatus é diferente: olha o status que A PRÓPRIA movimentação produziu (ver
+  // movStatusResultante), não o status atual do equipamento — senão filtrar por status
+  // trazia a VIDA INTEIRA do item (toda idas a campo/RMA de meses atrás de um item que
+  // hoje só por acaso está "Em estoque"), em vez de só as movimentações daquele status
+  // (achado ao vivo pelo usuário, BUG-049).
   return DB.movimentacoes.filter(m=>{
     if(histFiltro.tipo && m.tipo!==histFiltro.tipo) return false;
     if(q && !m.serie.toLowerCase().includes(q)) return false;
     if(histFiltro.tec && m.tecnicoId!==histFiltro.tec && m.tecnicoIdOrigem!==histFiltro.tec) return false;
-    if(histFiltro.eqTipo || histFiltro.eqStatus || histFiltro.eqDep){
+    if(histFiltro.eqStatus && movStatusResultante(m)!==histFiltro.eqStatus) return false;
+    if(histFiltro.eqTipo || histFiltro.eqDep){
       const e = acharEquipPorSerie(m.serie);
       if(!e) return false;
       if(histFiltro.eqTipo && e.tipo!==histFiltro.eqTipo) return false;
-      if(histFiltro.eqStatus && e.status!==histFiltro.eqStatus) return false;
       if(histFiltro.eqDep && e.deposito!==histFiltro.eqDep) return false;
     }
     return true;
@@ -3292,9 +3309,12 @@ async function limparTudo(){
 /* =========================================================
    KARDEX — histórico completo de um item
    ========================================================= */
-function abrirKardex(serie){
+async function abrirKardex(serie){
   const e=DB.equipamentos.find(x=>x.serie===serie);
   const movs=DB.movimentacoes.filter(m=>m.serie===serie);
+  // Bucket privado — resolve URL assinada (temporária) só na hora de mostrar,
+  // nunca guarda link público fixo (ver enviarFotosRetirada/resolverUrlsFotos).
+  const urlsFotos = await resolverUrlsFotos(movs.flatMap(m=>m.fotos||[]));
   const ent = e? `<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px">
       <span class="tag-tipo" style="border-left:3px solid ${tipoCor(e.tipo)}">${esc(tipoNome(e.tipo))}</span>
       <span class="badge ${e.status}">${STATUS[e.status]}</span>
@@ -3308,7 +3328,7 @@ function abrirKardex(serie){
           <div style="display:flex;gap:8px;align-items:center">${movBadge(m.tipo)}<span class="muted" style="font-size:11.5px">${fmtTS(m.ts)}</span></div>
           <div style="margin-top:3px;font-size:13px">${esc(m.de||'—')} → <b>${esc(m.para||'—')}</b></div>
           ${m.usuario||m.obs?`<div class="muted" style="font-size:11.5px;margin-top:2px">${esc(m.usuario||'')}${m.obs?' · '+esc(m.obs):''}</div>`:''}
-          ${m.fotos&&m.fotos.length?`<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">${m.fotos.map(u=>`<a href="${u}" target="_blank"><img src="${u}" style="width:56px;height:56px;object-fit:cover;border-radius:7px;border:1px solid var(--line)"></a>`).join('')}</div>`:''}
+          ${m.fotos&&m.fotos.length?`<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">${m.fotos.filter(c=>urlsFotos[c]).map(c=>`<a href="${urlsFotos[c]}" target="_blank"><img src="${urlsFotos[c]}" style="width:56px;height:56px;object-fit:cover;border-radius:7px;border:1px solid var(--line)"></a>`).join('')}</div>`:''}
         </div>
       </div>`).join('') : '<div class="empty">Nenhuma movimentação registrada para este item.</div>';
   modal('Kardex · <span class="mono">'+esc(serie)+'</span>', ent+`<div style="max-height:380px;overflow:auto">${linha}</div>`, '', 'lg');
@@ -3669,6 +3689,72 @@ function recBipar(){
 }
 /* ---- Registro de retirada em campo (manutenção/desinstalação) ---- */
 let formSel = [];
+// Comprime a foto no navegador ANTES de enviar pro Storage — só se o arquivo for grande
+// (>1MB); fotos já leves (testado com o usuário: câmera de celular moderna gera ~50-60KB
+// pra esse tipo de foto, por causa das superfícies lisas dos equipamentos) sobem como
+// estão, sem perder nitidez à toa. Usa createImageBitmap com correção de orientação EXIF
+// (senão foto de celular sobe rotacionada — bug clássico). Redimensiona pro maior lado no
+// máximo 1600px e reencoda em JPEG qualidade 0.72 — configuração validada visualmente com
+// o usuário comparando original x comprimida antes de decidir (16/07/2026).
+const FOTO_LIMIAR_COMPRIMIR = 1024*1024; // 1 MB
+async function prepararFotoParaUpload(file){
+  if(file.size <= FOTO_LIMIAR_COMPRIMIR) return file; // já é leve, sobe como está
+  let bitmap;
+  try{ bitmap = await createImageBitmap(file, {imageOrientation:'from-image'}); }
+  catch(e){ return file; } // não conseguiu decodificar (formato raro) — sobe o original
+  const maxDim = 1600;
+  let w = bitmap.width, h = bitmap.height;
+  if(Math.max(w,h) > maxDim){ const s = maxDim/Math.max(w,h); w = Math.round(w*s); h = Math.round(h*s); }
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(bitmap, 0, 0, w, h);
+  const blob = await new Promise(r=>canvas.toBlob(r, 'image/jpeg', 0.72));
+  return blob || file;
+}
+function extensaoDeFoto(file){
+  const t = (file.type||'').toLowerCase();
+  if(t.includes('png')) return 'png';
+  if(t.includes('webp')) return 'webp';
+  return 'jpg';
+}
+// Envia as fotos selecionadas pro bucket privado 'fotos-retirada', dentro da pasta do
+// técnico (a RLS de Storage exige que o 1º segmento do caminho seja o próprio
+// tecnico_id — ver supabase/rls_policies.sql). Retorna os CAMINHOS que subiram com
+// sucesso (não URLs — o bucket é privado, a exibição resolve URL assinada só na hora
+// de mostrar). Uma falha isolada de upload não trava a retirada inteira: o item só sobe
+// sem aquela foto (a ação de negócio — reivindicar o equipamento — importa mais que a
+// evidência fotográfica).
+async function enviarFotosRetirada(tecnicoId, codigoRetirada){
+  const caminhos = [];
+  for(let i=0;i<formFotos.length;i++){
+    const original = formFotos[i].file;
+    try{
+      const pronto = await prepararFotoParaUpload(original);
+      const ext = extensaoDeFoto(original);
+      const caminho = tecnicoId+'/'+codigoRetirada+'/'+Date.now()+'-'+i+'.'+ext;
+      const { error } = await sb.storage.from('fotos-retirada').upload(caminho, pronto, { contentType: pronto.type||original.type||'image/jpeg' });
+      if(error) throw error;
+      caminhos.push(caminho);
+    }catch(e){ flash('Falha ao enviar uma das fotos: '+e.message,'red'); }
+  }
+  return caminhos;
+}
+// Resolve caminhos do Storage (bucket privado) pra URLs assinadas temporárias, só na
+// hora de EXIBIR — nunca guardamos link público fixo (mantém a mesma postura de
+// privacidade endurecida na auditoria de segurança de 16/07/2026). 1h de validade é de
+// sobra pra olhar a foto numa tela/modal já aberta.
+async function resolverUrlsFotos(caminhos){
+  const unicos = [...new Set((caminhos||[]).filter(Boolean))];
+  if(!unicos.length) return {};
+  try{
+    const { data, error } = await sb.storage.from('fotos-retirada').createSignedUrls(unicos, 3600);
+    if(error || !data) return {};
+    const mapa = {};
+    data.forEach(d=>{ if(d.signedUrl) mapa[d.path]=d.signedUrl; });
+    return mapa;
+  }catch(e){ return {}; }
+}
 let formFotos = []; // { file, url } - url é local (blob) até o envio
 // Como o técnico agora só carrega localmente os itens dele, esse cache guarda o resultado
 // de consultas ao servidor pra reconhecer itens de OUTROS técnicos (pro aviso funcionar de novo).
@@ -3785,6 +3871,10 @@ async function confirmarRegistrarForm(){
   let codigoRetirada;
   try{ codigoRetirada = await proximoCodigoRetirada(); }
   catch(err){ if(btn){ btn.disabled=false; btn.textContent='Registrar ('+formSel.length+')'; } return flash('Falha ao gerar código: '+err.message,'red'); }
+
+  if(btn) btn.textContent='Enviando fotos...';
+  const fotosCaminhos = formFotos.length ? await enviarFotosRetirada(t.id, codigoRetirada) : [];
+
   if(btn) btn.textContent='Registrando...';
 
   // Cada item passa pela função registrar_retirada_campo() no banco — ela roda com
@@ -3802,7 +3892,8 @@ async function confirmarRegistrarForm(){
     try{
       const { data, error } = await sb.rpc('registrar_retirada_campo', {
         p_serie:serie, p_codigo:codigoRetirada, p_tipo:tipoNovo, p_os:null,
-        p_obs:obsCombinada, p_de:de, p_para:para, p_usuario:nomeUsuarioAtual()
+        p_obs:obsCombinada, p_de:de, p_para:para, p_usuario:nomeUsuarioAtual(),
+        p_fotos:fotosCaminhos
       });
       if(error) throw error;
       resp = data;
@@ -3819,7 +3910,7 @@ async function confirmarRegistrarForm(){
       e.status='com_tecnico'; e.tecnicoId=t.id; e.local=para; e.confirmado=true; e.emTransito=false; e.transitoPara=null; e.transitoDesde=null; e.transitoDe=null; e.desde=Date.now();
     }
     if(souTecnico()){ delete equipsIncomingMap[e.serie]; equipsOwnMap[e.serie]=e; } // já é meu agora, atualiza os mapas na hora
-    DB.movimentacoes.push({ id:resp.movimentacao_id, ts:Date.now(), tipo:'registro_campo', serie, de, para, tecnicoId:t.id, usuario:nomeUsuarioAtual(), obs:obsCombinada, fotos:[], retiradaId:codigoRetirada, temFotosLocais });
+    DB.movimentacoes.push({ id:resp.movimentacao_id, ts:Date.now(), tipo:'registro_campo', serie, de, para, tecnicoId:t.id, usuario:nomeUsuarioAtual(), obs:obsCombinada, fotos:fotosCaminhos, retiradaId:codigoRetirada, temFotosLocais });
     n++;
   }
   formFotos.forEach(f=>URL.revokeObjectURL(f.url)); formFotos=[];
@@ -3828,7 +3919,7 @@ async function confirmarRegistrarForm(){
     <div style="text-align:center;padding:10px 0">
       <div class="muted" style="font-size:12.5px;margin-bottom:6px">Código desta retirada</div>
       <div style="font-size:32px;font-weight:800;color:var(--brand);letter-spacing:1px;margin-bottom:14px">${codigoRetirada}</div>
-      <p class="muted" style="max-width:380px;margin:0 auto 6px">${n} equipamento(s) registrado(s).${temFotosLocais?' Salve as fotos no seu celular usando esse código no nome do arquivo (ex.: '+codigoRetirada+'-1.jpg) para conseguir encontrá-las depois.':''}</p>
+      <p class="muted" style="max-width:380px;margin:0 auto 6px">${n} equipamento(s) registrado(s).${fotosCaminhos.length?' '+fotosCaminhos.length+' foto(s) enviada(s) com segurança.':(temFotosLocais?' As fotos selecionadas não puderam ser enviadas — verifique a conexão e tente registrar de novo se precisar delas.':'')}</p>
     </div>`, `<button class="btn primary" style="width:100%;justify-content:center" onclick="closeModal()">Entendi</button>`, '');
 }
 function confirmarRecebimento(serie, semConfirm){
@@ -3860,7 +3951,7 @@ function renderMeuHistorico(){
 function listaRetiradas(){
   const porId = {};
   DB.movimentacoes.filter(m=>m.tipo==='registro_campo' && m.retiradaId).forEach(m=>{
-    if(!porId[m.retiradaId]) porId[m.retiradaId] = { codigo:m.retiradaId, ts:m.ts, tecnicoId:m.tecnicoId, usuario:m.usuario, obs:m.obs, temFotosLocais:m.temFotosLocais, itens:[] };
+    if(!porId[m.retiradaId]) porId[m.retiradaId] = { codigo:m.retiradaId, ts:m.ts, tecnicoId:m.tecnicoId, usuario:m.usuario, obs:m.obs, temFotosLocais:m.temFotosLocais, fotos:m.fotos||[], itens:[] };
     porId[m.retiradaId].itens.push(m.serie);
   });
   let lista = Object.values(porId).sort((a,b)=>b.ts-a.ts);
@@ -3892,11 +3983,17 @@ function renderRetiradasLista(){
             <div class="muted" style="font-size:12px">${esc(r.obs||'—')} · ${r.itens.length} item(ns)</div>
           </div>
           <div class="muted" style="font-size:11.5px">${fmtTS(r.ts)}</div>
-          ${r.temFotosLocais?`<span class="badge" style="background:var(--amber-soft);color:var(--amber)">${ic('camera')} tem foto local</span>`:''}
+          ${r.fotos&&r.fotos.length?`<span class="badge" style="background:var(--amber-soft);color:var(--amber)">${ic('camera')} ${r.fotos.length} foto(s)</span>`:(r.temFotosLocais?`<span class="badge" style="background:var(--amber-soft);color:var(--amber)">${ic('camera')} tem foto local</span>`:'')}
         </div></div>`).join('') : '<div class="empty"><div class="big">'+ic('search')+'</div>Nenhuma retirada encontrada.</div>';
 }
-function verRetirada(codigo){
+async function verRetirada(codigo){
   const r = listaRetiradas().find(x=>x.codigo===codigo); if(!r) return;
+  const urlsFotos = await resolverUrlsFotos(r.fotos);
+  const galeriaFotos = r.fotos&&r.fotos.length
+    ? `<div class="field"><label>${ic('camera')} Fotos de comprovação</label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">${r.fotos.filter(c=>urlsFotos[c]).map(c=>`<a href="${urlsFotos[c]}" target="_blank"><img src="${urlsFotos[c]}" style="width:72px;height:72px;object-fit:cover;border-radius:8px;border:1px solid var(--line)"></a>`).join('')}</div>
+      </div>`
+    : (r.temFotosLocais?`<div class="badge com_tecnico" style="padding:8px 12px;margin-bottom:14px">${ic('camera')} Fotos ficaram salvas só no celular do técnico (registradas antes do envio pra nuvem)</div>`:'');
   modal(ic('search')+' Retirada '+esc(codigo), `
     <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px">
       <span class="badge blue" style="padding:8px 12px">${ic('hard-hat')} ${esc(tecNome(r.tecnicoId))}</span>
@@ -3904,7 +4001,7 @@ function verRetirada(codigo){
       <span class="badge gray" style="padding:8px 12px">Registrado por ${esc(r.usuario||'—')}</span>
     </div>
     <p class="muted" style="margin-bottom:14px">${esc(r.obs||'Sem observação.')}</p>
-    ${r.temFotosLocais?`<div class="badge com_tecnico" style="padding:8px 12px;margin-bottom:14px">${ic('camera')} Fotos foram tiradas no momento do registro e ficam salvas no celular do técnico, organizadas pelo código ${esc(codigo)}</div>`:''}
+    ${galeriaFotos}
     <div class="tbl-wrap" style="max-height:320px"><table><thead><tr><th>Nº Série</th><th>Tipo</th></tr></thead><tbody>
       ${r.itens.map(serie=>{ const e=DB.equipamentos.find(x=>x.serie===serie); return `<tr>
         <td class="mono"><a href="#" onclick="abrirKardex('${esc(serie)}');return false"><b>${esc(serie)}</b></a></td>
