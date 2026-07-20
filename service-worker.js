@@ -62,7 +62,15 @@ self.addEventListener('fetch', event => {
   if (!mesmaOrigem && !cdnConhecido) return;
 
   event.respondWith(
-    fetch(req)
+    // cache:'no-store' é essencial aqui: sem isso, o fetch() ainda pode ser
+    // respondido pelo cache HTTP comum do navegador/GitHub Pages (Cache-Control
+    // do próprio servidor), então "rede-primeiro" na prática virava "cache do
+    // navegador primeiro" — o Cache API (linha abaixo) nunca era o problema,
+    // era essa camada mais baixa que nem chegava a bater no servidor de novo.
+    // Achado ao vivo (20/07/2026): usuário confirmou upload novo do app.js,
+    // dado já validado certo no banco, mas o celular seguia servindo a versão
+    // antiga — sintoma clássico de resposta HTTP em cache mascarando o deploy.
+    fetch(req, { cache: 'no-store' })
       .then(res => {
         const copia = res.clone();
         caches.open(CACHE_NAME).then(cache => cache.put(req, copia));
