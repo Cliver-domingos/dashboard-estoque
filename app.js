@@ -4005,7 +4005,7 @@ function renderMeusItens(){
     <div class="tbl-wrap">${
       confirmados.length? `<table><thead><tr><th>Nº Série</th><th>Tipo</th><th>Há quanto tempo</th></tr></thead><tbody>
         ${confirmados.map(e=>`<tr>
-          <td class="mono"><b>${esc(e.serie)}</b></td>
+          <td class="mono"><b>${esc(e.serie)}</b>${e.tipo==='Chip'&&e.operadora?` <span class="tag-tipo" style="background:var(--brand-soft);color:var(--brand-d)">${esc(e.operadora)}</span>`:''}</td>
           <td><span class="tag-tipo" style="border-left:3px solid ${tipoCor(e.tipo)}">${esc(tipoNome(e.tipo))}</span></td>
           <td>${fmtDias(diasEmPosse(e))} ${(diasEmPosse(e)||0)>=DIAS_PARADO?`<span class="badge com_tecnico" style="font-size:10px">parado</span>`:''}</td>
         </tr>`).join('')}</tbody></table>`
