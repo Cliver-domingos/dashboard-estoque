@@ -74,7 +74,8 @@ function equipamentoParaCamel(r){
     rmaTecnicoId:r.rma_tecnico_id, rmaDeposito:r.rma_deposito,
     rmaDesde:tsToMs(r.rma_desde), rmaOS:r.rma_os, cenarioTeste:r.cenario_teste,
     instaladoTecnicoId:r.instalado_tecnico_id, instaladoOS:r.instalado_os,
-    instaladoDesde:tsToMs(r.instalado_desde)
+    instaladoDesde:tsToMs(r.instalado_desde),
+    operadora:r.operadora, numeroLinha:r.numero_linha
   };
 }
 function equipamentoParaSnake(e){
@@ -89,7 +90,8 @@ function equipamentoParaSnake(e){
     rma_tecnico_id:e.rmaTecnicoId||null, rma_deposito:e.rmaDeposito||null,
     rma_desde:msToTs(e.rmaDesde), rma_os:e.rmaOS||null, cenario_teste:!!e.cenarioTeste,
     instalado_tecnico_id:e.instaladoTecnicoId||null, instalado_os:e.instaladoOS||null,
-    instalado_desde:msToTs(e.instaladoDesde)
+    instalado_desde:msToTs(e.instaladoDesde),
+    operadora:e.operadora||null, numero_linha:e.numeroLinha||null
   };
 }
 function movimentacaoParaCamel(r){
@@ -240,12 +242,12 @@ sb.auth.onAuthStateChange((event, session)=>{
     $('#loginBg').style.display='none';
     $('#pendingBg').style.display='none';
     const chaveDoUsuario = STORE_KEY_BASE+'_'+user.id;
-    if(STORE_KEY!==chaveDoUsuario){ STORE_KEY=chaveDoUsuario; DB=carregar(); ultimoSyncEquip=carregarUltimoSyncEquip(); }
+    if(STORE_KEY!==chaveDoUsuario){ STORE_KEY=chaveDoUsuario; DB=carregar(); ultimoSyncEquip=carregarUltimoSyncEquip(); invalidarConexaoRetiradasOffline(); }
     carregarPerfil(user);
   } else {
     if(perfilCanalAtivo){ sb.removeChannel(perfilCanalAtivo); perfilCanalAtivo=null; }
     if(cadastrosCanalAtivo){ sb.removeChannel(cadastrosCanalAtivo); cadastrosCanalAtivo=null; }
-    MEU_PERFIL = null; syncIniciado=false; STORE_KEY=STORE_KEY_BASE;
+    MEU_PERFIL = null; syncIniciado=false; STORE_KEY=STORE_KEY_BASE; invalidarConexaoRetiradasOffline();
     equipsCarregados=false; movsCarregadas=false; audsCarregadas=false;
     $('#loginBg').style.display='flex';
     $('#pendingBg').style.display='none';
@@ -300,7 +302,7 @@ function lerFilaOffline(){
 }
 function gravarFilaOffline(fila){
   try{ localStorage.setItem(filaOfflineKey(), JSON.stringify(fila)); }catch(e){}
-  atualizarIndicadorFilaOffline(fila.length);
+  atualizarIndicadorSincronizacao();
 }
 function enfileirarOffline(tipo, payload){
   const fila = lerFilaOffline();
@@ -317,10 +319,25 @@ function pareceFalhaDeConexao(error){
   const msg = (error.message||'').toLowerCase();
   return msg.includes('fetch')||msg.includes('network')||msg.includes('load failed')||!msg;
 }
-function atualizarIndicadorFilaOffline(n){
-  const el = document.getElementById('footSync');
-  if(!el) return;
-  if(n>0) el.innerHTML = `${ic('alert-triangle')} ${n} alteração${n>1?'ões':''} salva${n>1?'s':''} só neste aparelho<br>Reconectando automaticamente...`;
+// Uma ÚNICA função escrevendo em #footSync, considerando as duas filas offline
+// (movimentações/auditorias E retiradas em campo, ver bloco IndexedDB abaixo) — evita
+// que uma sobrescreva a mensagem da outra no mesmo ciclo de reconexão (achado no
+// planejamento do offline de retiradas, 17/07/2026). Fila de movimentações tem
+// prioridade de exibição (é a mais antiga/geral); se ela estiver vazia mas houver
+// retirada pendente, mostra a mensagem de retirada; só mostra "sincronizado" quando as
+// duas estiverem vazias.
+function atualizarIndicadorSincronizacao(){
+  const foot = document.getElementById('footSync');
+  if(!foot) return;
+  const nFila = lerFilaOffline().length;
+  const nRetiradas = seriesPendentesRetiradaOffline.size;
+  if(nFila>0){
+    foot.innerHTML = `${ic('alert-triangle')} ${nFila} alteração${nFila>1?'ões':''} salva${nFila>1?'s':''} só neste aparelho<br>Reconectando automaticamente...`;
+  } else if(nRetiradas>0){
+    foot.innerHTML = `${ic('alert-triangle')} ${nRetiradas} ite${nRetiradas>1?'ns':'m'} de retirada salvo${nRetiradas>1?'s':''} só neste aparelho<br>Reconectando automaticamente...`;
+  } else {
+    foot.innerHTML = 'Sincronizado com a nuvem '+ic('cloud')+'<br>Faça backup em <b>Dados</b>.';
+  }
 }
 async function tentarEsvaziarFilaOffline(){
   // Guarda pra não tentar sincronizar nada antes do login resolver, ou com conta
@@ -352,13 +369,193 @@ async function tentarEsvaziarFilaOffline(){
   sincronizarTecnicos().catch(()=>{});
   sincronizarConfig().catch(()=>{});
   persistirEquipamentos();
-  if(!lerFilaOffline().length){
-    const foot = document.getElementById('footSync');
-    if(foot) foot.innerHTML = 'Sincronizado com a nuvem '+ic('cloud')+'<br>Faça backup em <b>Dados</b>.';
-  }
+  // Drena também a fila de "Registrar retirada em campo" (bloco IndexedDB logo abaixo)
+  // no mesmo gatilho — evita registrar um segundo listener/timer de polling.
+  await tentarEsvaziarFilaRetiradas().catch(()=>{});
+  atualizarIndicadorSincronizacao();
 }
 window.addEventListener('online', tentarEsvaziarFilaOffline);
 setInterval(()=>{ if(navigator.onLine) tentarEsvaziarFilaOffline(); }, 30000);
+
+/* =========================================================
+   FILA OFFLINE DE "REGISTRAR RETIRADA EM CAMPO" (IndexedDB) — plano offline,
+   17/07/2026. A fila acima (localStorage) só serve INSERT simples em
+   movimentacoes/auditorias; retirada em campo depende de DUAS RPCs privilegiadas
+   (registrar_retirada_campo, e o código agora é gerado localmente — ver
+   gerarCodigoRetiradaLocal) e de upload de fotos (binário — localStorage não serve,
+   por isso IndexedDB). Banco FISICAMENTE SEPARADO por conta (mesmo espírito do
+   BUG-020, levado ao extremo: em vez de filtrar registros por uid dentro de um banco
+   compartilhado, cada conta abre o seu próprio banco IndexedDB).
+   ========================================================= */
+let _dbRetiradasOfflineConn = null;
+let _dbRetiradasOfflineStoreKey = null; // detecta troca de conta (ver os 2 pontos que reatribuem STORE_KEY)
+function dbRetiradasOfflineNome(){ return STORE_KEY+'_retiradas_offline_db'; }
+function invalidarConexaoRetiradasOffline(){ _dbRetiradasOfflineConn = null; _dbRetiradasOfflineStoreKey = null; }
+function abrirDbRetiradasOffline(){
+  if(_dbRetiradasOfflineConn && _dbRetiradasOfflineStoreKey===STORE_KEY) return Promise.resolve(_dbRetiradasOfflineConn);
+  return new Promise((resolve, reject)=>{
+    const req = indexedDB.open(dbRetiradasOfflineNome(), 1);
+    req.onupgradeneeded = ()=>{ if(!req.result.objectStoreNames.contains('pendentes')) req.result.createObjectStore('pendentes', {keyPath:'codigo'}); };
+    req.onsuccess = ()=>{ _dbRetiradasOfflineConn = req.result; _dbRetiradasOfflineStoreKey = STORE_KEY; resolve(req.result); };
+    req.onerror = ()=>reject(req.error);
+  });
+}
+async function salvarRetiradaOffline(registro){
+  const db = await abrirDbRetiradasOffline();
+  return new Promise((resolve, reject)=>{
+    const tx = db.transaction('pendentes','readwrite');
+    tx.objectStore('pendentes').put(registro);
+    tx.oncomplete = ()=>resolve();
+    tx.onerror = ()=>reject(tx.error);
+  });
+}
+async function listarRetiradasOffline(){
+  const db = await abrirDbRetiradasOffline();
+  return new Promise((resolve, reject)=>{
+    const req = db.transaction('pendentes','readonly').objectStore('pendentes').getAll();
+    req.onsuccess = ()=>resolve(req.result||[]);
+    req.onerror = ()=>reject(req.error);
+  });
+}
+// Read-modify-write — evita corrida entre a drenagem (rodando em background) e um
+// registro novo sendo criado ao mesmo tempo. `mutador(atual)` devolve o registro
+// atualizado, ou null/undefined pra remover o registro inteiro (todos os itens já
+// concluídos/descartados).
+async function atualizarRetiradaOffline(codigo, mutador){
+  const db = await abrirDbRetiradasOffline();
+  return new Promise((resolve, reject)=>{
+    const tx = db.transaction('pendentes','readwrite');
+    const store = tx.objectStore('pendentes');
+    const req = store.get(codigo);
+    req.onsuccess = ()=>{
+      const atual = req.result;
+      if(!atual){ resolve(null); return; }
+      const novo = mutador(atual);
+      if(novo) store.put(novo); else store.delete(codigo);
+      tx.oncomplete = ()=>resolve(novo||null);
+      tx.onerror = ()=>reject(tx.error);
+    };
+    req.onerror = ()=>reject(req.error);
+  });
+}
+async function removerRetiradaOffline(codigo){
+  const db = await abrirDbRetiradasOffline();
+  return new Promise((resolve, reject)=>{
+    const tx = db.transaction('pendentes','readwrite');
+    tx.objectStore('pendentes').delete(codigo);
+    tx.oncomplete = ()=>resolve();
+    tx.onerror = ()=>reject(tx.error);
+  });
+}
+
+// Conjunto de séries com retirada pendente de sincronizar — consultado de forma
+// SÍNCRONA dentro de sincronizarEquipamentos() (não dá pra esperar o IndexedDB abrir
+// no meio do diff-sync), por isso vive em memória com espelho em localStorage (mesma
+// convenção de filaOfflineKey), reconstruído a partir do IndexedDB (fonte da verdade)
+// uma vez no boot via carregarRetiradasOfflinePendentes().
+let seriesPendentesRetiradaOffline = new Set();
+function chaveSeriesPendentesRetirada(){ return STORE_KEY+'_series_pendentes_retirada'; }
+function salvarSeriesPendentesRetiradaLocalStorage(){
+  try{ localStorage.setItem(chaveSeriesPendentesRetirada(), JSON.stringify([...seriesPendentesRetiradaOffline])); }catch(e){}
+}
+function carregarSeriesPendentesRetiradaLocalStorage(){
+  try{ const r = localStorage.getItem(chaveSeriesPendentesRetirada()); return r? new Set(JSON.parse(r)) : new Set(); }catch(e){ return new Set(); }
+}
+function marcarSeriePendenteRetiradaOffline(serie){ seriesPendentesRetiradaOffline.add(serie); salvarSeriesPendentesRetiradaLocalStorage(); }
+function desmarcarSeriePendenteRetiradaOffline(serie){ seriesPendentesRetiradaOffline.delete(serie); salvarSeriesPendentesRetiradaLocalStorage(); }
+function serieEstaPendenteRetiradaOffline(serie){ return seriesPendentesRetiradaOffline.has(serie); }
+
+// Chamada uma vez no boot (iniciarSyncNuvem) — recupera do localStorage na hora
+// (síncrono, disponível de imediato) e depois reconstrói com precisão total a partir
+// do IndexedDB (que é a fonte da verdade; localStorage é só um cache rápido dele).
+async function carregarRetiradasOfflinePendentes(){
+  seriesPendentesRetiradaOffline = carregarSeriesPendentesRetiradaLocalStorage();
+  try{
+    const registros = await listarRetiradasOffline();
+    const seriesReal = new Set();
+    registros.forEach(r=> (r.itens||[]).forEach(it=>{ if(it.status==='pendente'||it.status==='erro'||it.status==='conflito') seriesReal.add(it.serie); }));
+    seriesPendentesRetiradaOffline = seriesReal;
+    salvarSeriesPendentesRetiradaLocalStorage();
+  }catch(e){ /* IndexedDB pode falhar (modo privado, quota etc.) — mantém o que veio do localStorage */ }
+  atualizarIndicadorSincronizacao();
+}
+
+// Compara o estado do equipamento no momento em que o técnico registrou a retirada
+// OFFLINE (snapshotAntes, capturado localmente na hora) contra o estado REAL atual do
+// servidor — se algo relevante mudou por causa de OUTRA PESSOA nesse meio tempo, é
+// conflito e não deve ser aplicado silenciosamente (decisão explícita do usuário: nunca
+// aplicar sem confirmação). meuTecnicoId identifica "eu mesmo" pra não acusar conflito
+// quando o dono atual já sou eu (ex.: outra sessão/aba já sincronizou esse item).
+function detectarConflitoRetiradaOffline(snapshotAntes, atual, meuTecnicoId){
+  if(atual && atual.tecnicoId===meuTecnicoId && atual.status==='com_tecnico') return null; // já é meu, sem conflito
+  if(!snapshotAntes){
+    // Técnico achou que era item NOVO (nunca visto antes, offline) — se o servidor já
+    // tem esse item, é porque OUTRO técnico também o registrou enquanto os dois
+    // estavam offline (o cenário de "dois técnicos offline ao mesmo tempo" aplicado à
+    // reivindicação do equipamento, não só ao código).
+    return atual ? { motivo:'item_novo_ja_existe', atual } : null;
+  }
+  if(!atual) return { motivo:'item_sumiu_do_servidor', atual:null }; // excluído por alguém nesse meio tempo
+  const mudouDono = atual.tecnicoId !== snapshotAntes.tecnicoId;
+  const mudouStatus = atual.status !== snapshotAntes.status;
+  if(mudouDono || mudouStatus) return { motivo:'estado_mudou', atual };
+  return null;
+}
+
+// Drenagem da fila de retiradas — chamada de dentro de tentarEsvaziarFilaOffline()
+// (mesmo gatilho: evento 'online' + timer de 30s), sem registrar um segundo listener.
+// Por item PENDENTE (nunca mexe em item já 'conflito' — esses só avançam pela tela de
+// revisão, ver abrirRetiradasOfflinePendentes): busca o estado autoritativo do
+// servidor, checa conflito, e só chama a RPC de verdade se não houver conflito.
+async function tentarEsvaziarFilaRetiradas(){
+  if(!navigator.onLine || !MEU_PERFIL || MEU_PERFIL.papel==='pendente') return;
+  let registros;
+  try{ registros = await listarRetiradasOffline(); }catch(e){ return; } // IndexedDB indisponível — desiste silenciosamente, tenta no próximo ciclo
+  for(const registro of registros){
+    let mudou = false;
+    for(const item of registro.itens){
+      if(item.status!=='pendente' && item.status!=='erro') continue; // 'conflito'/'concluido' não avançam aqui
+      let atual = null;
+      try{ const { data } = await sb.from('equipamentos').select('*').eq('serie', item.serie).maybeSingle(); atual = data ? equipamentoParaCamel(data) : null; }
+      catch(e){ continue; } // sem conexão de verdade agora — tenta de novo no próximo ciclo
+      const conflito = detectarConflitoRetiradaOffline(item.snapshotAntes, atual, registro.tecnicoId);
+      if(conflito){ item.status='conflito'; item.conflito=conflito; mudou=true; continue; }
+      // Sobe fotos do registro ainda pendentes (se houver) antes de tentar a RPC —
+      // mesmo array de caminhos é repassado pra cada item do lote, como no caminho online.
+      if(registro.fotos && registro.fotos.some(f=>f.status==='pendente')){
+        const pendentesAgora = registro.fotos.filter(f=>f.status==='pendente');
+        const resultadoFotos = await enviarFotosPreparadas(registro.tecnicoId, registro.codigo, pendentesAgora);
+        registro.fotosCaminhosEnviados = [...(registro.fotosCaminhosEnviados||[]), ...resultadoFotos.caminhos];
+        const idsSobra = new Set(resultadoFotos.sobra.map(f=>f.idLocal));
+        const idsFalha = new Set(resultadoFotos.falhas||[]);
+        registro.fotos = registro.fotos.map(f=>{
+          if(f.status!=='pendente') return f;
+          if(idsSobra.has(f.idLocal)) return f; // segue pendente, tenta de novo no próximo ciclo
+          if(idsFalha.has(f.idLocal)) return {...f, status:'erro'}; // falha real, desiste dessa foto
+          return {...f, status:'enviada'};
+        });
+        mudou = true;
+      }
+      const t = DB.tecnicos.find(x=>x.id===registro.tecnicoId) || { id:registro.tecnicoId, nome:registro.tecnicoNome, regiao:'' };
+      const para = tecNome(registro.tecnicoId);
+      const resultado = await registrarItemRetiradaNoServidor({
+        serie:item.serie, tipoNovo:item.tipoNovo, de:item.de, para,
+        obsCombinada:registro.obs, codigoRetirada:registro.codigo,
+        fotosCaminhos: registro.fotosCaminhosEnviados||[], tecnicoObj:t,
+        idLocalMovimentacao:item.idLocalMovimentacao
+      });
+      if(resultado.ok){ item.status='concluido'; item.movimentacaoIdServidor=resultado.movimentacaoIdServidor; mudou=true; }
+      else if(!resultado.conexao){ item.status='erro'; mudou=true; }
+      // se foi falha de conexão, deixa 'pendente' — tenta de novo no próximo ciclo
+    }
+    if(mudou){
+      const todosItensResolvidos = registro.itens.every(it=>it.status==='concluido');
+      const todasFotosResolvidas = !registro.fotos || registro.fotos.every(f=>f.status==='enviada'||f.status==='erro');
+      await atualizarRetiradaOffline(registro.codigo, ()=> (todosItensResolvidos&&todasFotosResolvidas) ? null : registro);
+      salvar(); render();
+    }
+  }
+}
 
 /* =========================================================
    TELEMETRIA DE ERROS — window.onerror/unhandledrejection gravam num log
@@ -441,6 +638,13 @@ async function sincronizarEquipamentos(){
       || (e.status==='baixado' && e.rmaTecnicoId===meuId)
       || (e.status==='instalado' && e.instaladoTecnicoId===meuId));
   }
+  // Plano offline de retiradas (17/07/2026): um item com retirada offline PENDENTE já
+  // foi mutado localmente pra tecnicoId=meu (otimista, antes da RPC ter rodado de
+  // verdade) — sem esta exclusão, este mesmo diff-sync tentaria um upsert direto que a
+  // RLS rejeitaria (só a RPC privilegiada pode reivindicar item que ainda não é meu no
+  // servidor). Quando a RPC concluir de verdade no drain, a série sai do Set e o
+  // próximo diff-sync (se rodar de novo) já encontra tecnico_id real — idempotente.
+  alterados = alterados.filter(e=> !serieEstaPendenteRetiradaOffline(e.serie));
   if(!alterados.length) return;
   try{
     for(let i=0;i<alterados.length;i+=500){
@@ -454,7 +658,7 @@ async function sincronizarEquipamentos(){
     // Não marcamos nada como sincronizado acima quando falha, então a própria
     // próxima chamada (por ação do usuário, pelo listener 'online' ou pelo timer
     // de 30s) já tenta reenviar sozinha — não precisa de fila explícita aqui.
-    if(pareceFalhaDeConexao(e)) atualizarIndicadorFilaOffline(1);
+    if(pareceFalhaDeConexao(e)) atualizarIndicadorSincronizacao();
     else flash('Falha ao sincronizar equipamentos: '+e.message,'red');
   }
 }
@@ -606,7 +810,7 @@ function salvar(){
       if(pareceFalhaDeConexao(r.reason)) semConexao = true;
       else flash('Falha ao sincronizar: '+r.reason.message,'red');
     });
-    if(semConexao) atualizarIndicadorFilaOffline(1); // sem fila explícita aqui — a próxima chamada (ação, 'online' ou timer) já reenvia sozinha
+    if(semConexao) atualizarIndicadorSincronizacao(); // sem fila explícita aqui — a próxima chamada (ação, 'online' ou timer) já reenvia sozinha
     persistirEquipamentos();
   }, 400);
 }
@@ -640,7 +844,8 @@ async function iniciarSyncNuvem(){
   }
   // mostra na hora se sobrou algo da fila offline de uma sessão anterior, e já tenta
   // esvaziar (não faz nada se ainda estiver sem conexão).
-  atualizarIndicadorFilaOffline(lerFilaOffline().length);
+  atualizarIndicadorSincronizacao();
+  carregarRetiradasOfflinePendentes().catch(()=>{});
   tentarEsvaziarFilaOffline();
 
   // movimentações/auditorias: log append-only — carga inicial ordenada + só acrescenta no INSERT.
@@ -821,6 +1026,7 @@ function detectarTipoPorSerie(serie){
   if(s.startsWith('02-')) return 'Foto';
   if(s.startsWith('04-')) return 'Magnetico';
   if(s.startsWith('05-')) return 'Sirene';
+  if(s.startsWith('8955')) return 'Chip'; // ICCID brasileiro (89=telecom, 55=Brasil) — cartão SIM de operadora
   return null;
 }
 function limparFilial(s){
@@ -2618,10 +2824,18 @@ function openEquip(serie){
   modal(e?'Editar equipamento':'Novo equipamento', `
     <div class="field"><label>Nº de série (código único) *</label>
       <input id="e_serie" value="${e?esc(e.serie):''}" ${e?'disabled':''} placeholder="Ex.: 00-124B...-AA" ${e?'':'oninput="autoDetectarTipoEquip()"'}>
-      <div class="hint">O tipo é detectado automaticamente pelo prefixo (00-=Controle, 02-=Foto, 04-=Magnetico, 05-=Sirene, A453EE20=Módulo).</div></div>
+      <div class="hint">O tipo é detectado automaticamente pelo prefixo (00-=Controle, 02-=Foto, 04-=Magnetico, 05-=Sirene, A453EE20=Módulo, 8955=Chip).</div></div>
     <div class="row2">
-      <div class="field"><label>Tipo *</label><select id="e_tipo">${tiposOpt||'<option value="">— nenhum tipo —</option>'}</select></div>
+      <div class="field"><label>Tipo *</label><select id="e_tipo" onchange="toggleCamposChip()">${tiposOpt||'<option value="">— nenhum tipo —</option>'}</select></div>
       <div class="field"><label>Depósito / Local</label><input id="e_dep" value="${e?esc(e.deposito||''):''}" placeholder="Ex.: CASEPV"></div>
+    </div>
+    <div class="row2" id="e_camposChip" style="${e&&e.tipo==='Chip'?'':'display:none'}">
+      <div class="field"><label>Operadora</label><select id="e_operadora">
+        <option value="">— selecione —</option>
+        <option value="Claro" ${e&&e.operadora==='Claro'?'selected':''}>Claro</option>
+        <option value="TIM" ${e&&e.operadora==='TIM'?'selected':''}>TIM</option>
+      </select></div>
+      <div class="field"><label>Número da linha</label><input id="e_numeroLinha" value="${e?esc(e.numeroLinha||''):''}" placeholder="Ex.: (47) 99999-9999"></div>
     </div>
     <div class="row2">
       <div class="field"><label>Status</label><select id="e_status">${Object.entries(STATUS).map(([k,v])=>`<option value="${k}" ${e&&e.status===k?'selected':''}>${v}</option>`).join('')}</select></div>
@@ -2642,13 +2856,25 @@ function autoDetectarTipoEquip(){
     }
     $('#e_tipo').value = tipo;
   }
+  toggleCamposChip();
+}
+// Mostra/esconde os campos Operadora/Número da linha — só fazem sentido pra tipo Chip
+// (cartão SIM de operadora). Chamado ao trocar o tipo manualmente ou ao autodetectar
+// pelo prefixo do nº de série (8955 = Chip, ver detectarTipoPorSerie).
+function toggleCamposChip(){
+  const el = $('#e_camposChip');
+  if(el) el.style.display = ($('#e_tipo')&&$('#e_tipo').value==='Chip') ? '' : 'none';
 }
 function salvarEquip(serieEdit){
   const serie = serieEdit || $('#e_serie').value.trim();
   if(!serie) return flash('Informe o nº de série','red');
   if(!serieEdit && acharEquipPorSerie(serie)) return flash('Já existe um item com esse nº de série','red');
   let e = serieEdit? DB.equipamentos.find(x=>x.serie===serieEdit) : null;
-  const dados={ tipo:$('#e_tipo').value, deposito:limparFilial($('#e_dep').value), status:$('#e_status').value, dataEntrada:$('#e_data').value.trim(), obs:$('#e_obs').value.trim() };
+  const tipoSelecionado = $('#e_tipo').value;
+  const dados={ tipo:tipoSelecionado, deposito:limparFilial($('#e_dep').value), status:$('#e_status').value, dataEntrada:$('#e_data').value.trim(), obs:$('#e_obs').value.trim(),
+    // Operadora/número da linha só se aplicam a Chip — zera se o tipo foi trocado pra outro.
+    operadora: tipoSelecionado==='Chip' ? (($('#e_operadora')&&$('#e_operadora').value)||null) : null,
+    numeroLinha: tipoSelecionado==='Chip' ? (($('#e_numeroLinha')&&$('#e_numeroLinha').value.trim())||null) : null };
   if(e){ Object.assign(e,dados); }
   else { DB.equipamentos.push(Object.assign({serie, local:dados.deposito, tecnicoId:null}, dados)); }
   // garante que o tipo exista
@@ -2963,7 +3189,11 @@ const COL_MAP = {
   produto:['produto','tipo'],
   deposito:['depósito','deposito','local','armazém','armazem'],
   data:['data entrada','data de entrada','data','entrada'],
-  origem:['origem'], familia:['família','familia'], derivacao:['derivação','derivacao'], um:['um','unidade']
+  origem:['origem'], familia:['família','familia'], derivacao:['derivação','derivacao'], um:['um','unidade'],
+  operadora:['operadora'],
+  // Frases específicas, de propósito (NÃO "número"/"numero" soltos — colidiria com
+  // "nº de série", que também contém essa palavra e é resolvida antes desta coluna).
+  numeroLinha:['número da linha','numero da linha','nº da linha','n da linha','linha']
 };
 function acharCol(headers, chaves){
   const norm = h => h.toLowerCase().trim().replace(/\s+/g,' ');
@@ -2975,7 +3205,7 @@ function parseLinhas(matriz, substituir){
   // acha header
   let hi=0; for(let i=0;i<Math.min(20,matriz.length);i++){ const row=matriz[i].map(c=>String(c).toLowerCase()); if(row.some(c=>c.includes('série')||c.includes('serie'))){ hi=i; break; } }
   const headers=matriz[hi].map(c=>String(c));
-  const ci={ serie:acharCol(headers,COL_MAP.serie), produto:acharCol(headers,COL_MAP.produto), deposito:acharCol(headers,COL_MAP.deposito), data:acharCol(headers,COL_MAP.data), origem:acharCol(headers,COL_MAP.origem), familia:acharCol(headers,COL_MAP.familia), derivacao:acharCol(headers,COL_MAP.derivacao), um:acharCol(headers,COL_MAP.um) };
+  const ci={ serie:acharCol(headers,COL_MAP.serie), produto:acharCol(headers,COL_MAP.produto), deposito:acharCol(headers,COL_MAP.deposito), data:acharCol(headers,COL_MAP.data), origem:acharCol(headers,COL_MAP.origem), familia:acharCol(headers,COL_MAP.familia), derivacao:acharCol(headers,COL_MAP.derivacao), um:acharCol(headers,COL_MAP.um), operadora:acharCol(headers,COL_MAP.operadora), numeroLinha:acharCol(headers,COL_MAP.numeroLinha) };
   if(ci.serie<0){ flash('Não encontrei a coluna "Nº Série". Verifique o cabeçalho.','red'); return; }
 
   if(substituir && !confirm('Isso vai atualizar o ESTOQUE (itens em depósito) com base nesta planilha: itens em estoque que não aparecerem nela serão removidos do sistema. Equipamentos que estão com técnico ou em RMA NÃO serão alterados, mesmo que não apareçam na planilha. Continuar?')) return;
@@ -2996,7 +3226,9 @@ function parseLinhas(matriz, substituir){
       origem: ci.origem>=0?String(row[ci.origem]||'').trim():'',
       familia: ci.familia>=0?String(row[ci.familia]||'').trim():'',
       derivacao: ci.derivacao>=0?String(row[ci.derivacao]||'').trim():'',
-      um: ci.um>=0?String(row[ci.um]||'').trim():''
+      um: ci.um>=0?String(row[ci.um]||'').trim():'',
+      operadora: ci.operadora>=0?String(row[ci.operadora]||'').trim():'',
+      numeroLinha: ci.numeroLinha>=0?String(row[ci.numeroLinha]||'').trim():''
     };
     if(tipo && !DB.tipos[tipo]) DB.tipos[tipo]={nome:tipo,cor:''};
     const idxExistente = idxPorSerie[serie.toLowerCase()];
@@ -3203,7 +3435,7 @@ function limparSiglasFiliais(){
 }
 function corrigirTiposPorSerie(){
   if(!souAdmin()) return flash('Somente administradores podem fazer isso','red');
-  if(!confirm('Corrigir o TIPO de todos os equipamentos com base no padrão do nº de série (00-=Controle, 02-=Foto, 04-=Magnetico, 05-=Sirene, A453EE20=Módulo)? Isso também mescla "Central" em "Modulo" (mesmo tipo) e substitui o tipo atual sempre que o padrão for reconhecido.')) return;
+  if(!confirm('Corrigir o TIPO de todos os equipamentos com base no padrão do nº de série (00-=Controle, 02-=Foto, 04-=Magnetico, 05-=Sirene, A453EE20=Módulo, 8955=Chip)? Isso também mescla "Central" em "Modulo" (mesmo tipo) e substitui o tipo atual sempre que o padrão for reconhecido.')) return;
   let n=0;
   DB.equipamentos.forEach(e=>{
     if(e.tipo==='Central'){ e.tipo='Modulo'; n++; }
@@ -3284,8 +3516,11 @@ function reverterCenarioTeste(){
 }
 function aplicarMinimosOficiais(){
   if(!souAdmin()) return flash('Somente administradores podem fazer isso','red');
-  const MINIMOS = { Controle:25, Magnetico:16, Sirene:8, Foto:30, Modulo:8 };
-  if(!confirm('Aplicar o estoque mínimo oficial POR TÉCNICO (Controle=25, Magnetico=16, Sirene=8, Foto=30, Modulo=8)? O mínimo de cada filial passa a ser esse valor multiplicado pela quantidade de técnicos nela. Isso substitui o mínimo atual desses tipos.')) return;
+  // Chip=4: o alerta dispara quando atual<min (ver alertasEstoqueMinPorTecnico/Filial) —
+  // "ter 3 chips já deve aparecer como abaixo do mínimo" (decisão do usuário) exige
+  // cadastrar 4 (3<4), não 3 (que só dispararia com 2 ou menos).
+  const MINIMOS = { Controle:25, Magnetico:16, Sirene:8, Foto:30, Modulo:8, Chip:4 };
+  if(!confirm('Aplicar o estoque mínimo oficial POR TÉCNICO (Controle=25, Magnetico=16, Sirene=8, Foto=30, Modulo=8, Chip=4)? O mínimo de cada filial passa a ser esse valor multiplicado pela quantidade de técnicos nela. Isso substitui o mínimo atual desses tipos.')) return;
   Object.entries(MINIMOS).forEach(([t,min])=>{
     if(!DB.tipos[t]) DB.tipos[t]={nome:t,cor:''};
     DB.tipos[t].min = min;
@@ -3712,33 +3947,42 @@ async function prepararFotoParaUpload(file){
   const blob = await new Promise(r=>canvas.toBlob(r, 'image/jpeg', 0.72));
   return blob || file;
 }
-function extensaoDeFoto(file){
-  const t = (file.type||'').toLowerCase();
-  if(t.includes('png')) return 'png';
-  if(t.includes('webp')) return 'webp';
-  return 'jpg';
+// Comprime TODAS as fotos selecionadas no form — 100% local (canvas), funciona
+// idêntico online e offline. Separado do envio (plano offline, 17/07/2026): assim a
+// compressão acontece uma vez só, e o resultado (Blob já pronto) pode ser reaproveitado
+// tanto pro envio imediato quanto pra guardar no IndexedDB caso não haja conexão.
+async function prepararTodasFotosForm(){
+  const prontos = [];
+  for(const f of formFotos){
+    const blob = await prepararFotoParaUpload(f.file);
+    prontos.push({ idLocal:uid(), blob, nomeArquivo:f.file.name||'foto.jpg', contentType:blob.type||f.file.type||'image/jpeg' });
+  }
+  return prontos;
 }
-// Envia as fotos selecionadas pro bucket privado 'fotos-retirada', dentro da pasta do
-// técnico (a RLS de Storage exige que o 1º segmento do caminho seja o próprio
-// tecnico_id — ver supabase/rls_policies.sql). Retorna os CAMINHOS que subiram com
-// sucesso (não URLs — o bucket é privado, a exibição resolve URL assinada só na hora
-// de mostrar). Uma falha isolada de upload não trava a retirada inteira: o item só sobe
-// sem aquela foto (a ação de negócio — reivindicar o equipamento — importa mais que a
-// evidência fotográfica).
-async function enviarFotosRetirada(tecnicoId, codigoRetirada){
-  const caminhos = [];
-  for(let i=0;i<formFotos.length;i++){
-    const original = formFotos[i].file;
+// Envia fotos JÁ PREPARADAS (ver prepararTodasFotosForm) pro bucket privado
+// 'fotos-retirada', dentro da pasta do técnico (a RLS de Storage exige que o 1º
+// segmento do caminho seja o próprio tecnico_id — ver supabase/rls_policies.sql).
+// Devolve { caminhos, sobra, falhas }: caminhos = subiram com sucesso (não URLs — o
+// bucket é privado, a exibição resolve URL assinada só na hora de mostrar); sobra =
+// itens (mesmo formato de entrada) que falharam por FALTA DE CONEXÃO — ficam pendentes
+// pra reenvio depois (plano offline: antes eram descartadas pra sempre); falhas =
+// idLocal dos que falharam por erro REAL (não é falta de conexão), desistidos de vez.
+async function enviarFotosPreparadas(tecnicoId, codigoRetirada, prontos){
+  const caminhos = [], sobra = [], falhas = [];
+  for(let i=0;i<prontos.length;i++){
+    const p = prontos[i];
+    const ext = p.contentType.includes('png')?'png':(p.contentType.includes('webp')?'webp':'jpg');
+    const caminho = tecnicoId+'/'+codigoRetirada+'/'+Date.now()+'-'+i+'.'+ext;
     try{
-      const pronto = await prepararFotoParaUpload(original);
-      const ext = extensaoDeFoto(original);
-      const caminho = tecnicoId+'/'+codigoRetirada+'/'+Date.now()+'-'+i+'.'+ext;
-      const { error } = await sb.storage.from('fotos-retirada').upload(caminho, pronto, { contentType: pronto.type||original.type||'image/jpeg' });
+      const { error } = await sb.storage.from('fotos-retirada').upload(caminho, p.blob, { contentType: p.contentType });
       if(error) throw error;
       caminhos.push(caminho);
-    }catch(e){ flash('Falha ao enviar uma das fotos: '+e.message,'red'); }
+    }catch(e){
+      if(pareceFalhaDeConexao(e)) sobra.push(p);
+      else { falhas.push(p.idLocal); flash('Falha ao enviar uma das fotos: '+e.message,'red'); }
+    }
   }
-  return caminhos;
+  return { caminhos, sobra, falhas };
 }
 // Resolve caminhos do Storage (bucket privado) pra URLs assinadas temporárias, só na
 // hora de EXIBIR — nunca guardamos link público fixo (mantém a mesma postura de
@@ -3839,10 +4083,73 @@ function renderFormChips(){
   }).join('');
   if($('#formN')) $('#formN').textContent = formSel.length;
 }
-async function proximoCodigoRetirada(){
-  const { data, error } = await sb.rpc('proximo_codigo_retirada');
-  if(error) throw error;
-  return data;
+// Código da retirada gerado 100% no CLIENTE (plano offline, 17/07/2026) — substitui a
+// antiga proximoCodigoRetirada() (RPC que consumia uma sequência do Postgres). Nunca
+// colide entre técnicos (1º segmento vem do UUID de cada um — únicos por natureza) nem
+// no mesmo técnico (timestamp em ms + sufixo aleatório; o botão já é desabilitado
+// durante o registro, então nem duplo-clique chegaria a chamar isso duas vezes no mesmo
+// ms). Síncrona de propósito: roda idêntica online e offline, sem exceção de rede — é
+// o que permite "Registrar retirada em campo" funcionar sem sinal (o código não precisa
+// mais representar uma contagem sequencial global, só ser único — decisão confirmada
+// com o usuário).
+function gerarCodigoRetiradaLocal(tecnicoId){
+  const tec = String(tecnicoId||'').replace(/-/g,'').slice(0,6).toUpperCase();
+  const ts = Date.now().toString(36).toUpperCase();
+  const rand = Math.random().toString(36).slice(2,6).toUpperCase();
+  return 'RET-'+tec+'-'+ts+'-'+rand;
+}
+// Aplica a mutação otimista LOCAL (equipamento) de uma retirada em campo — comum aos
+// dois caminhos (sucesso imediato no servidor OU enfileirado offline), pra garantir que
+// os dois deixam o estado local exatamente igual (plano offline, 17/07/2026).
+function aplicarEquipRetiradaOtimista(serie, tipoNovo, para, tecnicoObj){
+  let e = acharEquipPorSerie(serie);
+  if(!e){
+    e = { serie, tipo:tipoNovo, deposito:tecnicoObj.regiao||'', local:para, status:'com_tecnico', tecnicoId:tecnicoObj.id, dataEntrada:'', origem:'campo', familia:'', derivacao:'', um:'', obs:'', confirmado:true, desde:Date.now() };
+    DB.equipamentos.push(e);
+    if(!DB.tipos[tipoNovo]) DB.tipos[tipoNovo]={nome:tipoNovo,cor:''};
+  } else {
+    if(!DB.equipamentos.some(x=>x.serie===e.serie)) DB.equipamentos.push(e); // achado só no servidor (era de outro técnico) — traz pro array local pra sincronizar
+    e.status='com_tecnico'; e.tecnicoId=tecnicoObj.id; e.local=para; e.confirmado=true; e.emTransito=false; e.transitoPara=null; e.transitoDesde=null; e.transitoDe=null; e.desde=Date.now();
+  }
+  if(souTecnico()){ delete equipsIncomingMap[e.serie]; equipsOwnMap[e.serie]=e; } // já é meu agora, atualiza os mapas na hora
+  return e;
+}
+// Roda registrar_retirada_campo() pra UM item e, em sucesso, aplica a mutação otimista
+// + grava/reconcilia a movimentação local — usado tanto no caminho online direto
+// quanto na drenagem da fila offline (tentarEsvaziarFilaRetiradas), garantindo que os
+// dois deixam o estado local idêntico. Privilégio elevado necessário porque a política
+// normal de UPDATE não deixaria reivindicar item que hoje pertence a outro técnico
+// (BUG-029/MAPA_DO_SISTEMA.md). Se `idLocalMovimentacao` for passado (veio de um item
+// que estava na fila offline), RECONCILIA o id provisório pelo real do servidor em vez
+// de criar uma movimentação nova — evita duplicar quando o Realtime entregar a linha
+// real (o dedupe de Realtime é por id).
+async function registrarItemRetiradaNoServidor({ serie, tipoNovo, de, para, obsCombinada, codigoRetirada, fotosCaminhos, tecnicoObj, idLocalMovimentacao }){
+  let resp;
+  try{
+    const { data, error } = await sb.rpc('registrar_retirada_campo', {
+      p_serie:serie, p_codigo:codigoRetirada, p_tipo:tipoNovo, p_os:null,
+      p_obs:obsCombinada, p_de:de, p_para:para, p_usuario:nomeUsuarioAtual(),
+      p_fotos:fotosCaminhos
+    });
+    if(error) throw error;
+    resp = data;
+  }catch(err){ return { ok:false, conexao:pareceFalhaDeConexao(err), erro:err }; }
+
+  aplicarEquipRetiradaOtimista(serie, tipoNovo, para, tecnicoObj);
+  const movExistente = idLocalMovimentacao ? DB.movimentacoes.find(m=>m.id===idLocalMovimentacao) : null;
+  if(movExistente) movExistente.id = resp.movimentacao_id;
+  else DB.movimentacoes.push({ id:resp.movimentacao_id, ts:Date.now(), tipo:'registro_campo', serie, de, para, tecnicoId:tecnicoObj.id, usuario:nomeUsuarioAtual(), obs:obsCombinada, fotos:fotosCaminhos, retiradaId:codigoRetirada, temFotosLocais:fotosCaminhos.length>0 });
+  desmarcarSeriePendenteRetiradaOffline(serie);
+  return { ok:true, movimentacaoIdServidor:resp.movimentacao_id };
+}
+// Aplica a MESMA mutação otimista acima, mas sem chamar o servidor — usado quando o
+// item vai pra fila offline (sem conexão, ou a RPC falhou por conexão no meio do
+// lote). `idLocalMovimentacao` é sempre um uid() novo aqui — a movimentação real do
+// servidor ainda não existe, será reconciliada quando a fila drenar com sucesso.
+function enfileirarItemRetiradaOffline({ serie, tipoNovo, de, para, obsCombinada, codigoRetirada, fotosCaminhos, tecnicoObj, idLocalMovimentacao }){
+  aplicarEquipRetiradaOtimista(serie, tipoNovo, para, tecnicoObj);
+  DB.movimentacoes.push({ id:idLocalMovimentacao, ts:Date.now(), tipo:'registro_campo', serie, de, para, tecnicoId:tecnicoObj.id, usuario:nomeUsuarioAtual(), obs:obsCombinada, fotos:fotosCaminhos, retiradaId:codigoRetirada, temFotosLocais:fotosCaminhos.length>0 });
+  marcarSeriePendenteRetiradaOffline(serie);
 }
 async function confirmarRegistrarForm(){
   if(!formSel.length) return flash('Bipe ao menos um equipamento','red');
@@ -3866,60 +4173,73 @@ async function confirmarRegistrarForm(){
   }
 
   const btn = $('#formBtnRegistrar');
-  const temFotosLocais = formFotos.length>0;
-  if(btn){ btn.disabled=true; btn.textContent='Gerando código...'; }
-  let codigoRetirada;
-  try{ codigoRetirada = await proximoCodigoRetirada(); }
-  catch(err){ if(btn){ btn.disabled=false; btn.textContent='Registrar ('+formSel.length+')'; } return flash('Falha ao gerar código: '+err.message,'red'); }
+  if(btn){ btn.disabled=true; btn.textContent='Preparando...'; }
 
-  if(btn) btn.textContent='Enviando fotos...';
-  const fotosCaminhos = formFotos.length ? await enviarFotosRetirada(t.id, codigoRetirada) : [];
+  // Código gerado 100% no cliente (plano offline, 17/07/2026) — nunca depende de rede,
+  // idêntico online e offline. Ver gerarCodigoRetiradaLocal.
+  const codigoRetirada = gerarCodigoRetiradaLocal(t.id);
+
+  // Compressão é 100% local (canvas) — feita ANTES de qualquer decisão de rede, pra
+  // funcionar igual online e offline.
+  const fotosPreparadas = formFotos.length ? await prepararTodasFotosForm() : [];
+
+  const online = navigator.onLine;
+  let fotosCaminhos = [];
+  let fotosPendentes = []; // ficam pro registro offline, se sobrar alguma sem enviar
+  if(fotosPreparadas.length){
+    if(online){
+      if(btn) btn.textContent='Enviando fotos...';
+      const resultado = await enviarFotosPreparadas(t.id, codigoRetirada, fotosPreparadas);
+      fotosCaminhos = resultado.caminhos;
+      fotosPendentes = resultado.sobra.map(p=>({...p, status:'pendente'}));
+    } else {
+      fotosPendentes = fotosPreparadas.map(p=>({...p, status:'pendente'}));
+    }
+  }
 
   if(btn) btn.textContent='Registrando...';
-
-  // Cada item passa pela função registrar_retirada_campo() no banco — ela roda com
-  // privilégio elevado só pra essa ação, porque a política normal de UPDATE não deixaria
-  // reivindicar um item que hoje pertence a outro técnico (ver BUG-029/MAPA_DO_SISTEMA.md).
-  let n=0;
+  let n=0, algumEnfileirado=false;
+  const itensParaFila = [];
   for(const serie of formSel){
-    // Busca autoritativa no servidor (não só no array local, que pro técnico agora é um recorte)
-    // — só pra montar os textos de exibição da movimentação; quem decide de verdade é a função no banco.
-    let e = await acharEquipPorSerieAsync(serie);
-    const de = e ? (e.status==='com_tecnico'?tecNome(e.tecnicoId):(e.local||e.deposito||'Estoque')) : 'Campo (novo no sistema)';
-    const tipoNovo = e ? null : (detectarTipoPorSerie(serie) || tipoManual);
+    const eLocal = acharEquipParaForm(serie);
+    const de = eLocal ? (eLocal.status==='com_tecnico'?tecNome(eLocal.tecnicoId):(eLocal.local||eLocal.deposito||'Estoque')) : 'Campo (novo no sistema)';
+    const tipoNovo = eLocal ? null : (detectarTipoPorSerie(serie) || tipoManual);
     const para = tecNome(t.id);
-    let resp;
-    try{
-      const { data, error } = await sb.rpc('registrar_retirada_campo', {
-        p_serie:serie, p_codigo:codigoRetirada, p_tipo:tipoNovo, p_os:null,
-        p_obs:obsCombinada, p_de:de, p_para:para, p_usuario:nomeUsuarioAtual(),
-        p_fotos:fotosCaminhos
-      });
-      if(error) throw error;
-      resp = data;
-    }catch(err){ flash('Falha ao registrar '+serie+': '+err.message,'red'); continue; }
+    // Snapshot do estado local NESTE momento — usado só se este item precisar entrar
+    // na fila offline, pra detectar conflito depois (ver detectarConflitoRetiradaOffline).
+    const snapshotAntes = eLocal ? JSON.parse(JSON.stringify(eLocal)) : null;
 
-    // Atualiza o estado local na hora (sem esperar o tempo real confirmar) — mesmo
-    // princípio do BUG-028: evita o item sumir/demorar a aparecer na tela.
-    if(!e){
-      e = { serie, tipo:tipoNovo, deposito:t.regiao||'', local:para, status:'com_tecnico', tecnicoId:t.id, dataEntrada:'', origem:'campo', familia:'', derivacao:'', um:'', obs:'', confirmado:true, desde:Date.now() };
-      DB.equipamentos.push(e);
-      if(!DB.tipos[tipoNovo]) DB.tipos[tipoNovo]={nome:tipoNovo,cor:''};
-    } else {
-      if(!DB.equipamentos.some(x=>x.serie===e.serie)) DB.equipamentos.push(e); // achado só no servidor (era de outro técnico) — traz pro array local pra sincronizar
-      e.status='com_tecnico'; e.tecnicoId=t.id; e.local=para; e.confirmado=true; e.emTransito=false; e.transitoPara=null; e.transitoDesde=null; e.transitoDe=null; e.desde=Date.now();
+    let processadoNoServidor = false;
+    if(online){
+      const resultado = await registrarItemRetiradaNoServidor({ serie, tipoNovo, de, para, obsCombinada, codigoRetirada, fotosCaminhos, tecnicoObj:t });
+      if(resultado.ok){ n++; processadoNoServidor=true; }
+      else if(!resultado.conexao){ flash('Falha ao registrar '+serie+': '+resultado.erro.message,'red'); continue; }
+      // se foi falha de conexão, cai pro enfileiramento abaixo
     }
-    if(souTecnico()){ delete equipsIncomingMap[e.serie]; equipsOwnMap[e.serie]=e; } // já é meu agora, atualiza os mapas na hora
-    DB.movimentacoes.push({ id:resp.movimentacao_id, ts:Date.now(), tipo:'registro_campo', serie, de, para, tecnicoId:t.id, usuario:nomeUsuarioAtual(), obs:obsCombinada, fotos:fotosCaminhos, retiradaId:codigoRetirada, temFotosLocais });
-    n++;
+    if(!processadoNoServidor){
+      const idLocalMovimentacao = uid();
+      enfileirarItemRetiradaOffline({ serie, tipoNovo, de, para, obsCombinada, codigoRetirada, fotosCaminhos, tecnicoObj:t, idLocalMovimentacao });
+      itensParaFila.push({ serie, tipoNovo, snapshotAntes, de, idLocalMovimentacao, status:'pendente', conflito:null, movimentacaoIdServidor:null });
+      algumEnfileirado = true;
+      n++;
+    }
   }
+
+  if(algumEnfileirado){
+    await salvarRetiradaOffline({
+      codigo:codigoRetirada, tecnicoId:t.id, tecnicoNome:t.nome, servico, obs, usuario:nomeUsuarioAtual(), criadoEm:Date.now(),
+      fotos: fotosPendentes, fotosCaminhosEnviados: fotosCaminhos, itens: itensParaFila
+    });
+    atualizarIndicadorSincronizacao();
+  }
+
   formFotos.forEach(f=>URL.revokeObjectURL(f.url)); formFotos=[];
   salvar(); render();
   modal(ic('check')+' Retirada registrada', `
     <div style="text-align:center;padding:10px 0">
       <div class="muted" style="font-size:12.5px;margin-bottom:6px">Código desta retirada</div>
       <div style="font-size:32px;font-weight:800;color:var(--brand);letter-spacing:1px;margin-bottom:14px">${codigoRetirada}</div>
-      <p class="muted" style="max-width:380px;margin:0 auto 6px">${n} equipamento(s) registrado(s).${fotosCaminhos.length?' '+fotosCaminhos.length+' foto(s) enviada(s) com segurança.':(temFotosLocais?' As fotos selecionadas não puderam ser enviadas — verifique a conexão e tente registrar de novo se precisar delas.':'')}</p>
+      <p class="muted" style="max-width:380px;margin:0 auto 6px">${n} equipamento(s) registrado(s).${algumEnfileirado?' Salvo(s) só neste aparelho — sincroniza quando a conexão voltar.':(fotosCaminhos.length?' '+fotosCaminhos.length+' foto(s) enviada(s) com segurança.':'')}</p>
     </div>`, `<button class="btn primary" style="width:100%;justify-content:center" onclick="closeModal()">Entendi</button>`, '');
 }
 function confirmarRecebimento(serie, semConfirm){
@@ -3961,14 +4281,96 @@ function listaRetiradas(){
 }
 let retiradaBusca = '';
 function renderRetiradas(){
+  const nPendentes = seriesPendentesRetiradaOffline.size;
   $('#content').innerHTML = `
   <div class="toolbar">
     <div class="search"><span class="si">${ic('search')}</span><input placeholder="Buscar por código (ex.: RET-0001)..." value="${esc(retiradaBusca)}" oninput="retiradaBusca=this.value;renderRetiradasLista()"></div>
+    ${souTecnico()?`<button class="btn" style="${nPendentes?'background:var(--amber-soft);color:var(--amber);border-color:transparent':''}" onclick="abrirRetiradasOfflinePendentes()">${ic('alert-triangle')} Retiradas offline${nPendentes?' ('+nPendentes+')':''}</button>`:''}
   </div>
   <div class="panel"><div class="ph"><h3>${ic('search')} Retiradas em campo</h3><span class="count-badge" id="retiradasCount"></span></div>
     <div class="pb" style="display:flex;flex-direction:column;gap:10px" id="retiradasLista"></div>
   </div>`;
   renderRetiradasLista();
+}
+// Tela de revisão das retiradas registradas OFFLINE ainda não confirmadas no servidor
+// (plano offline, 17/07/2026) — mostra o status de cada item e, pros que entraram em
+// CONFLITO (outra pessoa mexeu no equipamento enquanto o técnico estava offline — ver
+// detectarConflitoRetiradaOffline), deixa o técnico decidir explicitamente: aplicar
+// mesmo assim ou descartar. Nunca aplica um conflito silenciosamente.
+function abrirRetiradasOfflinePendentes(){
+  modal(ic('alert-triangle')+' Retiradas offline pendentes', `<div id="retiradasOfflineBody">Carregando...</div>`, `<button class="btn" onclick="closeModal()">Fechar</button>`, 'lg');
+  renderRetiradasOfflinePendentesBody();
+}
+function descreverConflitoRetirada(c){
+  if(!c) return 'estado mudou desde o registro offline';
+  if(c.motivo==='item_novo_ja_existe') return 'este item já existe no sistema — outra pessoa também o registrou enquanto você estava offline';
+  if(c.motivo==='item_sumiu_do_servidor') return 'este item foi excluído do sistema por outra pessoa';
+  if(c.motivo==='estado_mudou') return 'este item foi movimentado por outra pessoa — status atual: '+(c.atual?(STATUS[c.atual.status]||c.atual.status):'desconhecido');
+  return 'estado mudou desde o registro offline';
+}
+async function renderRetiradasOfflinePendentesBody(){
+  const el = $('#retiradasOfflineBody'); if(!el) return;
+  let registros;
+  try{ registros = await listarRetiradasOffline(); }
+  catch(e){ el.innerHTML = '<div class="empty">Não foi possível ler os dados offline deste aparelho.</div>'; return; }
+  if(!registros.length){ el.innerHTML = '<div class="empty">'+ic('check')+' Nenhuma retirada pendente — tudo sincronizado.</div>'; return; }
+  el.innerHTML = registros.map(r=>`
+    <div class="panel" style="box-shadow:none;margin-bottom:12px"><div class="pb">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <div style="font-weight:800;color:var(--brand)">${esc(r.codigo)}</div>
+        <span class="muted" style="font-size:11.5px">${fmtTS(r.criadoEm)}</span>
+      </div>
+      <div class="tbl-wrap"><table><thead><tr><th>Nº Série</th><th>Status</th><th></th></tr></thead><tbody>
+        ${r.itens.map(it=>`<tr>
+          <td class="mono">${esc(it.serie)}</td>
+          <td>${
+            it.status==='conflito' ? `<span class="badge" style="background:var(--red-soft);color:var(--red)" title="${esc(descreverConflitoRetirada(it.conflito))}">${ic('alert-triangle')} Conflito</span>`
+            : it.status==='erro' ? `<span class="badge" style="background:var(--red-soft);color:var(--red)">${ic('x')} Falhou</span>`
+            : `<span class="badge gray">${ic('clock')} Pendente</span>`
+          }</td>
+          <td>${it.status==='conflito' ? `<div class="muted" style="font-size:11.5px;margin-bottom:6px">${esc(descreverConflitoRetirada(it.conflito))}</div>
+            <button class="btn sm" onclick="confirmarConflitoRetiradaOffline('${esc(r.codigo)}','${esc(it.serie)}')">Aplicar mesmo assim</button>
+            <button class="btn sm red ghost" onclick="descartarItemConflitanteRetiradaOffline('${esc(r.codigo)}','${esc(it.serie)}')">Descartar</button>`:''}</td>
+        </tr>`).join('')}
+      </tbody></table></div>
+    </div></div>`).join('');
+}
+async function confirmarConflitoRetiradaOffline(codigo, serie){
+  const registros = await listarRetiradasOffline();
+  const registro = registros.find(r=>r.codigo===codigo); if(!registro) return;
+  const item = registro.itens.find(it=>it.serie===serie); if(!item) return;
+  const t = DB.tecnicos.find(x=>x.id===registro.tecnicoId) || { id:registro.tecnicoId, nome:registro.tecnicoNome, regiao:'' };
+  const para = tecNome(registro.tecnicoId);
+  const resultado = await registrarItemRetiradaNoServidor({
+    serie, tipoNovo:item.tipoNovo, de:item.de, para, obsCombinada:registro.obs, codigoRetirada:registro.codigo,
+    fotosCaminhos: registro.fotosCaminhosEnviados||[], tecnicoObj:t, idLocalMovimentacao:item.idLocalMovimentacao
+  });
+  if(resultado.ok){ item.status='concluido'; item.movimentacaoIdServidor=resultado.movimentacaoIdServidor; item.conflito=null; }
+  else if(!resultado.conexao){ item.status='erro'; flash('Falha ao aplicar: '+resultado.erro.message,'red'); }
+  else { flash('Sem conexão — tente de novo quando reconectar.','red'); return; }
+  const todosItensResolvidos = registro.itens.every(it=>it.status==='concluido');
+  const todasFotosResolvidas = !registro.fotos || registro.fotos.every(f=>f.status==='enviada'||f.status==='erro');
+  await atualizarRetiradaOffline(codigo, ()=> (todosItensResolvidos&&todasFotosResolvidas) ? null : registro);
+  salvar(); render(); renderRetiradasOfflinePendentesBody(); atualizarIndicadorSincronizacao();
+}
+async function descartarItemConflitanteRetiradaOffline(codigo, serie){
+  if(!confirm('Descartar o registro deste item ('+serie+')? Ele NÃO será reivindicado — o estoque local volta a refletir o estado real do servidor.')) return;
+  const registros = await listarRetiradasOffline();
+  const registro = registros.find(r=>r.codigo===codigo); if(!registro) return;
+  const item = registro.itens.find(it=>it.serie===serie); if(!item) return;
+
+  // Reverte o equipamento local pro estado REAL do servidor (o que veio junto do conflito).
+  const atualServidor = item.conflito && item.conflito.atual;
+  const idx = DB.equipamentos.findIndex(e=>e.serie===serie);
+  if(atualServidor){ if(idx>=0) DB.equipamentos[idx]=atualServidor; else DB.equipamentos.push(atualServidor); }
+  else if(idx>=0) DB.equipamentos.splice(idx,1); // não existe mais no servidor — remove do local também
+  DB.movimentacoes = DB.movimentacoes.filter(m=>m.id!==item.idLocalMovimentacao); // remove a otimista provisória, nunca confirmada
+  desmarcarSeriePendenteRetiradaOffline(serie);
+
+  registro.itens = registro.itens.filter(it=>it.serie!==serie);
+  await atualizarRetiradaOffline(codigo, ()=> registro.itens.length ? registro : null);
+  salvar(); render(); renderRetiradasOfflinePendentesBody(); atualizarIndicadorSincronizacao();
+  flash('Item descartado','green');
 }
 function renderRetiradasLista(){
   const todas = listaRetiradas();
