@@ -2761,6 +2761,12 @@ function renderDados(){
       <label class="checkbox"><input type="checkbox" id="fileSubstituir" checked> Substituir todo o inventário ao importar</label>
     </div></div>
   </div>
+  ${souAdmin()?`
+  <div class="panel" style="margin-top:18px"><div class="ph"><h3>${ic('inbox')} Importar chips (colar do portal da operadora)</h3></div><div class="pb">
+    <p class="muted" style="margin-bottom:12px">Cole aqui o texto copiado direto do portal da operadora (Virtueyes). O sistema reconhece o ICCID de cada chip e a operadora (Claro/TIM) automaticamente — depois você escolhe o técnico e confirma o envio do lote inteiro.</p>
+    <div class="field"><textarea id="chipPasteArea" rows="8" placeholder="Cole aqui os dados copiados do portal..." style="font-family:Consolas,monospace;font-size:12px"></textarea></div>
+    <button class="btn primary" onclick="reconhecerChipsColados()">${ic('search')} Reconhecer chips</button>
+  </div></div>`:''}
 
   <div class="panel" style="margin-top:18px"><div class="ph"><h3>${ic('save')} Backup & compartilhamento</h3></div><div class="pb">
     <p class="muted" style="margin-bottom:14px">Os dados ficam salvos <b>neste navegador</b>. Para fazer cópia de segurança ou usar em outra máquina/compartilhar via rede, exporte o backup e importe no outro computador.</p>
@@ -3293,6 +3299,106 @@ function importarArquivo(input){
     reader.readAsArrayBuffer(file);
   }
   input.value='';
+}
+
+/* =========================================================
+   IMPORTAÇÃO DE CHIPS — colar direto do portal da operadora (Virtueyes)
+   20/07/2026. Formato irregular, sempre em blocos de ~4 linhas por chip:
+     <ICCID><TAB>ALARME 365<TAB>
+     Virtueyes-Claro   (ou Virtueyes-Tim)
+     Orsegups
+     Em trânsito
+   Só o ICCID e a operadora (Claro/TIM) interessam — "ALARME 365"/"Orsegups"/
+   "Em trânsito" são descartados de propósito (decisão confirmada com o usuário).
+   Cada chip novo entra JÁ em trânsito para o técnico escolhido (mesmo padrão do
+   'saida' de confirmarMov: status continua 'estoque', emTransito=true) — aparece
+   na tela do técnico como aguardando confirmação de recebimento.
+   ========================================================= */
+let chipsPendentesImport = [];
+// Reconhece o ICCID reaproveitando detectarTipoPorSerie (mesma fonte de verdade do
+// prefixo 8955 usada no resto do sistema, evita duplicar a regra aqui) — qualquer
+// linha cujo primeiro token bater com o tipo 'Chip' inicia um novo bloco.
+function parseColagemChips(texto){
+  const linhas = String(texto||'').replace(/\r/g,'').split('\n').map(l=>l.trim()).filter(Boolean);
+  const chips = [];
+  let atual = null;
+  linhas.forEach(linha=>{
+    const primeiroToken = linha.split('\t')[0].trim();
+    if(detectarTipoPorSerie(primeiroToken)==='Chip'){
+      atual = { serie:primeiroToken, operadora:'' };
+      chips.push(atual);
+      return;
+    }
+    if(!atual) return; // linha antes de qualquer ICCID reconhecido — ignora
+    const m = linha.match(/^Virtueyes-(\w+)/i);
+    if(m){
+      const op = m[1].toLowerCase();
+      if(op==='claro') atual.operadora='Claro';
+      else if(op==='tim') atual.operadora='TIM';
+    }
+    // demais linhas (produto, "Orsegups", status "Em trânsito") são ignoradas de propósito
+  });
+  return chips;
+}
+function reconhecerChipsColados(){
+  const txt = $('#chipPasteArea').value;
+  if(!txt.trim()) return flash('Cole os dados copiados do portal primeiro','red');
+  const chips = parseColagemChips(txt);
+  if(!chips.length) return flash('Não reconheci nenhum ICCID (nº de série 8955...) nesse texto','red');
+  const vistos = new Set();
+  chipsPendentesImport = chips.map(c=>{
+    const duplicado = !!acharEquipPorSerie(c.serie) || vistos.has(c.serie.toLowerCase());
+    vistos.add(c.serie.toLowerCase());
+    return { serie:c.serie, operadora:c.operadora, duplicado };
+  });
+  abrirModalImportChips();
+}
+function abrirModalImportChips(){
+  const linhas = chipsPendentesImport.map((c,i)=>`
+    <tr>
+      <td class="mono">${esc(c.serie)}</td>
+      <td>${c.duplicado
+        ? `<span class="badge baixado">${ic('alert-triangle')} Já existe — será pulado</span>`
+        : `<select onchange="chipsPendentesImport[${i}].operadora=this.value" style="padding:8px 10px;border:1px solid var(--line);border-radius:var(--radius-md);background:var(--panel);color:var(--txt)">
+            <option value="" ${!c.operadora?'selected':''}>— selecione —</option>
+            <option value="Claro" ${c.operadora==='Claro'?'selected':''}>Claro</option>
+            <option value="TIM" ${c.operadora==='TIM'?'selected':''}>TIM</option>
+          </select>`}
+      </td>
+    </tr>`).join('');
+  const novos = chipsPendentesImport.filter(c=>!c.duplicado).length;
+  const pulados = chipsPendentesImport.length - novos;
+  modal(ic('inbox')+' Importar chips — '+chipsPendentesImport.length+' reconhecido(s)', `
+    <p class="muted" style="margin-bottom:12px">${novos} novo(s) será(ão) enviado(s)${pulados?`, ${pulados} já existente(s) será(ão) pulado(s)`:''}. Selecione o técnico que vai receber TODO o lote — a entrada no estoque da filial dele e o envio acontecem juntos, ele confirma o recebimento na tela dele.</p>
+    <div class="tbl-wrap" style="max-height:280px;overflow:auto;margin-bottom:14px"><table><thead><tr><th>ICCID</th><th>Operadora</th></tr></thead><tbody>${linhas}</tbody></table></div>
+    <div class="field"><label>Técnico de destino *</label><select id="chipImportTec"><option value="">— selecione —</option>${agruparTecsPorFilialOpt(DB.tecnicos,'')}</select></div>`,
+    `<button class="btn" onclick="closeModal()">Cancelar</button>
+     <button class="btn primary" onclick="confirmarImportChips()">${ic('check')} Confirmar envio</button>`, 'lg');
+}
+function confirmarImportChips(){
+  const tecId = $('#chipImportTec').value;
+  if(!tecId) return flash('Selecione o técnico de destino','red');
+  const tecnico = DB.tecnicos.find(t=>t.id===tecId);
+  if(!tecnico) return flash('Técnico não encontrado','red');
+  const novos = chipsPendentesImport.filter(c=>!c.duplicado);
+  if(!novos.length) return flash('Nenhum chip novo para enviar — todos já existem no sistema','red');
+  const usuario = nomeUsuarioAtual();
+  const filial = tecnico.regiao||'';
+  const destinoTxt = tecNome(tecId);
+  novos.forEach(c=>{
+    DB.equipamentos.push({
+      serie:c.serie, tipo:'Chip', deposito:filial, local:filial, status:'estoque', tecnicoId:null,
+      dataEntrada:'', origem:'', familia:'', derivacao:'', um:'', obs:'', confirmado:true, desde:Date.now(),
+      operadora:c.operadora||null, numeroLinha:null,
+      emTransito:true, transitoPara:tecId, transitoDesde:Date.now(), transitoDe:filial, transitoUsuario:usuario, transitoDeTecnicoId:null
+    });
+    registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:'saida', serie:c.serie, de:filial, para:destinoTxt+' (aguardando confirmação)', tecnicoId:tecId, tecnicoIdOrigem:null, usuario, obs:'Importado do portal da operadora' });
+  });
+  if(!DB.tipos['Chip']) DB.tipos['Chip']={nome:'Chip',cor:''};
+  const pulados = chipsPendentesImport.length - novos.length;
+  chipsPendentesImport = [];
+  salvar(); closeModal(); render();
+  flash(`${novos.length} chip(s) enviado(s) para ${destinoTxt} — aguardando confirmação`+(pulados?`, ${pulados} pulado(s) por já existir`:''),'green');
 }
 
 /* ---- Exportações ---- */
@@ -3882,7 +3988,7 @@ function renderMeusItens(){
       <div style="display:flex;flex-direction:column;gap:10px">
         ${pendentes.map(e=>`
           <div class="rec-card">
-            <div class="rec-info"><span class="mono rec-serie"><b>${esc(e.serie)}</b></span><span class="rec-meta"><span class="tag-tipo">${esc(tipoNome(e.tipo))}</span><span class="muted" style="font-size:11.5px">de ${esc(e.transitoDe||'—')}</span></span></div>
+            <div class="rec-info"><span class="mono rec-serie"><b>${esc(e.serie)}</b>${e.tipo==='Chip'&&e.operadora?` <span class="tag-tipo" style="background:var(--brand-soft);color:var(--brand-d)">${esc(e.operadora)}</span>`:''}</span><span class="rec-meta"><span class="tag-tipo">${esc(tipoNome(e.tipo))}</span><span class="muted" style="font-size:11.5px">de ${esc(e.transitoDe||'—')}</span></span></div>
             <button class="btn green sm" onclick="confirmarRecebimento('${esc(e.serie)}')">${ic('check')} Confirmar</button>
           </div>`).join('')}
       </div>` : '<div class="empty">Nenhum equipamento aguardando confirmação no momento.</div>'}
