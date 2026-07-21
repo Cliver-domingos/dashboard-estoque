@@ -1108,7 +1108,13 @@ function auditoriasPermitidas(){
 // Mais recente primeiro (por refTS — desde, ou data de importação se nunca foi
 // movimentado), pra listas como "Meus equipamentos"/"Ficha do técnico" ficarem
 // organizadas por quem mexeu por último, não na ordem de importação da planilha.
-function itensDoTecnico(id){ return DB.equipamentos.filter(e=>e.tecnicoId===id && e.status==='com_tecnico').sort((a,b)=>(refTS(b)||0)-(refTS(a)||0)); }
+// Não conta item marcado como perdido (20/07/2026, a pedido do usuário) — um item
+// "em posse" que na prática está pendente de localização não deveria aparecer como
+// estoque disponível em nenhuma tela normal (ficha do técnico, Estoque Mínimo por
+// técnico, Meus Equipamentos, Auditoria, etc. — todas cascateiam a partir daqui). Em
+// Movimentar ele continua aparecendo normalmente (filtrarPickMov não usa esta função) —
+// é o único jeito de resolvê-lo.
+function itensDoTecnico(id){ return DB.equipamentos.filter(e=>e.tecnicoId===id && e.status==='com_tecnico' && !e.perdido).sort((a,b)=>(refTS(b)||0)-(refTS(a)||0)); }
 function itensDoDeposito(dep){ return DB.equipamentos.filter(e=>e.status==='estoque' && (e.local||e.deposito||'')===dep); }
 function acharEquipPorSerie(serie){ const s=(serie||'').toLowerCase(); return DB.equipamentos.find(e=>e.serie.toLowerCase()===s); }
 
@@ -1237,7 +1243,10 @@ function dashItemBateTecnico(e, tecId){
   return false; // 'estoque' não tem técnico associado
 }
 function dashboardFiltrado(){
-  const baseEq = souSupervisor() ? DB.equipamentos.filter(e=>regiaoPermitida(e.deposito)) : DB.equipamentos;
+  // Item marcado como perdido não conta como estoque "normal" em nenhuma visão da
+  // Visão Geral (20/07/2026, a pedido do usuário) — fica só no Inventário Pendente até
+  // ser resolvido (qualquer movimentação, feita normalmente em Movimentar, resolve).
+  const baseEq = (souSupervisor() ? DB.equipamentos.filter(e=>regiaoPermitida(e.deposito)) : DB.equipamentos).filter(e=>!e.perdido);
   const eqPorFilial = dashFiliais.length ? baseEq.filter(e=>dashFiliais.includes(e.deposito)) : baseEq;
   let eq = dashTecnicoFiltro ? eqPorFilial.filter(e=>dashItemBateTecnico(e, dashTecnicoFiltro)) : eqPorFilial;
   if(dashStatusFiltro) eq = eq.filter(e=>e.status===dashStatusFiltro);
@@ -1246,7 +1255,10 @@ function dashboardFiltrado(){
 function renderDashboard(){
   let todasFiliais = todasFiliaisConhecidas();
   if(souSupervisor()) todasFiliais = todasFiliais.filter(regiaoPermitida);
-  const baseEq = souSupervisor() ? DB.equipamentos.filter(e=>regiaoPermitida(e.deposito)) : DB.equipamentos;
+  // Item marcado como perdido não conta como estoque "normal" em nenhuma visão da
+  // Visão Geral (20/07/2026, a pedido do usuário) — fica só no Inventário Pendente até
+  // ser resolvido (qualquer movimentação, feita normalmente em Movimentar, resolve).
+  const baseEq = (souSupervisor() ? DB.equipamentos.filter(e=>regiaoPermitida(e.deposito)) : DB.equipamentos).filter(e=>!e.perdido);
   const eqPorFilial = dashFiliais.length ? baseEq.filter(e=>dashFiliais.includes(e.deposito)) : baseEq;
   // Considera os 3 campos de "dono" (tecnico_id/rma_tecnico_id/instalado_tecnico_id) —
   // um técnico que só tem itens em RMA ou instalados nesta filial também deve aparecer
@@ -1463,7 +1475,7 @@ function renderEquipTabela(){
     <tr>
       <td class="mono"><a href="#" onclick="abrirKardex('${esc(e.serie)}');return false" title="Ver histórico (kardex)"><b>${esc(e.serie)}</b></a></td>
       <td><span class="tag-tipo" style="border-left:3px solid ${tipoCor(e.tipo)}">${esc(tipoNome(e.tipo))}</span></td>
-      <td><span class="badge ${e.status}">${STATUS[e.status]}</span> ${e.emTransito?`<span class="badge com_tecnico" style="font-size:10px">${ic('hourglass')} em trânsito p/ ${esc(tecNome(e.transitoPara))}</span>`:''}</td>
+      <td><span class="badge ${e.status}">${STATUS[e.status]}</span> ${e.emTransito?`<span class="badge com_tecnico" style="font-size:10px">${ic('hourglass')} em trânsito p/ ${esc(tecNome(e.transitoPara))}</span>`:''} ${e.perdido?`<span class="badge baixado" style="font-size:10px">${ic('alert-triangle')} Inventário Pendente</span>`:''}</td>
       <td>${e.status==='com_tecnico'?esc(tecNome(e.tecnicoId)):esc(e.local||e.deposito||'—')}</td>
       <td class="muted">${e.status==='com_tecnico'?'há '+fmtDias(diasEmPosse(e)):fmtData(e.dataEntrada)}</td>
       <td class="right">
@@ -1489,7 +1501,10 @@ function paradosToggleFilial(d){
   renderParados();
 }
 function paradosLista(){
-  return DB.equipamentos.filter(e=>e.status==='com_tecnico' && (diasEmPosse(e)||0)>=DIAS_PARADO)
+  // Item marcado como perdido não conta como "parado" (20/07/2026, a pedido do
+  // usuário) — já está sinalizado no Inventário Pendente, sinalizar de novo aqui
+  // seria redundante/confuso.
+  return DB.equipamentos.filter(e=>e.status==='com_tecnico' && !e.perdido && (diasEmPosse(e)||0)>=DIAS_PARADO)
     .sort((a,b)=>(diasEmPosse(b)||0)-(diasEmPosse(a)||0));
 }
 // Aplica os filtros de filial + técnico atuais — reaproveitado tanto pela tela quanto
@@ -1712,8 +1727,11 @@ function alertasEstoqueMinPorFilial(){
       const minPorTecnico = DB.tipos[t].min||0;
       if(minPorTecnico>0){
         const min = minPorTecnico*nTecs;
-        const noDeposito = DB.equipamentos.filter(e=>e.deposito===f && e.tipo===t && e.status==='estoque').length;
-        const comTecnicos = DB.equipamentos.filter(e=>e.tipo===t && e.status==='com_tecnico' && idsTecs.includes(e.tecnicoId)).length;
+        // Item marcado como perdido não conta como estoque atual (20/07/2026, a pedido
+        // do usuário) — na prática não está disponível, então deixa a filial/técnico
+        // mais perto (ou abaixo) do mínimo de verdade.
+        const noDeposito = DB.equipamentos.filter(e=>e.deposito===f && e.tipo===t && e.status==='estoque' && !e.perdido).length;
+        const comTecnicos = DB.equipamentos.filter(e=>e.tipo===t && e.status==='com_tecnico' && !e.perdido && idsTecs.includes(e.tecnicoId)).length;
         const atual = noDeposito+comTecnicos;
         if(atual<min) alertas.push({filial:f, tipo:t, atual, min, deficit:min-atual});
       }
@@ -1976,14 +1994,14 @@ function rmaToggleFilial(d){ const i=rmaFiliais.indexOf(d); if(i>=0) rmaFiliais.
 // Aplica os filtros de filial + técnico atuais — reaproveitado pela tela e pelas
 // exportações (Excel/relatório/modal "ver tudo"), mesmo princípio de dashboardFiltrado().
 function rmaFiltrado(){
-  const baseRma = DB.equipamentos.filter(e=>e.status==='baixado' && (!souSupervisor()||regiaoPermitida(e.rmaDeposito||e.deposito)));
+  const baseRma = DB.equipamentos.filter(e=>e.status==='baixado' && !e.perdido && (!souSupervisor()||regiaoPermitida(e.rmaDeposito||e.deposito)));
   const rma = rmaFiliais.length ? baseRma.filter(e=>rmaFiliais.includes(e.rmaDeposito||e.deposito)) : baseRma;
   return rmaTecnicoFiltro ? rma.filter(e=>e.rmaTecnicoId===rmaTecnicoFiltro) : rma;
 }
 function renderRMA(){
-  let todasFiliais = [...new Set(DB.equipamentos.filter(e=>e.status==='baixado').map(e=>e.rmaDeposito||e.deposito).filter(Boolean))].sort();
+  let todasFiliais = [...new Set(DB.equipamentos.filter(e=>e.status==='baixado' && !e.perdido).map(e=>e.rmaDeposito||e.deposito).filter(Boolean))].sort();
   if(souSupervisor()) todasFiliais = todasFiliais.filter(regiaoPermitida);
-  const baseRma = DB.equipamentos.filter(e=>e.status==='baixado' && (!souSupervisor()||regiaoPermitida(e.rmaDeposito||e.deposito)));
+  const baseRma = DB.equipamentos.filter(e=>e.status==='baixado' && !e.perdido && (!souSupervisor()||regiaoPermitida(e.rmaDeposito||e.deposito)));
   const rmaPorFilial = rmaFiliais.length ? baseRma.filter(e=>rmaFiliais.includes(e.rmaDeposito||e.deposito)) : baseRma;
   const tecnicosDisponiveis = [...new Map(rmaPorFilial.filter(e=>e.rmaTecnicoId).map(e=>[e.rmaTecnicoId, e.rmaTecnicoId])).keys()]
     .map(id=>DB.tecnicos.find(t=>t.id===id)).filter(Boolean).sort((a,b)=>a.nome.localeCompare(b.nome));
@@ -2124,7 +2142,7 @@ function verTodosRMA(){
     }</div>`, `<button class="btn" onclick="closeModal()">Fechar</button>`, 'lg');
 }
 function rmaFichaTecnico(tecnicoId){
-  const itens = DB.equipamentos.filter(e=>e.status==='baixado' && (e.rmaTecnicoId||null)===(tecnicoId||null) && (!souSupervisor()||regiaoPermitida(e.rmaDeposito||e.deposito)));
+  const itens = DB.equipamentos.filter(e=>e.status==='baixado' && !e.perdido && (e.rmaTecnicoId||null)===(tecnicoId||null) && (!souSupervisor()||regiaoPermitida(e.rmaDeposito||e.deposito)));
   const titulo = tecnicoId? ic('recycle')+' RMA enviado por '+esc(tecNome(tecnicoId)) : ic('map-pin')+' RMA enviado direto do estoque (sem técnico)';
 
   const porTipo={}; itens.forEach(e=>porTipo[e.tipo]=(porTipo[e.tipo]||0)+1);
@@ -2170,7 +2188,7 @@ function rmaFichaTecnico(tecnicoId){
     }</div>`, `<button class="btn" onclick="exportarRMATecnicoExcel('${tecnicoId||''}')">${ic('bar-chart-3')} Exportar Excel</button><button class="btn" onclick="gerarRelatorioRMATecnico('${tecnicoId||''}')">${ic('printer')} Gerar relatório</button><button class="btn" onclick="closeModal()">Fechar</button>`, 'lg');
 }
 function exportarRMATecnicoExcel(tecnicoId){
-  const itens = DB.equipamentos.filter(e=>e.status==='baixado' && (e.rmaTecnicoId||null)===(tecnicoId||null) && (!souSupervisor()||regiaoPermitida(e.rmaDeposito||e.deposito)));
+  const itens = DB.equipamentos.filter(e=>e.status==='baixado' && !e.perdido && (e.rmaTecnicoId||null)===(tecnicoId||null) && (!souSupervisor()||regiaoPermitida(e.rmaDeposito||e.deposito)));
   if(window.__noXLSX||typeof XLSX==='undefined') return flash('Exportação para Excel indisponível (sem internet). Use "Gerar relatório" e imprima como PDF.','red');
   const nomeRef = tecnicoId? tecNome(tecnicoId) : 'sem_tecnico';
   const linhas = itens.map(e=>({ 'Nº Série':e.serie, 'Tipo':tipoNome(e.tipo), 'Filial':e.rmaDeposito||e.deposito||'—', 'Desde':e.rmaDesde?fmtTS(e.rmaDesde):'—' }));
@@ -2180,7 +2198,7 @@ function exportarRMATecnicoExcel(tecnicoId){
   XLSX.writeFile(wb, 'rma_'+nomeRef.replace(/[^\w-]+/g,'_')+'_'+new Date().toISOString().slice(0,10)+'.xlsx');
 }
 function gerarRelatorioRMATecnico(tecnicoId){
-  const itens = DB.equipamentos.filter(e=>e.status==='baixado' && (e.rmaTecnicoId||null)===(tecnicoId||null) && (!souSupervisor()||regiaoPermitida(e.rmaDeposito||e.deposito)));
+  const itens = DB.equipamentos.filter(e=>e.status==='baixado' && !e.perdido && (e.rmaTecnicoId||null)===(tecnicoId||null) && (!souSupervisor()||regiaoPermitida(e.rmaDeposito||e.deposito)));
   const titulo = tecnicoId? 'RMA enviado por '+tecNome(tecnicoId) : 'RMA enviado direto do estoque (sem técnico)';
   const hoje = new Date().toLocaleDateString('pt-BR')+' '+new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
   const html=`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="utf-8"><title>Relatório de RMA</title>
@@ -2513,7 +2531,7 @@ function renderTecnicos(){
   </div>
   <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(280px,1fr))">
     ${tecnicosLista.length? tecnicosLista.map(t=>{
-      const itens = DB.equipamentos.filter(e=>e.tecnicoId===t.id && e.status==='com_tecnico');
+      const itens = itensDoTecnico(t.id);
       const aud = ultimaAuditoria('tecnico',t.id);
       return `<div class="panel" style="cursor:pointer" onclick="fichaTecnico('${t.id}')"><div class="pb">
         <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
