@@ -735,6 +735,17 @@ async function selecionarTudo(tabela, configurar){
   return todos;
 }
 
+// IMPORTANTE (BUG-052, mesmo endurecimento pós-BUG-034 já aplicado em
+// sincronizarEquipamentos()): as 3 funções abaixo NUNCA apagam linha no banco. Elas
+// tratavam "código/sigla/id sumiu do array local" como "usuário excluiu de propósito" e
+// mandavam DELETE da diferença — exatamente o mecanismo que, numa importação pesada de
+// equipamentos (que dispara muitos eventos de tempo real na mesma conexão), causou uma
+// tentativa de apagar um técnico que ainda tinha movimentação no histórico (nunca foi
+// excluído de propósito) e travou com "violates foreign key constraint
+// movimentacoes_tecnico_id_fkey" — o Postgres protegeu o dado corretamente, mas o
+// cliente nem deveria ter tentado apagar. Agora a sincronização só grava criações e
+// alterações; exclusão só acontece por ação explícita (excluirTec()/excluirFilial()/
+// corrigirTiposDuplicados(), cada uma chamando o delete direto e com guarda própria).
 async function sincronizarTipos(){
   const codigos = Object.keys(DB.tipos);
   const alterados = [];
@@ -743,17 +754,11 @@ async function sincronizarTipos(){
     const json = JSON.stringify(row);
     if(ultimoSyncTipos[cod]!==json) alterados.push(row);
   });
-  const removidos = Object.keys(ultimoSyncTipos).filter(c=>!codigos.includes(c));
   if(alterados.length){
     const { error } = await sb.from('tipos').upsert(alterados, { onConflict:'codigo' });
     if(error) throw error;
   }
-  if(removidos.length){
-    const { error } = await sb.from('tipos').delete().in('codigo', removidos);
-    if(error) throw error;
-  }
   alterados.forEach(r=>{ ultimoSyncTipos[r.codigo]=JSON.stringify(r); });
-  removidos.forEach(c=>{ delete ultimoSyncTipos[c]; });
 }
 async function sincronizarFiliais(){
   // Usa todasFiliaisConhecidas() (DB.filiais + deposito de equipamentos + regiao de
@@ -762,31 +767,19 @@ async function sincronizarFiliais(){
   // Sem isso, importar equipamento com depósito novo falha por causa da FK (ver BUG-030).
   const atuais = new Set(todasFiliaisConhecidas());
   const novas = [...atuais].filter(f=>!ultimoSyncFiliais.has(f));
-  const removidas = [...ultimoSyncFiliais].filter(f=>!atuais.has(f));
   if(novas.length){
     const { error } = await sb.from('filiais').upsert(novas.map(sigla=>({sigla})), { onConflict:'sigla' });
     if(error) throw error;
   }
-  if(removidas.length){
-    const { error } = await sb.from('filiais').delete().in('sigla', removidas);
-    if(error) throw error;
-  }
-  ultimoSyncFiliais = atuais;
+  ultimoSyncFiliais = new Set([...ultimoSyncFiliais, ...atuais]); // só cresce — nunca esquece uma filial já sincronizada
 }
 async function sincronizarTecnicos(){
-  const idsAtuais = new Set(DB.tecnicos.map(t=>t.id));
   const alterados = DB.tecnicos.filter(t=>ultimoSyncTecnicos[t.id]!==JSON.stringify(t));
-  const removidos = Object.keys(ultimoSyncTecnicos).filter(id=>!idsAtuais.has(id));
   if(alterados.length){
     const { error } = await sb.from('tecnicos').upsert(alterados.map(tecnicoParaSnake), { onConflict:'id' });
     if(error) throw error;
   }
-  if(removidos.length){
-    const { error } = await sb.from('tecnicos').delete().in('id', removidos);
-    if(error) throw error;
-  }
   alterados.forEach(t=>{ ultimoSyncTecnicos[t.id]=JSON.stringify(t); });
-  removidos.forEach(id=>{ delete ultimoSyncTecnicos[id]; });
 }
 async function sincronizarConfig(){
   const json = JSON.stringify(DB.config);
@@ -2664,8 +2657,17 @@ function corrigirTiposDuplicados(){
   });
   if(!paraRemover.length) return flash('Nenhum tipo duplicado sem uso encontrado','green');
   if(!confirm('Remover '+paraRemover.length+' tipo(s) duplicado(s) sem nenhum equipamento (ex.: "'+paraRemover[0]+'")? Os tipos com equipamentos reais não são afetados.')) return;
-  paraRemover.forEach(c=>delete DB.tipos[c]);
+  paraRemover.forEach(c=>{ delete DB.tipos[c]; delete ultimoSyncTipos[c]; });
   salvar(); render(); flash(`${paraRemover.length} tipo(s) duplicado(s) removido(s)`,'green');
+  // Exclusão no banco é EXPLÍCITA (ver BUG-052) — a sincronização não infere mais
+  // exclusões pela diferença do array local.
+  excluirTiposNoBanco(paraRemover).catch(err=>{
+    flash('A remoção dos '+paraRemover.length+' tipo(s) NÃO foi aplicada na nuvem ('+err.message+') — eles vão reaparecer. Tente de novo com conexão.','red');
+  });
+}
+async function excluirTiposNoBanco(codigos){
+  const { error } = await sb.from('tipos').delete().in('codigo', codigos);
+  if(error) throw error;
 }
 function renderTipos(){
   const cods=Object.keys(DB.tipos);
@@ -2744,9 +2746,24 @@ function salvarFilial(){
 }
 function excluirFilial(f){
   if(!souAdmin()) return flash('Somente administradores podem fazer isso','red');
+  // BUG-052: equipamentos.deposito/rma_deposito e tecnicos.regiao têm FK pra
+  // filiais.sigla — excluir uma filial ainda em uso falharia no banco (corretamente).
+  // Checar aqui evita o erro só aparecer depois, escondido numa sincronização.
+  const emUso = DB.equipamentos.some(e=>e.deposito===f || e.rmaDeposito===f) || DB.tecnicos.some(t=>t.regiao===f);
+  if(emUso) return flash('Essa filial ainda está em uso (equipamento ou técnico) — mova tudo antes de excluir.','red');
   if(!confirm('Excluir a filial '+f+'?')) return;
   DB.filiais = (DB.filiais||[]).filter(x=>x!==f);
-  salvar(); closeModal(); render(); flash('Filial excluída');
+  ultimoSyncFiliais.delete(f);
+  salvar(); closeModal(); render(); flash('Filial excluída','green');
+  // Exclusão no banco é EXPLÍCITA (ver BUG-052) — a sincronização não infere mais
+  // exclusões pela diferença do array local.
+  excluirFilialNoBanco(f).catch(err=>{
+    flash('A exclusão da filial NÃO foi aplicada na nuvem ('+err.message+') — ela vai reaparecer. Tente de novo com conexão.','red');
+  });
+}
+async function excluirFilialNoBanco(sigla){
+  const { error } = await sb.from('filiais').delete().eq('sigla', sigla);
+  if(error) throw error;
 }
 
 /* =========================================================
@@ -2960,9 +2977,26 @@ function salvarTec(id){
 function excluirTec(id){
   const n = DB.equipamentos.filter(e=>e.tecnicoId===id && e.status==='com_tecnico').length;
   if(n) return flash('Esse técnico tem '+n+' itens em posse. Mova-os antes de excluir.','red');
+  // BUG-052: o banco tem FK de movimentacoes.tecnico_id/tecnico_id_origem pra
+  // tecnicos.id — um técnico com QUALQUER movimentação no histórico nunca pode ser
+  // excluído de verdade (o Postgres protege o rastro), mesmo já sem nenhum item em
+  // posse hoje. Checar aqui evita o erro só aparecer depois, escondido dentro de uma
+  // sincronização em segundo plano.
+  const temHistorico = DB.movimentacoes.some(m=>m.tecnicoId===id || m.tecnicoIdOrigem===id);
+  if(temHistorico) return flash('Esse técnico já tem movimentações no histórico e não pode ser excluído definitivamente (o banco preserva o rastro) — deixe cadastrado, mesmo sem itens em posse.','red');
   if(!confirm('Excluir técnico?')) return;
   DB.tecnicos=DB.tecnicos.filter(t=>t.id!==id);
-  salvar(); closeModal(); render(); flash('Técnico excluído');
+  delete ultimoSyncTecnicos[id];
+  salvar(); closeModal(); render(); flash('Técnico excluído','green');
+  // Exclusão no banco é EXPLÍCITA (ver BUG-052) — a sincronização não infere mais
+  // exclusões pela diferença do array local.
+  excluirTecnicoNoBanco(id).catch(err=>{
+    flash('A exclusão do técnico NÃO foi aplicada na nuvem ('+err.message+') — ele vai reaparecer. Tente de novo com conexão.','red');
+  });
+}
+async function excluirTecnicoNoBanco(id){
+  const { error } = await sb.from('tecnicos').delete().eq('id', id);
+  if(error) throw error;
 }
 
 /* ---- Tipo ---- */
