@@ -3270,6 +3270,25 @@ function perdidosFiltrados(){
   if(q) pendentes = pendentes.filter(e=>e.serie.toLowerCase().includes(q));
   return pendentes;
 }
+
+let resolvidosBusca = ''; // busca por nº de série no histórico de localizados
+let resolvidosFilialFiltro = ''; // filial ATUAL do equipamento (filialAtualDoEquip); vazio = todas
+let resolvidosTecnicoFiltro = ''; // técnico ATUAL (só considera item hoje com_tecnico); vazio = todos
+// Histórico de localizados filtrado — a movimentação de resolução em si só guarda a
+// string fixa "Inventário Pendente" em "de" (ver convenção documentada em
+// renderInventarioPendente()), sem filial/técnico estruturados, então filial e técnico
+// aqui são calculados pela localização ATUAL do equipamento (mesma filialAtualDoEquip()
+// usada na marcação) — reflete onde o item está hoje, não necessariamente onde foi no
+// exato momento da resolução.
+function resolvidosFiltrados(){
+  let lista = DB.movimentacoes.filter(m=>m.tipo==='perdido' && m.de==='Inventário Pendente')
+    .map(m=>({ mov:m, eq:acharEquipPorSerie(m.serie) }));
+  if(resolvidosFilialFiltro) lista = lista.filter(r=>r.eq && filialAtualDoEquip(r.eq)===resolvidosFilialFiltro);
+  if(resolvidosTecnicoFiltro) lista = lista.filter(r=>r.eq && r.eq.status==='com_tecnico' && r.eq.tecnicoId===resolvidosTecnicoFiltro);
+  const q = resolvidosBusca.trim().toLowerCase();
+  if(q) lista = lista.filter(r=>r.mov.serie.toLowerCase().includes(q));
+  return lista.sort((a,b)=>b.mov.ts-a.mov.ts).slice(0,200);
+}
 function renderInventarioPendente(){
   // Marcar/desmarcar/importar em massa viraram ações só de admin (20/07/2026, a pedido do
   // usuário — os formulários mudaram pra tela Dados, junto das outras ferramentas
@@ -3308,9 +3327,15 @@ function renderInventarioPendente(){
   // Não filtrado por filial/região de propósito (é só um log histórico somativo, não uma
   // ação — mesmo tratamento dado a outros logs consolidados do sistema; a movimentação de
   // resolução não guarda a filial de origem em campo próprio, só dentro do texto de obs).
-  const resolvidos = DB.movimentacoes.filter(m=>m.tipo==='perdido' && m.de==='Inventário Pendente')
-    .slice().sort((a,b)=>b.ts-a.ts).slice(0,200);
-  const resolvidosSemana = resolvidos.filter(m=>m.ts>=Date.now()-7*86400000).length;
+  const resolvidosTodos = DB.movimentacoes.filter(m=>m.tipo==='perdido' && m.de==='Inventário Pendente')
+    .map(m=>({ mov:m, eq:acharEquipPorSerie(m.serie) }));
+  const resolvidosSemana = resolvidosTodos.filter(r=>r.mov.ts>=Date.now()-7*86400000).length;
+  // Opções dos dois dropdowns do histórico: só as filiais/técnicos que de fato aparecem
+  // como localização ATUAL de algum item já resolvido (mesmo princípio de
+  // tecnicosDisponiveis em renderRMA() — só quem tem item no escopo, não a lista inteira).
+  const resolvidosFiliaisDisponiveis = [...new Set(resolvidosTodos.map(r=>r.eq&&filialAtualDoEquip(r.eq)).filter(Boolean))].sort();
+  const resolvidosTecnicosDisponiveis = [...new Map(resolvidosTodos.filter(r=>r.eq&&r.eq.status==='com_tecnico'&&r.eq.tecnicoId).map(r=>[r.eq.tecnicoId,r.eq.tecnicoId])).keys()]
+    .map(id=>DB.tecnicos.find(t=>t.id===id)).filter(Boolean).sort((a,b)=>a.nome.localeCompare(b.nome));
 
   $('#content').innerHTML = `
     <div class="panel" style="margin-bottom:18px"><div class="pb" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
@@ -3369,13 +3394,34 @@ function renderInventarioPendente(){
       <div id="perdidosTabelaBox"></div>
     </div></div>
 
-    <div class="panel"><div class="ph"><h3>${ic('clock')} Histórico de localizados</h3><span class="count-badge">${resolvidos.length}</span></div><div class="pb">
-      ${!resolvidos.length ? '<div class="empty">Nenhum item foi localizado ainda.</div>' :
-        `<div class="tbl-wrap"><table><thead><tr><th>Quando</th><th>Nº Série</th><th>Foi localizado</th><th>Usuário</th></tr></thead><tbody>
-          ${resolvidos.map(m=>`<tr><td class="mono">${fmtTS(m.ts)}</td><td class="mono">${esc(m.serie)}</td><td>${esc(m.para)}</td><td>${esc(m.usuario||'—')}</td></tr>`).join('')}
-        </tbody></table></div>`}
+    <div class="panel"><div class="ph"><h3>${ic('clock')} Histórico de localizados</h3><span class="count-badge" id="resolvidosTabelaCount">${resolvidosTodos.length}</span></div><div class="pb">
+      <div class="toolbar" style="margin-bottom:16px">
+        <div class="search"><span class="si">${ic('search')}</span><input placeholder="Buscar por nº de série..." value="${esc(resolvidosBusca)}" oninput="resolvidosBusca=this.value;renderResolvidosTabela()"></div>
+        <select class="filter" onchange="resolvidosFilialFiltro=this.value;renderInventarioPendente()">
+          <option value="">Todas as filiais</option>
+          ${resolvidosFiliaisDisponiveis.map(f=>`<option value="${esc(f)}" ${resolvidosFilialFiltro===f?'selected':''}>${esc(f)}</option>`).join('')}
+        </select>
+        <select class="filter" onchange="resolvidosTecnicoFiltro=this.value;renderInventarioPendente()">
+          <option value="">Todos os técnicos</option>
+          ${resolvidosTecnicosDisponiveis.map(t=>`<option value="${t.id}" ${resolvidosTecnicoFiltro===t.id?'selected':''}>${t.regiao?'['+esc(t.regiao)+'] ':''}${esc(t.nome)}</option>`).join('')}
+        </select>
+        ${resolvidosTodos.length?`<button class="btn sm" onclick="exportarResolvidosExcel()">${ic('bar-chart-3')} Exportar Excel</button><button class="btn sm" onclick="gerarRelatorioResolvidos()">${ic('printer')} Gerar relatório</button>`:''}
+      </div>
+      <div id="resolvidosTabelaBox"></div>
     </div></div>`;
   renderPerdidosTabela();
+  renderResolvidosTabela();
+}
+// Re-renderiza só a tabela "Histórico de localizados" (mesmo motivo de
+// renderPerdidosTabela() — o campo de busca não pode perder o foco a cada letra).
+function renderResolvidosTabela(){
+  const box = $('#resolvidosTabelaBox'); if(!box) return;
+  const lista = resolvidosFiltrados();
+  if($('#resolvidosTabelaCount')) $('#resolvidosTabelaCount').textContent = lista.length;
+  box.innerHTML = !lista.length ? '<div class="empty">Nenhum item foi localizado ainda (ou nenhum bate com esses filtros).</div>' :
+    `<div class="tbl-wrap"><table><thead><tr><th>Quando</th><th>Nº Série</th><th>Tipo</th><th>Foi localizado</th><th>Usuário</th></tr></thead><tbody>
+      ${lista.map(({mov:m,eq})=>`<tr><td class="mono">${fmtTS(m.ts)}</td><td class="mono">${esc(m.serie)}</td><td>${eq?`<span class="tag-tipo" style="border-left:3px solid ${tipoCor(eq.tipo)}">${esc(tipoNome(eq.tipo))}</span>`:'—'}</td><td>${esc(m.para)}</td><td>${esc(m.usuario||'—')}</td></tr>`).join('')}
+    </tbody></table></div>`;
 }
 // Re-renderiza só a tabela "Pendentes de localizar" (não o resto da tela) — usada pelo
 // campo de busca (oninput, dispara a cada letra) pra não perder o foco do campo a cada
@@ -3385,10 +3431,19 @@ function renderPerdidosTabela(){
   const box = $('#perdidosTabelaBox'); if(!box) return;
   const podeAgir = souAdmin();
   const pendentes = perdidosFiltrados();
+  if($('#perdidosTabelaCount')) $('#perdidosTabelaCount').textContent = pendentes.length;
+  // Com centenas de itens espalhados por muitas filiais, listar tudo de uma vez de
+  // propósito ficava poluído (achado do usuário, 20/07/2026) — a lista detalhada só
+  // aparece depois de algum filtro ser aplicado (filial, tipo ou busca); sem filtro,
+  // o gráfico "Pendentes por filial" acima já dá a visão agrupada/resumida.
+  const temFiltro = perdidosFiliaisFiltro.length>0 || !!perdidosTipoFiltro || perdidosBusca.trim().length>0;
+  if(!temFiltro){
+    box.innerHTML = `<div class="empty">Selecione uma filial (pílula, gráfico ou o campo acima), um tipo, ou busque por um nº de série pra ver a lista detalhada — ${pendentes.length} equipamento(s) pendente(s) ao todo.</div>`;
+    return;
+  }
   const porFilialFiltrado = {};
   pendentes.forEach(e=>{ const f=e.perdidoFilial||'Sem filial'; (porFilialFiltrado[f]=porFilialFiltrado[f]||[]).push(e); });
   const filiaisFiltradas = Object.keys(porFilialFiltrado).sort();
-  if($('#perdidosTabelaCount')) $('#perdidosTabelaCount').textContent = pendentes.length;
   box.innerHTML = !pendentes.length ? '<div class="empty">Nenhum equipamento pendente de localização com esses filtros.</div>' :
     filiaisFiltradas.map(f=>`
       <div style="margin-bottom:18px">
@@ -3428,6 +3483,33 @@ function gerarRelatorioPerdidos(){
     <h2>${esc(titulo)} · ${pendentes.length} item(ns) pendente(s) · gerado em ${hoje}</h2>
     <table><thead><tr><th>Nº Série</th><th>Tipo</th><th>Filial</th><th>Há quanto tempo</th><th>Motivo</th><th>Marcado por</th></tr></thead><tbody>
       ${pendentes.length? pendentes.map(e=>`<tr><td>${esc(e.serie)}</td><td>${esc(tipoNome(e.tipo))}</td><td>${esc(e.perdidoFilial||'—')}</td><td>${fmtDias(Math.floor((Date.now()-(e.perdidoDesde||Date.now()))/86400000))}</td><td>${esc(e.perdidoObs||'—')}</td><td>${esc(e.perdidoUsuario||'—')}</td></tr>`).join('') : '<tr><td colspan="6">Nenhum equipamento pendente de localização.</td></tr>'}
+    </tbody></table>
+    </body></html>`;
+  const w=window.open('','_blank'); if(!w) return flash('Permita pop-ups para gerar o relatório','red'); w.document.write(html); w.document.close();
+}
+function exportarResolvidosExcel(){
+  const lista = resolvidosFiltrados();
+  if(window.__noXLSX||typeof XLSX==='undefined') return flash('Exportação para Excel indisponível (sem internet). Use "Gerar relatório" e imprima como PDF.','red');
+  const linhas = lista.map(({mov:m,eq})=>({ 'Quando':fmtTS(m.ts), 'Nº Série':m.serie, 'Tipo':eq?tipoNome(eq.tipo):'—', 'Foi localizado':m.para, 'Usuário':m.usuario||'—' }));
+  const ws = XLSX.utils.json_to_sheet(linhas.length?linhas:[{'Quando':'','Nº Série':'','Tipo':'','Foi localizado':'','Usuário':'Nenhum item'}]);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Historico Localizados');
+  XLSX.writeFile(wb, 'inventario_pendente_historico_'+(resolvidosFilialFiltro||'todas_filiais').replace(/[^\w-]+/g,'_')+'_'+new Date().toISOString().slice(0,10)+'.xlsx');
+}
+function gerarRelatorioResolvidos(){
+  const lista = resolvidosFiltrados();
+  const titulo = resolvidosFilialFiltro || 'Todas as filiais';
+  const hoje = new Date().toLocaleDateString('pt-BR')+' '+new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
+  const html=`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="utf-8"><title>Relatório de Histórico de Localizados</title>
+    <style>body{font-family:Arial,sans-serif;max-width:820px;margin:30px auto;padding:0 24px;color:#111;font-size:13px;line-height:1.5}
+    h1{font-size:20px;margin-bottom:2px}h2{font-size:13px;font-weight:normal;color:#555;margin-bottom:20px}
+    table{width:100%;border-collapse:collapse;margin:8px 0}th,td{border:1px solid #ccc;padding:7px 9px;text-align:left;font-size:12px}th{background:#f0f0f0}
+    @media print{button{display:none}}</style></head><body>
+    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">Imprimir / Salvar PDF</button>
+    <h1>Relatório de Histórico de Localizados</h1>
+    <h2>${esc(titulo)} · ${lista.length} item(ns) · gerado em ${hoje}</h2>
+    <table><thead><tr><th>Quando</th><th>Nº Série</th><th>Tipo</th><th>Foi localizado</th><th>Usuário</th></tr></thead><tbody>
+      ${lista.length? lista.map(({mov:m,eq})=>`<tr><td>${fmtTS(m.ts)}</td><td>${esc(m.serie)}</td><td>${eq?esc(tipoNome(eq.tipo)):'—'}</td><td>${esc(m.para)}</td><td>${esc(m.usuario||'—')}</td></tr>`).join('') : '<tr><td colspan="5">Nenhum item foi localizado ainda.</td></tr>'}
     </tbody></table>
     </body></html>`;
   const w=window.open('','_blank'); if(!w) return flash('Permita pop-ups para gerar o relatório','red'); w.document.write(html); w.document.close();
