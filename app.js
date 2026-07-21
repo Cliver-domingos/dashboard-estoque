@@ -75,7 +75,9 @@ function equipamentoParaCamel(r){
     rmaDesde:tsToMs(r.rma_desde), rmaOS:r.rma_os, cenarioTeste:r.cenario_teste,
     instaladoTecnicoId:r.instalado_tecnico_id, instaladoOS:r.instalado_os,
     instaladoDesde:tsToMs(r.instalado_desde),
-    operadora:r.operadora, numeroLinha:r.numero_linha
+    operadora:r.operadora, numeroLinha:r.numero_linha,
+    perdido:r.perdido, perdidoDesde:tsToMs(r.perdido_desde), perdidoFilial:r.perdido_filial,
+    perdidoUsuario:r.perdido_usuario, perdidoObs:r.perdido_obs
   };
 }
 function equipamentoParaSnake(e){
@@ -91,7 +93,9 @@ function equipamentoParaSnake(e){
     rma_desde:msToTs(e.rmaDesde), rma_os:e.rmaOS||null, cenario_teste:!!e.cenarioTeste,
     instalado_tecnico_id:e.instaladoTecnicoId||null, instalado_os:e.instaladoOS||null,
     instalado_desde:msToTs(e.instaladoDesde),
-    operadora:e.operadora||null, numero_linha:e.numeroLinha||null
+    operadora:e.operadora||null, numero_linha:e.numeroLinha||null,
+    perdido:!!e.perdido, perdido_desde:msToTs(e.perdidoDesde), perdido_filial:e.perdidoFilial||null,
+    perdido_usuario:e.perdidoUsuario||null, perdido_obs:e.perdidoObs||null
   };
 }
 function movimentacaoParaCamel(r){
@@ -1136,6 +1140,7 @@ const PAGES = [
   { id:'rma',       icon:'recycle', titulo:'Estoque RMA', sub:'Equipamentos enviados para RMA, por filial e técnico', papeis:['admin','supervisor'] },
   { id:'estoquemin', icon:'target', titulo:'Estoque Mínimo', sub:'Filiais abaixo do estoque mínimo por tipo de equipamento', papeis:['admin','supervisor'] },
   { id:'auditoria', icon:'search', titulo:'Auditoria', sub:'Conferência de estoque por técnico ou depósito', papeis:['admin','supervisor'] },
+  { id:'perdidos',  icon:'alert-triangle', titulo:'Inventário Pendente', sub:'Equipamentos não localizados, por filial', papeis:['admin','supervisor'] },
   { id:'hist',      icon:'clock', titulo:'Histórico', sub:'Todas as movimentações registradas', papeis:['admin','supervisor'] },
   { id:'tipos',     icon:'tag', titulo:'Tipos', sub:'Os 5 tipos de equipamento', papeis:['admin','supervisor'] },
   { id:'filiais',   icon:'building-2', titulo:'Filiais', sub:'Cadastro de filiais e depósitos', papeis:['admin'] },
@@ -1170,7 +1175,7 @@ function toggleSidebar(force){
   $('#sidebarOverlay').classList.toggle('show', open);
 }
 
-const RENDERERS = { dashboard:renderDashboard, equip:renderEquip, mov:renderMovPage, tecnicos:renderTecnicos, parados:renderParados, rma:renderRMA, estoquemin:renderEstoqueMinimo, auditoria:renderAuditoria, hist:renderHist, tipos:renderTipos, filiais:renderFiliais, dados:renderDados, usuarios:renderUsuarios, meusItens:renderMeusItens, meuHistorico:renderMeuHistorico, retiradas:renderRetiradas };
+const RENDERERS = { dashboard:renderDashboard, equip:renderEquip, mov:renderMovPage, tecnicos:renderTecnicos, parados:renderParados, rma:renderRMA, estoquemin:renderEstoqueMinimo, auditoria:renderAuditoria, perdidos:renderInventarioPendente, hist:renderHist, tipos:renderTipos, filiais:renderFiliais, dados:renderDados, usuarios:renderUsuarios, meusItens:renderMeusItens, meuHistorico:renderMeuHistorico, retiradas:renderRetiradas };
 function render(){
   // Enquanto a carga inicial de equipamentos ainda não terminou de verdade (ex.: logo
   // depois de um F5), mostra "carregando" em vez de renderizar com o que sobrou no
@@ -1311,8 +1316,9 @@ function renderDashboard(){
   const pendentesConf = pendentesConfirmacaoLista().filter(e=>seriesEq.has(e.serie));
 
   const alertasMinGeral = alertasEstoqueMinPorFilial();
+  const perdidosGeral = souSupervisor() ? DB.equipamentos.filter(e=>e.perdido && regiaoPermitida(e.perdidoFilial)) : DB.equipamentos.filter(e=>e.perdido);
   $('#content').innerHTML = `
-  ${(alertasMinGeral.length||parados.length||tecsSemAud.length||pendentesConf.length)?`
+  ${(alertasMinGeral.length||parados.length||tecsSemAud.length||pendentesConf.length||perdidosGeral.length)?`
   <div class="panel" style="margin-bottom:18px;border-left:4px solid var(--amber)">
     <div class="ph"><h3>${ic('list-checks')} Resumo do dia — o que precisa de ação</h3></div>
     <div class="pb" style="display:flex;flex-wrap:wrap;gap:10px">
@@ -1320,6 +1326,7 @@ function renderDashboard(){
       ${alertasMinGeral.length?`<button class="badge baixado" style="padding:8px 12px;border:0;cursor:pointer" onclick="goto('estoquemin')">${ic('target')} ${alertasMinGeral.length} ${alertasMinGeral.length===1?'alerta de estoque mínimo':'alertas de estoque mínimo'}</button>`:''}
       ${parados.length?`<button class="badge com_tecnico" style="padding:8px 12px;border:0;cursor:pointer" onclick="goto('parados')">${parados.length} ${parados.length===1?'item parado':'itens parados'} ${DIAS_PARADO}+ dias com técnico</button>`:''}
       ${tecsSemAud.length?`<button class="badge gray" style="padding:8px 12px;border:0;cursor:pointer" onclick="goto('auditoria')">${tecsSemAud.length} ${tecsSemAud.length===1?'técnico nunca auditado':'técnicos nunca auditados'}</button>`:''}
+      ${perdidosGeral.length?`<button class="badge baixado" style="padding:8px 12px;border:0;cursor:pointer" onclick="goto('perdidos')">${ic('alert-triangle')} ${perdidosGeral.length} ${perdidosGeral.length===1?'item no Inventário Pendente':'itens no Inventário Pendente'}</button>`:''}
     </div>
   </div>`:''}
   <div class="panel" style="margin-bottom:18px"><div class="pb" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
@@ -2206,6 +2213,7 @@ function retornarSelecionadosRMA(tecnicoId){
   series.forEach(serie=>{
     const e=DB.equipamentos.find(x=>x.serie===serie); if(!e||e.status!=='baixado') return;
     const destino = e.rmaDeposito||e.deposito||'estoque';
+    resolverPerdidoSeNecessario(e, 'Retorno do RMA para '+destino);
     e.status='estoque'; e.tecnicoId=null; e.deposito=e.rmaDeposito||e.deposito; e.local=e.deposito; e.confirmado=true; e.desde=Date.now();
     registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:'retorno_rma', serie, de:'RMA', para:destino, tecnicoId:null, usuario:nomeUsuarioAtual(), obs:'Retorno do RMA ao estoque (admin, em lote)' });
     n++;
@@ -2217,6 +2225,7 @@ function retornarDoRMA(serie){
   const e=DB.equipamentos.find(x=>x.serie===serie); if(!e||e.status!=='baixado') return;
   const destino = e.rmaDeposito||e.deposito||'estoque';
   if(!confirm('Retornar o equipamento '+serie+' do RMA para o estoque de '+destino+'?')) return;
+  resolverPerdidoSeNecessario(e, 'Retorno do RMA para '+destino);
   e.status='estoque'; e.tecnicoId=null; e.deposito=e.rmaDeposito||e.deposito; e.local=e.deposito; e.confirmado=true; e.desde=Date.now();
   registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:'retorno_rma', serie, de:'RMA', para:destino, tecnicoId:null, usuario:nomeUsuarioAtual(), obs:'Retorno do RMA ao estoque (admin)' });
   salvar(); render(); flash('Equipamento retornado ao estoque','green');
@@ -2767,6 +2776,30 @@ function renderDados(){
     <div class="field"><textarea id="chipPasteArea" rows="8" placeholder="Cole aqui os dados copiados do portal..." style="font-family:Consolas,monospace;font-size:12px"></textarea></div>
     <button class="btn primary" onclick="reconhecerChipsColados()">${ic('search')} Reconhecer chips</button>
   </div></div>`:''}
+  ${souAdmin()?`
+  <div class="panel" style="margin-top:18px"><div class="ph"><h3>${ic('alert-triangle')} Marcar equipamento como perdido (Inventário Pendente)</h3></div><div class="pb">
+    <p class="muted" style="margin-bottom:12px">Digite ou cole um ou mais nº de série (separados por espaço, vírgula ou linha). Qualquer movimentação normal feita depois nesse item (entrada, saída, confirmação, baixa, uso em campo, retirada em campo) já tira ele da lista de pendentes automaticamente — acompanhe em <button class="btn sm ghost" style="display:inline-flex;padding:2px 8px" onclick="goto('perdidos')">Inventário Pendente →</button></p>
+    <div class="field" style="margin-bottom:12px"><label>Nº de série</label>
+      <div style="display:flex;gap:8px"><input id="perdidoBusca" placeholder="Bipe ou digite o(s) nº de série..." onkeydown="if(event.key==='Enter'){event.preventDefault();addPerdidoSerieBusca()}" style="flex:1"><button class="btn" onclick="addPerdidoSerieBusca()">+ Adicionar</button></div>
+    </div>
+    <div id="perdidoChips" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px"></div>
+    <div class="field" style="margin-bottom:12px"><label>Motivo (opcional)</label><input id="perdidoMotivo" placeholder="Ex.: não encontrado na auditoria da filial X"></div>
+    <button class="btn red" onclick="confirmarMarcarPerdido()">${ic('alert-triangle')} Marcar como perdido</button>
+  </div></div>
+  <div class="panel" style="margin-top:18px"><div class="ph"><h3>${ic('inbox')} Importar planilha pro Inventário Pendente (várias filiais de uma vez)</h3></div><div class="pb">
+    <p class="muted" style="margin-bottom:12px">Pra marcar muitos equipamentos perdidos de uma vez — de filiais diferentes no mesmo lote. Reconhece as mesmas colunas da importação de estoque acima: <b>Nº Série</b> e <b>Depósito</b> (obrigatórias — cada linha usa o depósito dela própria como filial), Produto/Tipo (opcional, senão detecta pelo padrão do nº de série). Nº de série que ainda não existe no sistema é criado na hora, já em Inventário Pendente.</p>
+    <div class="field" style="margin-bottom:14px"><label>Motivo (aplicado a todo o lote)</label><input id="perdidoMotivoLote" placeholder="Ex.: Auditoria física de 20/07"></div>
+    <div class="grid" style="grid-template-columns:1fr 1fr">
+      <div class="field"><label>Colar dados da planilha</label>
+        <textarea id="perdidoPasteArea" rows="6" placeholder="Cole aqui os dados copiados do Excel (com o cabeçalho)..." style="font-family:Consolas,monospace;font-size:12px"></textarea>
+        <button class="btn red" style="margin-top:10px" onclick="importarColadoPerdido()">Reconhecer e marcar como perdido</button>
+      </div>
+      <div class="field"><label>Abrir arquivo Excel / CSV</label>
+        <input type="file" id="perdidoFileInput" accept=".xlsx,.xls,.csv" onchange="importarArquivoPerdido(this)">
+        ${window.__noXLSX?`<div class="badge baixado" style="margin-top:10px">${ic('alert-triangle')} Leitura de .xlsx indisponível (sem internet). Use CSV ou cole os dados.</div>`:''}
+      </div>
+    </div>
+  </div></div>`:''}
 
   <div class="panel" style="margin-top:18px"><div class="ph"><h3>${ic('save')} Backup & compartilhamento</h3></div><div class="pb">
     <p class="muted" style="margin-bottom:14px">Os dados ficam salvos <b>neste navegador</b>. Para fazer cópia de segurança ou usar em outra máquina/compartilhar via rede, exporte o backup e importe no outro computador.</p>
@@ -2793,6 +2826,7 @@ function renderDados(){
     <button class="btn" onclick="carregarErrosRecentes()">${ic('refresh-cw')} Carregar últimos 50</button>
     <div id="errosRecentesBox" style="margin-top:14px"></div>
   </div></div>`:''}`;
+  renderPerdidoChips();
 }
 async function carregarErrosRecentes(){
   if(!souAdmin()) return;
@@ -3131,6 +3165,336 @@ function renderMovChips(){
   $('#movChips').innerHTML = movSel.map(s=>`<span class="chip">${esc(s)} <span class="rm" role="button" tabindex="0" aria-label="Remover ${esc(s)}" onclick="removeMovSerie('${esc(s)}')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();removeMovSerie('${esc(s)}')}">×</span></span>`).join('');
   if($('#movN')) $('#movN').textContent = movSel.length;
 }
+/* =========================================================
+   INVENTÁRIO PENDENTE — equipamentos marcados manualmente como "não
+   localizados" (20/07/2026). status/tecnicoId NÃO mudam quando isso
+   acontece (fica "estoque"/"com_tecnico" normalmente por baixo) — é só um
+   flag em cima, no mesmo espírito do bloco de trânsito, o que permite
+   qualquer movimentação normal continuar funcionando sem alteração.
+   ========================================================= */
+// Chamada no início de toda função que já mexe num equipamento e grava uma
+// movimentação — se o item estava marcado como perdido, registra UM evento
+// de resolução (de:'Inventário Pendente', para:<descrição de onde foi>) e
+// limpa o flag. Não faz nada se o item não estava perdido (custo zero nos
+// 99% dos casos). Também reaproveitada por desmarcarPerdido() (correção de
+// marcação por engano), só com uma descrição diferente.
+function resolverPerdidoSeNecessario(e, descricao){
+  if(!e.perdido) return;
+  registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:'perdido', serie:e.serie, de:'Inventário Pendente', para:descricao, tecnicoId:e.tecnicoId||null, usuario:nomeUsuarioAtual(), obs:'Estava pendente desde '+fmtTS(e.perdidoDesde)+' ('+(e.perdidoFilial||'—')+')'+(e.perdidoObs?' — motivo original: '+e.perdidoObs:'') });
+  e.perdido=false; e.perdidoDesde=null; e.perdidoFilial=null; e.perdidoUsuario=null; e.perdidoObs=null;
+}
+// Última localização conhecida do equipamento — mesma lógica já usada em "de"
+// nas movimentações (confirmarMov): depósito se estava em estoque, região do
+// técnico se estava com ele.
+function filialAtualDoEquip(e){
+  if(e.status==='com_tecnico'){ const t=DB.tecnicos.find(x=>x.id===e.tecnicoId); return (t&&t.regiao)||''; }
+  return e.deposito||'';
+}
+function marcarComoPerdido(series, motivo){
+  // Só admin (20/07/2026, a pedido do usuário): os formulários de marcar/importar
+  // mudaram pra tela Dados, que já é admin-only — supervisor continua vendo o
+  // dashboard/lista do Inventário Pendente (renderInventarioPendente), só não age mais.
+  if(!souAdmin()) return flash('Somente administradores podem fazer isso','red');
+  const usuario = nomeUsuarioAtual();
+  let n=0, ignorados=0;
+  series.forEach(serie=>{
+    const e = acharEquipPorSerie(serie);
+    if(!e || e.perdido){ ignorados++; return; }
+    const filial = filialAtualDoEquip(e);
+    e.perdido=true; e.perdidoDesde=Date.now(); e.perdidoFilial=filial; e.perdidoUsuario=usuario; e.perdidoObs=motivo||'';
+    registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:'perdido', serie:e.serie, de:filial||'—', para:'Inventário Pendente', tecnicoId:e.tecnicoId||null, usuario, obs:motivo||'' });
+    n++;
+  });
+  salvar(); render();
+  flash(`${n} equipamento(s) marcado(s) como perdido(s)`+(ignorados?`, ${ignorados} ignorado(s) (já perdido ou não encontrado)`:''), n?'green':'red');
+}
+function desmarcarPerdido(serie){
+  if(!souAdmin()) return flash('Somente administradores podem fazer isso','red');
+  const e = acharEquipPorSerie(serie); if(!e || !e.perdido) return;
+  if(!confirm('Remover '+serie+' do Inventário Pendente (marcação por engano)?')) return;
+  resolverPerdidoSeNecessario(e, 'Removido do painel (marcação cancelada)');
+  salvar(); render(); flash('Marcação removida','green');
+}
+
+let perdidoSel = [];
+function addPerdidoSerieBusca(){
+  const bruto = $('#perdidoBusca').value.trim(); if(!bruto) return;
+  const tokens = bruto.split(/[\s,;]+/).map(s=>s.trim()).filter(Boolean);
+  let achados=0; const ignorados=[];
+  tokens.forEach(v=>{
+    const e = acharEquipPorSerie(v);
+    if(!e){ ignorados.push(v+' (não encontrado)'); return; }
+    if(e.perdido){ ignorados.push(v+' (já pendente)'); return; }
+    if(!perdidoSel.includes(e.serie)){ perdidoSel.push(e.serie); achados++; }
+  });
+  $('#perdidoBusca').value='';
+  renderPerdidoChips();
+  if(ignorados.length) flash((achados?achados+' adicionado(s)':'Nada adicionado')+' — ignorado(s): '+ignorados.join(', '), achados?'':'red');
+}
+function removePerdidoSerie(serie){ perdidoSel = perdidoSel.filter(s=>s!==serie); renderPerdidoChips(); }
+function renderPerdidoChips(){
+  const el = $('#perdidoChips'); if(!el) return;
+  el.innerHTML = perdidoSel.map(s=>`<span class="chip">${esc(s)} <span class="rm" role="button" tabindex="0" aria-label="Remover ${esc(s)}" onclick="removePerdidoSerie('${esc(s)}')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();removePerdidoSerie('${esc(s)}')}">×</span></span>`).join('');
+}
+function confirmarMarcarPerdido(){
+  if(!perdidoSel.length) return flash('Adicione ao menos um nº de série','red');
+  const motivo = $('#perdidoMotivo')?$('#perdidoMotivo').value.trim():'';
+  const series = perdidoSel.slice();
+  perdidoSel = [];
+  marcarComoPerdido(series, motivo);
+}
+let perdidosFiliaisFiltro = []; // array de filiais selecionadas no dashboard; vazio = todas
+let perdidosBusca = ''; // busca por nº de série, só afeta a tabela "Pendentes de localizar" (não os KPIs/gráficos)
+let perdidosTipoFiltro = ''; // tipo de equipamento; vazio = todos
+function perdidosToggleFilial(f){
+  const i = perdidosFiliaisFiltro.indexOf(f);
+  if(i>=0) perdidosFiliaisFiltro.splice(i,1); else perdidosFiliaisFiltro.push(f);
+  renderInventarioPendente();
+}
+// Lista de pendentes já com TODOS os filtros aplicados (região do supervisor, pílula de
+// filial, tipo, busca por série) — reaproveitada pela exportação (Excel/relatório) e pela
+// tabela "Pendentes de localizar", pra exportar sempre bater exatamente com o que está
+// filtrado na tela (mesmo princípio de dashboardFiltrado()/rmaFiltrado() já usado em
+// outras telas). Os KPIs/gráficos do topo usam essa mesma função nos renders completos
+// (clique de pílula, carregamento da tela), mas a busca por texto só re-renderiza a
+// tabela (renderPerdidosTabela(), parcial — evita perder o foco do campo a cada letra
+// digitada, mesmo motivo de filtrarEquip()/renderEquipTabela() em Equipamentos), então
+// os KPIs podem ficar "uma letra atrasados" em relação à tabela enquanto o usuário digita
+// — não é bug, é a mesma concessão já aceita naquela tela.
+function perdidosFiltrados(){
+  let pendentes = DB.equipamentos.filter(e=>e.perdido);
+  if(souSupervisor()) pendentes = pendentes.filter(e=>regiaoPermitida(e.perdidoFilial));
+  if(perdidosFiliaisFiltro.length) pendentes = pendentes.filter(e=>perdidosFiliaisFiltro.includes(e.perdidoFilial||'Sem filial'));
+  if(perdidosTipoFiltro) pendentes = pendentes.filter(e=>e.tipo===perdidosTipoFiltro);
+  const q = perdidosBusca.trim().toLowerCase();
+  if(q) pendentes = pendentes.filter(e=>e.serie.toLowerCase().includes(q));
+  return pendentes;
+}
+function renderInventarioPendente(){
+  // Marcar/desmarcar/importar em massa viraram ações só de admin (20/07/2026, a pedido do
+  // usuário — os formulários mudaram pra tela Dados, junto das outras ferramentas
+  // administrativas de dados). Supervisor continua enxergando o dashboard/lista da
+  // própria região normalmente, só não vê o botão de ação (checado em renderPerdidosTabela()).
+  let pendentesTodos = DB.equipamentos.filter(e=>e.perdido);
+  if(souSupervisor()) pendentesTodos = pendentesTodos.filter(e=>regiaoPermitida(e.perdidoFilial));
+
+  // Pílulas de filtro por filial (dashboard) — mesmo padrão de dashFiliais em renderDashboard().
+  const porFilialTodos = {};
+  pendentesTodos.forEach(e=>{ const f=e.perdidoFilial||'Sem filial'; (porFilialTodos[f]=porFilialTodos[f]||[]).push(e); });
+  const filiaisDisponiveis = Object.keys(porFilialTodos).sort();
+  perdidosFiliaisFiltro = perdidosFiliaisFiltro.filter(f=>filiaisDisponiveis.includes(f)); // limpa filial que sumiu (item resolvido)
+  const pendentes = perdidosFiltrados();
+  const maxFilial = Math.max(1, ...filiaisDisponiveis.map(f=>porFilialTodos[f].length));
+  // Ordem do gráfico de barras "Pendentes por filial": maior pra menor (mesmo padrão de
+  // RMA/Itens Parados/Estoque Mínimo) — diferente da ordem alfabética das pílulas acima.
+  const filialArr = Object.entries(porFilialTodos).map(([f,arr])=>[f,arr.length]).sort((a,b)=>b[1]-a[1]);
+  // Tipos oferecidos no dropdown: todos os presentes no escopo (região + pílula de
+  // filial), sem considerar o próprio filtro de tipo — mesmo princípio das pílulas de
+  // status em renderDashboard(), que mostram a contagem "se eu escolhesse essa opção".
+  const tiposDisponiveis = [...new Set(pendentesTodos.map(e=>e.tipo))].sort((a,b)=>tipoNome(a).localeCompare(tipoNome(b)));
+
+  const porTipo = {};
+  pendentes.forEach(e=>{ porTipo[e.tipo]=(porTipo[e.tipo]||0)+1; });
+  const tiposArr = Object.entries(porTipo).sort((a,b)=>b[1]-a[1]);
+  // Distribuição por tipo agora é um gráfico de pizza/donut (mesmo componente donut() já
+  // usado em renderRMA()/renderDashboard()), reagindo ao filtro de filial das pílulas —
+  // pedido explícito do usuário, "igual tem nas outras telas".
+  const donutTipo = tiposArr.map(([t,n])=>[tipoNome(t),n,tipoCor(t)]);
+  const diasMaisAntigo = pendentes.length ? Math.floor(Math.max(...pendentes.map(e=>Date.now()-(e.perdidoDesde||Date.now())))/86400000) : null;
+
+  // Histórico de resolvidos: qualquer movimentação registrada por resolverPerdidoSeNecessario
+  // tem sempre de==='Inventário Pendente' — convenção que separa evento de marcação
+  // (para==='Inventário Pendente') de evento de resolução, sem precisar de coluna nova.
+  // Não filtrado por filial/região de propósito (é só um log histórico somativo, não uma
+  // ação — mesmo tratamento dado a outros logs consolidados do sistema; a movimentação de
+  // resolução não guarda a filial de origem em campo próprio, só dentro do texto de obs).
+  const resolvidos = DB.movimentacoes.filter(m=>m.tipo==='perdido' && m.de==='Inventário Pendente')
+    .slice().sort((a,b)=>b.ts-a.ts).slice(0,200);
+  const resolvidosSemana = resolvidos.filter(m=>m.ts>=Date.now()-7*86400000).length;
+
+  $('#content').innerHTML = `
+    <div class="panel" style="margin-bottom:18px"><div class="pb" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <span style="font-weight:700;font-size:12.5px;color:var(--txt-soft);white-space:nowrap">${ic('map-pin')} FILIAL ${perdidosFiliaisFiltro.length?`<span class="muted" style="font-weight:500">(${perdidosFiliaisFiltro.length} selecionada${perdidosFiliaisFiltro.length>1?'s':''} · clique pra adicionar/remover)</span>`:'<span class="muted" style="font-weight:500">(clique pra filtrar, pode escolher várias)</span>'}</span>
+      <div class="pill-tabs" style="flex-wrap:wrap;background:transparent;padding:0;gap:8px">
+        <button class="${!perdidosFiliaisFiltro.length?'active':''}" style="background:${!perdidosFiliaisFiltro.length?'var(--brand)':'var(--panel-soft)'};color:${!perdidosFiliaisFiltro.length?'#fff':'var(--txt)'};border-radius:var(--radius-md)" onclick="perdidosFiliaisFiltro=[];renderInventarioPendente()">Todas <span class="count-badge" style="background:rgba(255,255,255,.25);color:inherit;margin-left:4px">${pendentesTodos.length}</span></button>
+        ${filiaisDisponiveis.map(f=>{ const on=perdidosFiliaisFiltro.includes(f); return `
+          <button class="${on?'active':''}" style="background:${on?'var(--brand)':'var(--panel-soft)'};color:${on?'#fff':'var(--txt)'};border-radius:var(--radius-md)" onclick="perdidosToggleFilial('${esc(f)}')">${on?ic('check')+' ':''}${esc(f)} <span class="count-badge" style="background:${on?'rgba(255,255,255,.25)':'var(--surface-2)'};color:inherit;margin-left:4px">${porFilialTodos[f].length}</span></button>`;}).join('')}
+      </div>
+      <div class="spacer"></div>
+      ${pendentes.length?`<button class="btn sm" onclick="exportarPerdidosExcel()">${ic('bar-chart-3')} Exportar Excel</button><button class="btn sm" onclick="gerarRelatorioPerdidos()">${ic('printer')} Gerar relatório</button>`:''}
+    </div></div>
+
+    <div class="grid kpis" style="margin-bottom:20px">
+      ${kpi('r','alert-triangle','Pendentes de localizar',pendentes.length)}
+      ${kpi('b','map-pin','Filiais afetadas',filiaisDisponiveis.length)}
+      ${kpi('a','alarm-clock','Mais antigo (dias)',diasMaisAntigo==null?'—':diasMaisAntigo)}
+      ${kpi('g','check','Localizados (7 dias)',resolvidosSemana)}
+    </div>
+
+    <div class="chart-row" style="margin-bottom:20px">
+      <div class="panel">
+        <div class="ph"><h3>${ic('map-pin')} Pendentes por filial</h3></div>
+        <div class="pb">
+          ${filialArr.length?filialArr.map(([f,n])=>{
+            const intensidade = n/maxFilial; // 0 a 1 — mais itens pendentes = vermelho mais forte/escuro (mesmo padrão de RMA/Itens Parados)
+            const cor = `rgb(${220-Math.round(60*(1-intensidade))},${38+Math.round(90*(1-intensidade))},${38+Math.round(90*(1-intensidade))})`;
+            return `
+            <div class="bar-row" style="cursor:pointer" onclick="perdidosToggleFilial('${esc(f)}')">
+              <div class="bl">${esc(f)}</div>
+              <div class="bar-track"><div class="bar-fill" style="width:${n/maxFilial*100}%;background:${cor}">${n}</div></div>
+            </div>`;}).join(''):'<div class="empty">Nenhum equipamento pendente de localização — tudo certo.</div>'}
+        </div>
+      </div>
+      <div class="panel">
+        <div class="ph"><h3>${ic('package')} Distribuição por tipo</h3></div>
+        <div class="pb"><div class="donut-wrap">
+          ${donutTipo.length?donut(donutTipo):'<div class="empty">Sem dados</div>'}
+        </div></div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-bottom:18px"><div class="ph"><h3>${ic('list-checks')} Pendentes de localizar</h3><span class="count-badge" id="perdidosTabelaCount">${pendentes.length}</span></div><div class="pb">
+      <div class="toolbar" style="margin-bottom:16px">
+        <div class="search"><span class="si">${ic('search')}</span><input placeholder="Buscar por nº de série..." value="${esc(perdidosBusca)}" oninput="perdidosBusca=this.value;renderPerdidosTabela()"></div>
+        <select class="filter" onchange="perdidosTipoFiltro=this.value;renderInventarioPendente()">
+          <option value="">Todos os tipos</option>
+          ${tiposDisponiveis.map(t=>`<option value="${t}" ${perdidosTipoFiltro===t?'selected':''}>${esc(tipoNome(t))}</option>`).join('')}
+        </select>
+        <select class="filter" onchange="perdidosFiliaisFiltro=this.value?[this.value]:[];renderInventarioPendente()">
+          <option value="">Todas as filiais</option>
+          ${filiaisDisponiveis.map(f=>`<option value="${esc(f)}" ${perdidosFiliaisFiltro.length===1&&perdidosFiliaisFiltro[0]===f?'selected':''}>${esc(f)}</option>`).join('')}
+        </select>
+        ${pendentes.length?`<button class="btn sm" onclick="exportarPerdidosExcel()">${ic('bar-chart-3')} Exportar Excel</button><button class="btn sm" onclick="gerarRelatorioPerdidos()">${ic('printer')} Gerar relatório</button>`:''}
+      </div>
+      <div id="perdidosTabelaBox"></div>
+    </div></div>
+
+    <div class="panel"><div class="ph"><h3>${ic('clock')} Histórico de localizados</h3><span class="count-badge">${resolvidos.length}</span></div><div class="pb">
+      ${!resolvidos.length ? '<div class="empty">Nenhum item foi localizado ainda.</div>' :
+        `<div class="tbl-wrap"><table><thead><tr><th>Quando</th><th>Nº Série</th><th>Foi localizado</th><th>Usuário</th></tr></thead><tbody>
+          ${resolvidos.map(m=>`<tr><td class="mono">${fmtTS(m.ts)}</td><td class="mono">${esc(m.serie)}</td><td>${esc(m.para)}</td><td>${esc(m.usuario||'—')}</td></tr>`).join('')}
+        </tbody></table></div>`}
+    </div></div>`;
+  renderPerdidosTabela();
+}
+// Re-renderiza só a tabela "Pendentes de localizar" (não o resto da tela) — usada pelo
+// campo de busca (oninput, dispara a cada letra) pra não perder o foco do campo a cada
+// tecla, mesmo motivo de filtrarEquip()/renderEquipTabela() em Equipamentos. Reflete
+// todos os filtros de perdidosFiltrados() (região, pílula de filial, tipo, busca).
+function renderPerdidosTabela(){
+  const box = $('#perdidosTabelaBox'); if(!box) return;
+  const podeAgir = souAdmin();
+  const pendentes = perdidosFiltrados();
+  const porFilialFiltrado = {};
+  pendentes.forEach(e=>{ const f=e.perdidoFilial||'Sem filial'; (porFilialFiltrado[f]=porFilialFiltrado[f]||[]).push(e); });
+  const filiaisFiltradas = Object.keys(porFilialFiltrado).sort();
+  if($('#perdidosTabelaCount')) $('#perdidosTabelaCount').textContent = pendentes.length;
+  box.innerHTML = !pendentes.length ? '<div class="empty">Nenhum equipamento pendente de localização com esses filtros.</div>' :
+    filiaisFiltradas.map(f=>`
+      <div style="margin-bottom:18px">
+        <h4 style="margin-bottom:8px">${esc(f)} <span class="count-badge">${porFilialFiltrado[f].length}</span></h4>
+        <div class="tbl-wrap"><table><thead><tr><th>Nº Série</th><th>Tipo</th><th>Há quanto tempo</th><th>Motivo</th><th>Marcado por</th>${podeAgir?'<th></th>':''}</tr></thead><tbody>
+          ${porFilialFiltrado[f].map(e=>`<tr>
+            <td class="mono">${esc(e.serie)}</td>
+            <td><span class="tag-tipo" style="border-left:3px solid ${tipoCor(e.tipo)}">${esc(tipoNome(e.tipo))}</span></td>
+            <td>${fmtDias(Math.floor((Date.now()-(e.perdidoDesde||Date.now()))/86400000))}</td>
+            <td>${esc(e.perdidoObs||'—')}</td>
+            <td>${esc(e.perdidoUsuario||'—')}</td>
+            ${podeAgir?`<td class="right"><button class="btn sm" onclick="desmarcarPerdido('${esc(e.serie)}')">Desmarcar</button></td>`:''}
+          </tr>`).join('')}
+        </tbody></table></div>
+      </div>`).join('');
+}
+function exportarPerdidosExcel(){
+  const pendentes = perdidosFiltrados();
+  if(window.__noXLSX||typeof XLSX==='undefined') return flash('Exportação para Excel indisponível (sem internet). Use "Gerar relatório" e imprima como PDF.','red');
+  const linhas = pendentes.map(e=>({ 'Nº Série':e.serie, 'Tipo':tipoNome(e.tipo), 'Filial':e.perdidoFilial||'—', 'Há quanto tempo':fmtDias(Math.floor((Date.now()-(e.perdidoDesde||Date.now()))/86400000)), 'Motivo':e.perdidoObs||'—', 'Marcado por':e.perdidoUsuario||'—' }));
+  const ws = XLSX.utils.json_to_sheet(linhas.length?linhas:[{'Nº Série':'','Tipo':'','Filial':'','Há quanto tempo':'','Motivo':'','Marcado por':'Nenhum item'}]);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Inventario Pendente');
+  XLSX.writeFile(wb, 'inventario_pendente_'+(perdidosFiliaisFiltro.length?perdidosFiliaisFiltro.join('_'):'todas_filiais').replace(/[^\w-]+/g,'_')+'_'+new Date().toISOString().slice(0,10)+'.xlsx');
+}
+function gerarRelatorioPerdidos(){
+  const pendentes = perdidosFiltrados();
+  const titulo = perdidosFiliaisFiltro.length ? perdidosFiliaisFiltro.join(', ') : 'Todas as filiais';
+  const hoje = new Date().toLocaleDateString('pt-BR')+' '+new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
+  const html=`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="utf-8"><title>Relatório de Inventário Pendente</title>
+    <style>body{font-family:Arial,sans-serif;max-width:820px;margin:30px auto;padding:0 24px;color:#111;font-size:13px;line-height:1.5}
+    h1{font-size:20px;margin-bottom:2px}h2{font-size:13px;font-weight:normal;color:#555;margin-bottom:20px}
+    table{width:100%;border-collapse:collapse;margin:8px 0}th,td{border:1px solid #ccc;padding:7px 9px;text-align:left;font-size:12px}th{background:#f0f0f0}
+    @media print{button{display:none}}</style></head><body>
+    <button onclick="window.print()" style="padding:8px 16px;margin-bottom:16px;cursor:pointer">Imprimir / Salvar PDF</button>
+    <h1>Relatório de Inventário Pendente</h1>
+    <h2>${esc(titulo)} · ${pendentes.length} item(ns) pendente(s) · gerado em ${hoje}</h2>
+    <table><thead><tr><th>Nº Série</th><th>Tipo</th><th>Filial</th><th>Há quanto tempo</th><th>Motivo</th><th>Marcado por</th></tr></thead><tbody>
+      ${pendentes.length? pendentes.map(e=>`<tr><td>${esc(e.serie)}</td><td>${esc(tipoNome(e.tipo))}</td><td>${esc(e.perdidoFilial||'—')}</td><td>${fmtDias(Math.floor((Date.now()-(e.perdidoDesde||Date.now()))/86400000))}</td><td>${esc(e.perdidoObs||'—')}</td><td>${esc(e.perdidoUsuario||'—')}</td></tr>`).join('') : '<tr><td colspan="6">Nenhum equipamento pendente de localização.</td></tr>'}
+    </tbody></table>
+    </body></html>`;
+  const w=window.open('','_blank'); if(!w) return flash('Permita pop-ups para gerar o relatório','red'); w.document.write(html); w.document.close();
+}
+// Importação em massa pro Inventário Pendente — pensada pra planilhas com equipamentos
+// de VÁRIAS filiais diferentes no mesmo lote (diferente da marcação manual/do formulário
+// acima, que é 1 filial calculada automaticamente por vez). Reaproveita o mesmo
+// reconhecimento de colunas da importação de estoque (COL_MAP/acharCol/parseCSVLinha,
+// app.js:~3327+), mas a coluna Depósito aqui é OBRIGATÓRIA e é ela que vira
+// perdido_filial de cada linha (decisão do usuário, 20/07/2026) — ao contrário da
+// marcação manual, que calcula a filial pela localização atual do item no sistema.
+function parseLinhasPerdido(matriz, motivo){
+  if(!souAdmin()) return flash('Somente administradores podem fazer isso','red');
+  if(!matriz.length){ flash('Arquivo vazio','red'); return; }
+  let hi=0; for(let i=0;i<Math.min(20,matriz.length);i++){ const row=matriz[i].map(c=>String(c).toLowerCase()); if(row.some(c=>c.includes('série')||c.includes('serie'))){ hi=i; break; } }
+  const headers=matriz[hi].map(c=>String(c));
+  const ci={ serie:acharCol(headers,COL_MAP.serie), produto:acharCol(headers,COL_MAP.produto), deposito:acharCol(headers,COL_MAP.deposito) };
+  if(ci.serie<0){ flash('Não encontrei a coluna "Nº Série". Verifique o cabeçalho.','red'); return; }
+  if(ci.deposito<0){ flash('Não encontrei a coluna "Depósito" — obrigatória aqui, já que cada linha pode ser de uma filial diferente.','red'); return; }
+
+  const usuario = nomeUsuarioAtual();
+  let marcados=0, criados=0, ignorados=0;
+  for(let i=hi+1;i<matriz.length;i++){
+    const row=matriz[i]; if(!row||!row.length) continue;
+    const serie=String(row[ci.serie]==null?'':row[ci.serie]).trim(); if(!serie) continue;
+    const filial = limparFilial(row[ci.deposito]||'');
+    if(!filial){ ignorados++; continue; }
+    let e = acharEquipPorSerie(serie);
+    if(e){
+      if(e.perdido){ ignorados++; continue; }
+    } else {
+      const tipoProduto = ci.produto>=0? String(row[ci.produto]||'').trim() : '';
+      const tipo = detectarTipoPorSerie(serie) || tipoProduto || 'SEM-TIPO';
+      e = { serie, tipo, deposito:filial, local:filial, status:'estoque', tecnicoId:null, dataEntrada:'', origem:'', familia:'', derivacao:'', um:'', obs:'', confirmado:true, desde:Date.now() };
+      DB.equipamentos.push(e);
+      if(!DB.tipos[tipo]) DB.tipos[tipo]={nome:tipo,cor:''};
+      criados++;
+    }
+    e.perdido=true; e.perdidoDesde=Date.now(); e.perdidoFilial=filial; e.perdidoUsuario=usuario; e.perdidoObs=motivo||'';
+    registrarMovimentacao({ id:uid(), ts:Date.now(), tipo:'perdido', serie:e.serie, de:filial, para:'Inventário Pendente', tecnicoId:e.tecnicoId||null, usuario, obs:motivo||'' });
+    marcados++;
+  }
+  salvar(); render();
+  flash(`${marcados} equipamento(s) marcado(s) como perdido(s)`+(criados?`, ${criados} novo(s) no sistema`:'')+(ignorados?`, ${ignorados} ignorado(s) (já perdido ou sem depósito)`:''), marcados?'green':'red');
+}
+function importarColadoPerdido(){
+  const txt=$('#perdidoPasteArea').value; if(!txt.trim()) return flash('Cole os dados primeiro','red');
+  const motivo = $('#perdidoMotivoLote')?$('#perdidoMotivoLote').value.trim():'';
+  const delim = txt.includes('\t')?'\t':(txt.split('\n')[0].includes(';')?';':',');
+  const matriz = txt.replace(/\r/g,'').split('\n').filter(l=>l.trim()).map(l=>parseCSVLinha(l,delim));
+  parseLinhasPerdido(matriz, motivo);
+}
+function importarArquivoPerdido(input){
+  const file=input.files[0]; if(!file) return;
+  const motivo = $('#perdidoMotivoLote')?$('#perdidoMotivoLote').value.trim():'';
+  const reader=new FileReader();
+  if(/\.csv$/i.test(file.name)){
+    reader.onload=e=>{ const txt=e.target.result; const delim=txt.includes('\t')?'\t':(txt.split('\n')[0].includes(';')?';':','); const matriz=txt.replace(/\r/g,'').split('\n').filter(l=>l.trim()).map(l=>parseCSVLinha(l,delim)); parseLinhasPerdido(matriz,motivo); };
+    reader.readAsText(file,'utf-8');
+  } else {
+    if(window.__noXLSX||typeof XLSX==='undefined') return flash('Leitura de Excel indisponível (sem internet). Salve como CSV ou cole os dados.','red');
+    reader.onload=e=>{ const wb=XLSX.read(new Uint8Array(e.target.result),{type:'array'}); const ws=wb.Sheets[wb.SheetNames[0]]; const matriz=XLSX.utils.sheet_to_json(ws,{header:1,raw:false,defval:''}); parseLinhasPerdido(matriz,motivo); };
+    reader.readAsArrayBuffer(file);
+  }
+  input.value='';
+}
+
 function confirmarMov(){
   if(!movSel.length) return flash('Selecione ao menos um equipamento','red');
   const usuario = nomeUsuarioAtual();
@@ -3165,6 +3529,11 @@ function confirmarMov(){
     const e=DB.equipamentos.find(x=>x.serie===serie); if(!e || e.emTransito) return;
     const de = e.status==='com_tecnico'? tecNome(e.tecnicoId) : (e.local||e.deposito||'Estoque');
     const tecnicoAnterior = e.tecnicoId;
+    const descricaoPerdido = (movTipo==='saida'||movTipo==='transferencia') ? 'Enviado para '+destinoTxt
+      : movTipo==='entrada' ? 'Entrada no estoque de '+destinoTxt
+      : movTipo==='baixa' ? 'Enviado para RMA (OS '+numeroOS+')'
+      : 'Uso em campo (OS '+numeroOS+')';
+    resolverPerdidoSeNecessario(e, descricaoPerdido);
     if(movTipo==='saida'||movTipo==='transferencia'){
       // fica "em trânsito": só sai do estoque/técnico de origem quando o destinatário confirmar o recebimento
       e.emTransito=true; e.transitoPara=tecId; e.transitoDesde=Date.now(); e.transitoDe=de; e.transitoUsuario=usuario; e.transitoDeTecnicoId=tecnicoAnterior||null;
@@ -4215,6 +4584,7 @@ function aplicarEquipRetiradaOtimista(serie, tipoNovo, para, tecnicoObj){
     if(!DB.tipos[tipoNovo]) DB.tipos[tipoNovo]={nome:tipoNovo,cor:''};
   } else {
     if(!DB.equipamentos.some(x=>x.serie===e.serie)) DB.equipamentos.push(e); // achado só no servidor (era de outro técnico) — traz pro array local pra sincronizar
+    resolverPerdidoSeNecessario(e, 'Retirada em campo por '+tecNome(tecnicoObj.id));
     e.status='com_tecnico'; e.tecnicoId=tecnicoObj.id; e.local=para; e.confirmado=true; e.emTransito=false; e.transitoPara=null; e.transitoDesde=null; e.transitoDe=null; e.desde=Date.now();
   }
   if(souTecnico()){ delete equipsIncomingMap[e.serie]; equipsOwnMap[e.serie]=e; } // já é meu agora, atualiza os mapas na hora
@@ -4353,6 +4723,7 @@ function confirmarRecebimento(serie, semConfirm){
   if(!semConfirm && !confirm('Confirmar o recebimento do equipamento '+serie+'?')) return;
   const destinoId = e.transitoPara;
   const origemTecId = e.transitoDeTecnicoId||null;
+  resolverPerdidoSeNecessario(e, 'Recebimento confirmado por '+tecNome(destinoId));
   e.status='com_tecnico'; e.tecnicoId=destinoId; e.local=tecNome(destinoId); e.confirmado=true; e.desde=Date.now();
   e.emTransito=false; e.transitoPara=null; e.transitoDesde=null; e.transitoDe=null; e.transitoUsuario=null; e.transitoDeTecnicoId=null;
   // O item muda de categoria (de "a caminho" pra "meu"); atualiza os mapas na hora, sem
