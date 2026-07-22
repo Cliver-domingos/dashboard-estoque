@@ -3965,23 +3965,29 @@ function normalizarNomeTec(s){
 // invisível que a normalização acima não tenha previsto — rede de segurança
 // extra pra planilha externa, sem abrir mão da exigência de casar 1 só nome.
 function normalizarNomeTecLetras(s){ return normalizarNomeTec(s).replace(/[^a-z]/g,''); }
+// BUG-054: descoberto ao investigar por que NENHUM técnico casava mesmo com
+// nome idêntico (planilha real do usuário, 22/07/2026) — a causa não era
+// texto sujo, era o cadastro de técnicos ter ~92 registros duplicados
+// (mesma pessoa cadastrada 2x, IDs diferentes; já corrigido em produção).
+// candidatosTecnicoPorNome() expõe a lista inteira de candidatos (não só
+// o match final) pra distinguir "não achei ninguém" de "achei mais de um" —
+// essa distinção é o que teria tornado aquele diagnóstico imediato em vez de
+// precisar investigar o banco direto.
+function candidatosTecnicoPorNome(nomeExtraido){
+  const alvo = normalizarNomeTec(nomeExtraido);
+  if(!alvo) return [];
+  const exatos = DB.tecnicos.filter(t=>normalizarNomeTec(t.nome)===alvo);
+  if(exatos.length) return exatos;
+  const alvoLetras = normalizarNomeTecLetras(nomeExtraido);
+  if(!alvoLetras) return [];
+  return DB.tecnicos.filter(t=>normalizarNomeTecLetras(t.nome)===alvoLetras);
+}
 // Só casa se for único candidato com nome idêntico (ignorando acento/caixa) —
 // nome ambíguo (2 técnicos com mesmo nome) ou não encontrado fica sem match,
 // exigindo escolha manual no modal em vez de arriscar mandar pro técnico errado.
 function acharTecnicoPorNomePlanilha(raw){
-  const nomeExtraido = extrairNomeTecnicoBruto(raw);
-  const alvo = normalizarNomeTec(nomeExtraido);
-  if(!alvo) return null;
-  let candidatos = DB.tecnicos.filter(t=>normalizarNomeTec(t.nome)===alvo);
-  if(candidatos.length===1) return candidatos[0];
-  if(candidatos.length===0){
-    const alvoLetras = normalizarNomeTecLetras(nomeExtraido);
-    if(alvoLetras){
-      candidatos = DB.tecnicos.filter(t=>normalizarNomeTecLetras(t.nome)===alvoLetras);
-      if(candidatos.length===1) return candidatos[0];
-    }
-  }
-  return null;
+  const candidatos = candidatosTecnicoPorNome(extrairNomeTecnicoBruto(raw));
+  return candidatos.length===1 ? candidatos[0] : null;
 }
 function extrairOperadoraPlanilha(raw){
   const s = String(raw||'').trim();
@@ -4011,14 +4017,16 @@ function parseLinhasChipsTecnico(matriz){
     const duplicado = !!acharEquipPorSerie(serie) || vistos.has(serie.toLowerCase());
     vistos.add(serie.toLowerCase());
     const tecnicoRaw = ci.tecnico>=0? String(row[ci.tecnico]||'').trim() : '';
-    const tecnico = acharTecnicoPorNomePlanilha(tecnicoRaw);
+    const tecnicoNome = extrairNomeTecnicoBruto(tecnicoRaw);
+    const candidatosTecnico = candidatosTecnicoPorNome(tecnicoNome);
     linhas.push({
       serie, duplicado,
       operadora: ci.operadora>=0? extrairOperadoraPlanilha(row[ci.operadora]) : '',
       numeroLinha: ci.numeroLinha>=0? String(row[ci.numeroLinha]||'').trim() : '',
       entregueTS: ci.entregue>=0? parseDataChipPlanilha(row[ci.entregue]) : null,
-      tecnicoRaw, tecnicoNome: extrairNomeTecnicoBruto(tecnicoRaw),
-      tecnicoId: tecnico ? tecnico.id : ''
+      tecnicoRaw, tecnicoNome,
+      tecnicoId: candidatosTecnico.length===1 ? candidatosTecnico[0].id : '',
+      tecnicoAmbiguo: candidatosTecnico.length>1
     });
   }
   if(!linhas.length) return flash('Nenhuma linha reconhecida na planilha','red');
@@ -4058,7 +4066,7 @@ function abrirModalImportChipsTecnico(){
       <td><select onchange="trocarTecnicoImportLinha(${i},this.value)" style="padding:6px 8px;border:1px solid var(--line);border-radius:var(--radius-md);background:var(--panel);color:var(--txt)">
           <option value="">— selecione —</option>
           ${agruparTecsPorFilialOpt(DB.tecnicos, c.tecnicoId)}
-        </select>${!c.tecnicoId?`<div class="muted" style="font-size:11px;margin-top:2px">Não identifiquei "${esc(c.tecnicoNome)}" — selecione manualmente</div>`:''}</td>
+        </select>${!c.tecnicoId?`<div class="muted" style="font-size:11px;margin-top:2px">${c.tecnicoAmbiguo?`Encontrei mais de um técnico chamado "${esc(c.tecnicoNome)}" — escolha qual é`:`Não encontrei "${esc(c.tecnicoNome)}" no cadastro — selecione manualmente ou cadastre-o antes`}</div>`:''}</td>
     </tr>`;
   }).join('');
   const novos = chipsTecPendentesImport.filter(c=>!c.duplicado).length;
