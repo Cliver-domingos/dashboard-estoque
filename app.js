@@ -2812,6 +2812,20 @@ function renderDados(){
     <button class="btn primary" onclick="reconhecerChipsColados()">${ic('search')} Reconhecer chips</button>
   </div></div>`:''}
   ${souAdmin()?`
+  <div class="panel" style="margin-top:18px"><div class="ph"><h3>${ic('inbox')} Importar chips em lote — já em mãos dos técnicos (planilha)</h3></div><div class="pb">
+    <p class="muted" style="margin-bottom:12px">Pra dar entrada de uma vez em chips que os técnicos já têm fisicamente, cada um no perfil do técnico certo. Reconhece as colunas <b>IccId</b> (ou Nº Série) e <b>Técnico</b> (obrigatórias), além de <b>Operadora</b>, <b>Linha</b> e <b>Entregue</b> (data em que o técnico recebeu — opcional, mas quando vier é usada como a data real do envio, não a de hoje). O nome do técnico é reconhecido mesmo com prefixo de filial na frente (ex.: "SOO - EPV - A365 - Fulano de Tal" vira "Fulano de Tal"). Antes de confirmar, você revisa linha por linha — cada chip entra em trânsito para o técnico indicado, que confirma o recebimento na tela dele, igual a qualquer outro envio.</p>
+    <div class="grid" style="grid-template-columns:1fr 1fr">
+      <div class="field"><label>Colar dados da planilha</label>
+        <textarea id="chipTecPasteArea" rows="6" placeholder="Cole aqui os dados copiados do Excel (com o cabeçalho)..." style="font-family:Consolas,monospace;font-size:12px"></textarea>
+        <button class="btn primary" style="margin-top:10px" onclick="importarColadoChipsTecnico()">${ic('search')} Reconhecer chips</button>
+      </div>
+      <div class="field"><label>Abrir arquivo Excel / CSV</label>
+        <input type="file" id="chipTecFileInput" accept=".xlsx,.xls,.csv" onchange="importarArquivoChipsTecnico(this)">
+        ${window.__noXLSX?`<div class="badge baixado" style="margin-top:10px">${ic('alert-triangle')} Leitura de .xlsx indisponível (sem internet). Use CSV ou cole os dados.</div>`:''}
+      </div>
+    </div>
+  </div></div>`:''}
+  ${souAdmin()?`
   <div class="panel" style="margin-top:18px"><div class="ph"><h3>${ic('alert-triangle')} Marcar equipamento como perdido (Inventário Pendente)</h3></div><div class="pb">
     <p class="muted" style="margin-bottom:12px">Digite ou cole um ou mais nº de série (separados por espaço, vírgula ou linha). Qualquer movimentação normal feita depois nesse item (entrada, saída, confirmação, baixa, uso em campo, retirada em campo) já tira ele da lista de pendentes automaticamente — acompanhe em <button class="btn sm ghost" style="display:inline-flex;padding:2px 8px" onclick="goto('perdidos')">Inventário Pendente →</button></p>
     <div class="field" style="margin-bottom:12px"><label>Nº de série</label>
@@ -3694,7 +3708,7 @@ function confirmarMov(){
    IMPORTAÇÃO
    ========================================================= */
 const COL_MAP = {
-  serie:['nº série','no série','n° série','numero de serie','nº de série','serie','série','n serie','nº serie'],
+  serie:['nº série','no série','n° série','numero de serie','nº de série','serie','série','n serie','nº serie','iccid'],
   produto:['produto','tipo'],
   deposito:['depósito','deposito','local','armazém','armazem'],
   data:['data entrada','data de entrada','data','entrada'],
@@ -3702,7 +3716,10 @@ const COL_MAP = {
   operadora:['operadora'],
   // Frases específicas, de propósito (NÃO "número"/"numero" soltos — colidiria com
   // "nº de série", que também contém essa palavra e é resolvida antes desta coluna).
-  numeroLinha:['número da linha','numero da linha','nº da linha','n da linha','linha']
+  numeroLinha:['número da linha','numero da linha','nº da linha','n da linha','linha'],
+  // Usadas só pela importação em lote de chips por técnico (22/07/2026, ver mais abaixo).
+  tecnico:['técnico','tecnico'],
+  entregue:['entregue','data de entrega','data entrega']
 };
 function acharCol(headers, chaves){
   const norm = h => h.toLowerCase().trim().replace(/\s+/g,' ');
@@ -3902,6 +3919,179 @@ function confirmarImportChips(){
   chipsPendentesImport = [];
   salvar(); closeModal(); render();
   flash(`${novos.length} chip(s) enviado(s) para ${destinoTxt} — aguardando confirmação`+(pulados?`, ${pulados} pulado(s) por já existir`:''),'green');
+}
+
+/* =========================================================
+   IMPORTAÇÃO EM LOTE DE CHIPS JÁ EM MÃOS DOS TÉCNICOS (planilha)
+   22/07/2026. Diferente da importação acima (que cola texto do portal e manda
+   o lote inteiro pra 1 técnico só): aqui é uma PLANILHA onde cada LINHA já tem
+   o seu próprio técnico — entrada retroativa de chips que já estão fisicamente
+   com eles (decisão do usuário). O nome do técnico na planilha vem sujo, com
+   prefixo de filial/produto (ex.: "SOO - EPV - A365 - Fulano de Tal") — o nome
+   de verdade é sempre o ÚLTIMO trecho depois do último " - ". Cada chip entra
+   em trânsito (emTransito=true, mesmo padrão de confirmarImportChips acima)
+   pro técnico da linha — ele confirma o recebimento na tela dele, exatamente
+   como pedido ("quando eu der entrada deve ficar para eles confirmarem que
+   receberam"). Usa a data da coluna "Entregue" (quando existir) como
+   transitoDesde/ts da movimentação, não a data de hoje — preserva o histórico
+   real de quando o chip realmente chegou às mãos do técnico.
+   ========================================================= */
+let chipsTecPendentesImport = [];
+function extrairNomeTecnicoBruto(raw){
+  const partes = String(raw||'').split(' - ').map(p=>p.trim()).filter(Boolean);
+  return partes.length ? partes[partes.length-1] : String(raw||'').trim();
+}
+// BUG-053: planilhas exportadas de sistema externo (Ubisafe) trazem nomes com
+// caracteres invisíveis (espaço não separável, zero-width space, BOM) que o
+// usuário não vê na tela mas que quebram uma comparação de texto ingênua —
+// mesmo nome "idêntico" aos olhos do usuário não casava com NENHUM técnico.
+// Usa NFD + remove marca diacrítica pelo código numérico (0x0300-0x036F, evita
+// digitar a faixa Unicode como regex literal — problema real encontrado ao
+// escrever isso, ver G.19) e some com uma lista de códigos de caractere
+// invisível conhecidos (soft hyphen, zero-width space/non-joiner/joiner,
+// marca direita-p-esquerda, BOM).
+const CODIGOS_INVISIVEIS_NOME_TEC = new Set([173, 8203, 8204, 8205, 8206, 8207, 65279]);
+function normalizarNomeTec(s){
+  let out = '';
+  for(const ch of String(s||'').normalize('NFD')){
+    const c = ch.codePointAt(0);
+    if(c>=768 && c<=879) continue;
+    out += CODIGOS_INVISIVEIS_NOME_TEC.has(c) ? ' ' : ch;
+  }
+  return out.toLowerCase().trim().replace(/\s+/g,' ');
+}
+// Segundo nível, só usado se a comparação normal não achar candidato nenhum:
+// compara só as letras (a-z), ignorando qualquer espaço/pontuação/caractere
+// invisível que a normalização acima não tenha previsto — rede de segurança
+// extra pra planilha externa, sem abrir mão da exigência de casar 1 só nome.
+function normalizarNomeTecLetras(s){ return normalizarNomeTec(s).replace(/[^a-z]/g,''); }
+// Só casa se for único candidato com nome idêntico (ignorando acento/caixa) —
+// nome ambíguo (2 técnicos com mesmo nome) ou não encontrado fica sem match,
+// exigindo escolha manual no modal em vez de arriscar mandar pro técnico errado.
+function acharTecnicoPorNomePlanilha(raw){
+  const nomeExtraido = extrairNomeTecnicoBruto(raw);
+  const alvo = normalizarNomeTec(nomeExtraido);
+  if(!alvo) return null;
+  let candidatos = DB.tecnicos.filter(t=>normalizarNomeTec(t.nome)===alvo);
+  if(candidatos.length===1) return candidatos[0];
+  if(candidatos.length===0){
+    const alvoLetras = normalizarNomeTecLetras(nomeExtraido);
+    if(alvoLetras){
+      candidatos = DB.tecnicos.filter(t=>normalizarNomeTecLetras(t.nome)===alvoLetras);
+      if(candidatos.length===1) return candidatos[0];
+    }
+  }
+  return null;
+}
+function extrairOperadoraPlanilha(raw){
+  const s = String(raw||'').trim();
+  const m = s.match(/Virtueyes-(\w+)/i);
+  if(m){ const op=m[1].toLowerCase(); if(op==='claro') return 'Claro'; if(op==='tim') return 'TIM'; }
+  return s;
+}
+function parseDataChipPlanilha(raw){
+  const s = String(raw||'').trim(); if(!s) return null;
+  const ts = Date.parse(s.replace(' ','T'));
+  return isNaN(ts) ? null : ts;
+}
+function parseLinhasChipsTecnico(matriz){
+  if(!souAdmin()) return flash('Somente administradores podem fazer isso','red');
+  if(!matriz.length){ flash('Arquivo vazio','red'); return; }
+  let hi=0; for(let i=0;i<Math.min(20,matriz.length);i++){ const row=matriz[i].map(c=>String(c).toLowerCase()); if(row.some(c=>c.includes('iccid')||c.includes('série')||c.includes('serie'))){ hi=i; break; } }
+  const headers=matriz[hi].map(c=>String(c));
+  const ci={ serie:acharCol(headers,COL_MAP.serie), operadora:acharCol(headers,COL_MAP.operadora), numeroLinha:acharCol(headers,COL_MAP.numeroLinha), tecnico:acharCol(headers,COL_MAP.tecnico), entregue:acharCol(headers,COL_MAP.entregue) };
+  if(ci.serie<0) return flash('Não encontrei a coluna "IccId"/"Nº Série". Verifique o cabeçalho.','red');
+  if(ci.tecnico<0) return flash('Não encontrei a coluna "Técnico". Verifique o cabeçalho.','red');
+
+  const vistos = new Set();
+  const linhas = [];
+  for(let i=hi+1;i<matriz.length;i++){
+    const row=matriz[i]; if(!row||!row.length) continue;
+    const serie=String(row[ci.serie]==null?'':row[ci.serie]).trim(); if(!serie) continue;
+    const duplicado = !!acharEquipPorSerie(serie) || vistos.has(serie.toLowerCase());
+    vistos.add(serie.toLowerCase());
+    const tecnicoRaw = ci.tecnico>=0? String(row[ci.tecnico]||'').trim() : '';
+    const tecnico = acharTecnicoPorNomePlanilha(tecnicoRaw);
+    linhas.push({
+      serie, duplicado,
+      operadora: ci.operadora>=0? extrairOperadoraPlanilha(row[ci.operadora]) : '',
+      numeroLinha: ci.numeroLinha>=0? String(row[ci.numeroLinha]||'').trim() : '',
+      entregueTS: ci.entregue>=0? parseDataChipPlanilha(row[ci.entregue]) : null,
+      tecnicoRaw, tecnicoNome: extrairNomeTecnicoBruto(tecnicoRaw),
+      tecnicoId: tecnico ? tecnico.id : ''
+    });
+  }
+  if(!linhas.length) return flash('Nenhuma linha reconhecida na planilha','red');
+  chipsTecPendentesImport = linhas;
+  abrirModalImportChipsTecnico();
+}
+function importarColadoChipsTecnico(){
+  const txt = $('#chipTecPasteArea').value; if(!txt.trim()) return flash('Cole os dados primeiro','red');
+  const delim = txt.includes('\t')?'\t':(txt.split('\n')[0].includes(';')?';':',');
+  const matriz = txt.replace(/\r/g,'').split('\n').filter(l=>l.trim()).map(l=>parseCSVLinha(l,delim));
+  parseLinhasChipsTecnico(matriz);
+}
+function importarArquivoChipsTecnico(input){
+  const file=input.files[0]; if(!file) return;
+  const reader=new FileReader();
+  if(/\.csv$/i.test(file.name)){
+    reader.onload=e=>{ const txt=e.target.result; const delim=txt.includes('\t')?'\t':(txt.split('\n')[0].includes(';')?';':','); const matriz=txt.replace(/\r/g,'').split('\n').filter(l=>l.trim()).map(l=>parseCSVLinha(l,delim)); parseLinhasChipsTecnico(matriz); };
+    reader.readAsText(file,'utf-8');
+  } else {
+    if(window.__noXLSX||typeof XLSX==='undefined') return flash('Leitura de Excel indisponível (sem internet). Salve como CSV ou cole os dados.','red');
+    reader.onload=e=>{ const wb=XLSX.read(new Uint8Array(e.target.result),{type:'array'}); const ws=wb.Sheets[wb.SheetNames[0]]; const matriz=XLSX.utils.sheet_to_json(ws,{header:1,raw:false,defval:''}); parseLinhasChipsTecnico(matriz); };
+    reader.readAsArrayBuffer(file);
+  }
+  input.value='';
+}
+function trocarTecnicoImportLinha(i, tecId){ if(chipsTecPendentesImport[i]) chipsTecPendentesImport[i].tecnicoId = tecId; }
+function abrirModalImportChipsTecnico(){
+  const linhas = chipsTecPendentesImport.map((c,i)=>{
+    if(c.duplicado){
+      return `<tr><td class="mono">${esc(c.serie)}</td><td colspan="4"><span class="badge baixado">${ic('alert-triangle')} Já existe — será pulado</span></td></tr>`;
+    }
+    return `<tr ${!c.tecnicoId?'style="background:var(--amber-soft)"':''}>
+      <td class="mono">${esc(c.serie)}</td>
+      <td>${esc(c.operadora||'—')}</td>
+      <td>${esc(c.numeroLinha||'—')}</td>
+      <td>${c.entregueTS? esc(fmtTS(c.entregueTS)) : '—'}</td>
+      <td><select onchange="trocarTecnicoImportLinha(${i},this.value)" style="padding:6px 8px;border:1px solid var(--line);border-radius:var(--radius-md);background:var(--panel);color:var(--txt)">
+          <option value="">— selecione —</option>
+          ${agruparTecsPorFilialOpt(DB.tecnicos, c.tecnicoId)}
+        </select>${!c.tecnicoId?`<div class="muted" style="font-size:11px;margin-top:2px">Não identifiquei "${esc(c.tecnicoNome)}" — selecione manualmente</div>`:''}</td>
+    </tr>`;
+  }).join('');
+  const novos = chipsTecPendentesImport.filter(c=>!c.duplicado).length;
+  const pulados = chipsTecPendentesImport.length - novos;
+  const semTecnico = chipsTecPendentesImport.filter(c=>!c.duplicado && !c.tecnicoId).length;
+  modal(ic('inbox')+' Importar chips em lote — '+chipsTecPendentesImport.length+' linha(s)', `
+    <p class="muted" style="margin-bottom:12px">${novos} novo(s) será(ão) enviado(s)${pulados?`, ${pulados} já existente(s) será(ão) pulado(s)`:''}${semTecnico?`. <b>${semTecnico} sem técnico identificado</b> — selecione manualmente antes de confirmar.`:''} Cada chip entra em trânsito para o técnico indicado, aguardando confirmação de recebimento dele.</p>
+    <div class="tbl-wrap" style="max-height:360px;overflow:auto;margin-bottom:14px"><table><thead><tr><th>ICCID</th><th>Operadora</th><th>Linha</th><th>Entregue</th><th>Técnico</th></tr></thead><tbody>${linhas}</tbody></table></div>`,
+    `<button class="btn" onclick="closeModal()">Cancelar</button>
+     <button class="btn primary" onclick="confirmarImportChipsTecnico()">${ic('check')} Confirmar envio</button>`, 'lg');
+}
+function confirmarImportChipsTecnico(){
+  const novos = chipsTecPendentesImport.filter(c=>!c.duplicado);
+  if(!novos.length) return flash('Nenhum chip novo para enviar — todos já existem no sistema','red');
+  if(novos.some(c=>!c.tecnicoId)) return flash('Ainda tem chip sem técnico selecionado — resolva antes de confirmar','red');
+  const usuario = nomeUsuarioAtual();
+  novos.forEach(c=>{
+    const tecnico = DB.tecnicos.find(t=>t.id===c.tecnicoId);
+    const filial = tecnico.regiao||'';
+    const destinoTxt = tecNome(c.tecnicoId);
+    DB.equipamentos.push({
+      serie:c.serie, tipo:'Chip', deposito:filial, local:filial, status:'estoque', tecnicoId:null,
+      dataEntrada:'', origem:'', familia:'', derivacao:'', um:'', obs:'', confirmado:true, desde:Date.now(),
+      operadora:c.operadora||null, numeroLinha:c.numeroLinha||null,
+      emTransito:true, transitoPara:c.tecnicoId, transitoDesde:c.entregueTS||Date.now(), transitoDe:filial, transitoUsuario:usuario, transitoDeTecnicoId:null
+    });
+    registrarMovimentacao({ id:uid(), ts:c.entregueTS||Date.now(), tipo:'saida', serie:c.serie, de:filial, para:destinoTxt+' (aguardando confirmação)', tecnicoId:c.tecnicoId, tecnicoIdOrigem:null, usuario, obs:'Entrada retroativa em lote (planilha)'+(c.entregueTS?'':' — sem data de recebimento informada') });
+  });
+  if(!DB.tipos['Chip']) DB.tipos['Chip']={nome:'Chip',cor:''};
+  const pulados = chipsTecPendentesImport.length - novos.length;
+  chipsTecPendentesImport = [];
+  salvar(); closeModal(); render();
+  flash(`${novos.length} chip(s) enviado(s) para os técnicos — aguardando confirmação de cada um`+(pulados?`, ${pulados} pulado(s) por já existir`:''),'green');
 }
 
 /* ---- Exportações ---- */
