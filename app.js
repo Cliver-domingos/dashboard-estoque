@@ -118,7 +118,7 @@ function auditoriaParaSnake(a){
     auditor:a.auditor||null, esperados:a.esperados||[], conferidos:a.conferidos||[], faltando:a.faltando||[],
     sobrando:a.sobrando||[], obs:a.obs||null };
 }
-function tecnicoParaSnake(t){ return { id:t.id, nome:t.nome, regiao:t.regiao||null, matricula:t.matricula||null }; }
+function tecnicoParaSnake(t){ return { id:t.id, nome:t.nome, regiao:t.regiao||null, matricula:t.matricula||null, apelidos:(t.apelidos&&t.apelidos.length)?t.apelidos:null }; }
 function tipoParaSnake(codigo, t){ return { codigo, nome:t.nome, cor:t.cor||null, min_por_tecnico:t.min||0 }; }
 function tiposArrayParaObjeto(rows){ const o={}; rows.forEach(r=>{ o[r.codigo]={nome:r.nome,cor:r.cor,min:r.min_por_tecnico}; }); return o; }
 function configParaCamel(r){ return { usuario:r.usuario||'', importadoEm:tsToMs(r.importado_em), empresa:r.empresa||'A365', ultimoBackup:tsToMs(r.ultimo_backup) }; }
@@ -824,7 +824,7 @@ async function iniciarSyncNuvem(){
     aplicandoRemoto = true;
     DB.tipos = tiposArrayParaObjeto(tiposLista);
     DB.filiais = filiaisLista.map(r=>r.sigla);
-    DB.tecnicos = tecnicosLista.map(r=>({ id:r.id, nome:r.nome, regiao:r.regiao, matricula:r.matricula }));
+    DB.tecnicos = tecnicosLista.map(r=>({ id:r.id, nome:r.nome, regiao:r.regiao, matricula:r.matricula, apelidos:r.apelidos||[] }));
     DB.config = configRes.data ? configParaCamel(configRes.data) : DB.config;
     ultimoSyncTipos = {}; tiposLista.forEach(r=>{ ultimoSyncTipos[r.codigo]=JSON.stringify(r); });
     ultimoSyncFiliais = new Set(DB.filiais);
@@ -882,7 +882,7 @@ async function iniciarSyncNuvem(){
     })
     .on('postgres_changes', {event:'*',schema:'public',table:'tecnicos'}, async()=>{
       const data = await selecionarTudo('tecnicos');
-      DB.tecnicos = data.map(r=>({ id:r.id, nome:r.nome, regiao:r.regiao, matricula:r.matricula }));
+      DB.tecnicos = data.map(r=>({ id:r.id, nome:r.nome, regiao:r.regiao, matricula:r.matricula, apelidos:r.apelidos||[] }));
       ultimoSyncTecnicos = {}; DB.tecnicos.forEach(t=>{ ultimoSyncTecnicos[t.id]=JSON.stringify(t); });
       salvarLocal(); render();
     })
@@ -2464,6 +2464,9 @@ function actionCard(icone,titulo,desc,cor,onclickJs){
    TÉCNICOS
    ========================================================= */
 const TECNICOS_PADRAO = [
+  {nome:'Maurício Lana de Oliveira', regiao:'CTA', matricula:'EPV'},
+  {nome:'Flavio Renato Gomes Vasconcellos', regiao:'JLE', matricula:'EPV'},
+  {nome:'Emerson Luis Prudente Ocampo', regiao:'LGS', matricula:'EPV'},
   {nome:'Thiago Silveira Alvez', regiao:'IAI', matricula:'EPV'},
   {nome:'David Cleiton Silva da Costa', regiao:'SOO', matricula:'EPV'},
   {nome:'Izaque Alves De Jesus', regiao:'CCO', matricula:'EPV'},
@@ -2994,14 +2997,16 @@ function openTec(id){
     <div class="row2">
       <div class="field"><label>Região / Base</label><input id="t_regiao" value="${t?esc(t.regiao||''):''}" placeholder="Ex.: Blumenau"></div>
       <div class="field"><label>Matrícula</label><input id="t_mat" value="${t?esc(t.matricula||''):''}"></div>
-    </div>`,
+    </div>
+    <div class="field"><label>Apelidos / nomes alternativos</label><input id="t_apelidos" value="${t&&t.apelidos?esc(t.apelidos.join(', ')):''}" placeholder="Ex.: Mauro Valente, Mauro N. Valente"><div class="hint">Separe por vírgula. Usado pra reconhecer o técnico em importações de planilha quando o nome vier diferente do cadastrado.</div></div>`,
     `${t?`<button class="btn red ghost" style="margin-right:auto" onclick="excluirTec('${t.id}')">Excluir</button>`:''}
      <button class="btn" onclick="closeModal()">Cancelar</button>
      <button class="btn primary" onclick="salvarTec(${t?`'${t.id}'`:'null'})">Salvar</button>`);
 }
 function salvarTec(id){
   const nome=$('#t_nome').value.trim(); if(!nome) return flash('Informe o nome','red');
-  const dados={nome, regiao:$('#t_regiao').value.trim(), matricula:$('#t_mat').value.trim()};
+  const apelidos = ($('#t_apelidos')?$('#t_apelidos').value:'').split(',').map(s=>s.trim()).filter(Boolean);
+  const dados={nome, regiao:$('#t_regiao').value.trim(), matricula:$('#t_mat').value.trim(), apelidos};
   if(id){ Object.assign(DB.tecnicos.find(x=>x.id===id),dados); }
   else { DB.tecnicos.push(Object.assign({id:uid()},dados)); }
   salvar(); closeModal(); render(); flash('Técnico salvo','green');
@@ -3973,14 +3978,23 @@ function normalizarNomeTecLetras(s){ return normalizarNomeTec(s).replace(/[^a-z]
 // o match final) pra distinguir "não achei ninguém" de "achei mais de um" —
 // essa distinção é o que teria tornado aquele diagnóstico imediato em vez de
 // precisar investigar o banco direto.
+// Casa o nome da planilha contra o nome cadastrado OU qualquer apelido do técnico
+// (apelidos = nomes alternativos que o admin cadastra pra reconciliar planilhas de
+// sistema externo, ex.: "Mauro Valente" apontando pro "Mauro Roberto Nascimento
+// Valente" do cadastro). Os dois níveis de tolerância do BUG-053 (normalização
+// completa, depois só-letras) valem tanto pro nome quanto pros apelidos.
+function nomeOuApelidoBate(t, alvoNorm, normFn){
+  if(normFn(t.nome)===alvoNorm) return true;
+  return !!(t.apelidos && t.apelidos.some(a=>normFn(a)===alvoNorm));
+}
 function candidatosTecnicoPorNome(nomeExtraido){
   const alvo = normalizarNomeTec(nomeExtraido);
   if(!alvo) return [];
-  const exatos = DB.tecnicos.filter(t=>normalizarNomeTec(t.nome)===alvo);
+  const exatos = DB.tecnicos.filter(t=>nomeOuApelidoBate(t, alvo, normalizarNomeTec));
   if(exatos.length) return exatos;
   const alvoLetras = normalizarNomeTecLetras(nomeExtraido);
   if(!alvoLetras) return [];
-  return DB.tecnicos.filter(t=>normalizarNomeTecLetras(t.nome)===alvoLetras);
+  return DB.tecnicos.filter(t=>nomeOuApelidoBate(t, alvoLetras, normalizarNomeTecLetras));
 }
 // Só casa se for único candidato com nome idêntico (ignorando acento/caixa) —
 // nome ambíguo (2 técnicos com mesmo nome) ou não encontrado fica sem match,
