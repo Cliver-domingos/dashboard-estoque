@@ -2524,15 +2524,31 @@ function importarTecnicosPadrao(){
   });
   salvar(); render(); flash(`${novos} técnico(s) importado(s)${TECNICOS_PADRAO.length-novos>0?', '+(TECNICOS_PADRAO.length-novos)+' já existiam':''}`,'green');
 }
+let tecnicosBusca = '';
+// Lista base (respeitando a região do supervisor) + filtro por texto — nome,
+// filial ou matrícula. Sub-renderização própria (renderTecnicosGrid) pra o
+// campo de busca não perder o foco a cada letra digitada (mesmo padrão já
+// usado em Equipamentos/Pendentes de localizar).
+function tecnicosFiltrados(){
+  const base = souSupervisor() ? DB.tecnicos.filter(t=>regiaoPermitida(t.regiao)) : DB.tecnicos;
+  const q = tecnicosBusca.trim().toLowerCase();
+  if(!q) return base;
+  return base.filter(t=>(t.nome||'').toLowerCase().includes(q) || (t.regiao||'').toLowerCase().includes(q) || (t.matricula||'').toLowerCase().includes(q));
+}
 function renderTecnicos(){
-  const tecnicosLista = souSupervisor() ? DB.tecnicos.filter(t=>regiaoPermitida(t.regiao)) : DB.tecnicos;
   $('#content').innerHTML = `
   <div class="toolbar">
-    <div style="flex:1"></div>
+    <div class="search"><span class="si">${ic('search')}</span><input placeholder="Buscar por nome, filial ou matrícula..." value="${esc(tecnicosBusca)}" oninput="tecnicosBusca=this.value;renderTecnicosGrid()"></div>
     ${souAdmin()?`<button class="btn" onclick="importarTecnicosPadrao()">${ic('clipboard-list')} Importar lista oficial</button>`:''}
     <button class="btn primary" onclick="openTec()">＋ Novo técnico</button>
   </div>
-  <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(280px,1fr))">
+  <div id="tecnicosGrid"></div>`;
+  renderTecnicosGrid();
+}
+function renderTecnicosGrid(){
+  const tecnicosLista = tecnicosFiltrados();
+  const existeAlgum = (souSupervisor() ? DB.tecnicos.filter(t=>regiaoPermitida(t.regiao)) : DB.tecnicos).length > 0;
+  $('#tecnicosGrid').innerHTML = `<div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(280px,1fr))">
     ${tecnicosLista.length? tecnicosLista.map(t=>{
       const itens = itensDoTecnico(t.id);
       const aud = ultimaAuditoria('tecnico',t.id);
@@ -2548,7 +2564,9 @@ function renderTecnicos(){
           <span class="btn sm ghost" style="margin-left:auto">ver ficha →</span>
         </div>
       </div></div>`;
-    }).join('') : `<div class="panel" style="grid-column:1/-1"><div class="empty"><div class="big">${ic('hard-hat')}</div>Nenhum técnico cadastrado.<br><button class="btn primary" style="margin-top:14px" onclick="openTec()">＋ Cadastrar primeiro técnico</button></div></div>`}
+    }).join('') : existeAlgum
+        ? `<div class="panel" style="grid-column:1/-1"><div class="empty"><div class="big">${ic('search')}</div>Nenhum técnico encontrado com esse filtro.</div></div>`
+        : `<div class="panel" style="grid-column:1/-1"><div class="empty"><div class="big">${ic('hard-hat')}</div>Nenhum técnico cadastrado.<br><button class="btn primary" style="margin-top:14px" onclick="openTec()">＋ Cadastrar primeiro técnico</button></div></div>`}
   </div>`;
 }
 function verTecItens(id){
