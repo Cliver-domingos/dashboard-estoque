@@ -169,20 +169,6 @@
   .topbar .spacer{flex:1}
   .content{padding:24px 28px 60px}
 
-  /* animação de entrada suave — dispara sozinha toda vez que o app.js troca o
-     innerHTML de #content (cada render() cria elementos novos no DOM, então a
-     animação reaparece a cada navegação, sem precisar de nenhuma classe manual
-     nem mudança no app.js). O bloco prefers-reduced-motion acima já neutraliza
-     pra quem pediu menos movimento. */
-  @keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
-  .content>*{animation:rise .45s var(--ease) both}
-  .kpis>.kpi{animation:rise .45s var(--ease) both}
-  .kpis>.kpi:nth-child(1){animation-delay:.02s} .kpis>.kpi:nth-child(2){animation-delay:.06s}
-  .kpis>.kpi:nth-child(3){animation-delay:.10s} .kpis>.kpi:nth-child(4){animation-delay:.14s}
-  .kpis>.kpi:nth-child(5){animation-delay:.18s} .kpis>.kpi:nth-child(6){animation-delay:.22s}
-  .chart-row>*:nth-child(1){animation:rise .45s var(--ease) both .04s}
-  .chart-row>*:nth-child(2){animation:rise .45s var(--ease) both .09s}
-
   /* ---- Buttons ---- */
   .btn{display:inline-flex;align-items:center;gap:7px;padding:9px 15px;border-radius:var(--radius-md);font-weight:600;font-size:var(--text-sm);background:var(--panel);border:1px solid var(--line);color:var(--txt);transition:background var(--dur-fast) var(--ease),border-color var(--dur-fast) var(--ease),transform var(--dur-fast) var(--ease),box-shadow var(--dur-fast) var(--ease)}
   .btn svg{width:15px;height:15px;flex-shrink:0}
@@ -293,11 +279,7 @@
   .bar-row{display:flex;align-items:center;gap:12px;margin-bottom:12px}
   .bar-row .bl{width:130px;font-weight:600;font-size:var(--text-sm);display:flex;align-items:center;gap:7px}
   .bar-track{flex:1;height:24px;background:var(--surface-2);border-radius:var(--radius-sm);overflow:hidden;position:relative}
-  .bar-fill{height:100%;border-radius:var(--radius-sm);transition:width 1s cubic-bezier(.22,1,.36,1);display:flex;align-items:center;justify-content:flex-end;padding-right:8px;color:#fff;font-weight:700;font-size:var(--text-xs);min-width:28px;font-variant-numeric:tabular-nums;position:relative;overflow:hidden}
-  /* brilho que passa pela barra assim que ela é preenchida — puramente CSS,
-     dispara sozinho porque o app.js já define a largura via style inline */
-  .bar-fill::after{content:'';position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.28),transparent);transform:translateX(-100%);animation:shine 2.2s var(--ease) .5s}
-  @keyframes shine{to{transform:translateX(100%)}}
+  .bar-fill{height:100%;border-radius:var(--radius-sm);display:flex;align-items:center;justify-content:flex-end;padding-right:8px;color:#fff;font-weight:700;font-size:var(--text-xs);min-width:28px;font-variant-numeric:tabular-nums;position:relative;overflow:hidden}
   .donut-wrap{display:flex;align-items:center;justify-content:center;gap:48px;flex-wrap:wrap;padding:24px;min-height:340px}
   .donut,svg.donut{filter:drop-shadow(0 6px 18px var(--glow))}
   .legend{display:flex;flex-direction:column;gap:16px;min-width:220px}
