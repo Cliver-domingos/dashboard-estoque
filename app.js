@@ -606,6 +606,27 @@ function registrarMovimentacao(m){
     else flash('Falha ao salvar movimentação: '+error.message,'red');
   }).catch(()=>{ enfileirarOffline('movimentacao', payload); });
 }
+// Insere VÁRIAS movimentações de uma vez. Usado pela importação de estoque, que pode
+// criar milhares de 'entrada' num lote só — chamar registrarMovimentacao item a item
+// dispararia milhares de inserts HTTP. Mesmo padrão de chunk de 500 da
+// sincronizarEquipamentos, e mesma resiliência offline (enfileira o que falhar).
+function registrarMovimentacoesEmLote(arr){
+  if(!arr||!arr.length) return;
+  arr.forEach(m=>DB.movimentacoes.push(m));
+  const payloads = arr.map(movimentacaoParaSnake);
+  (async()=>{
+    for(let i=0;i<payloads.length;i+=500){
+      const lote = payloads.slice(i,i+500);
+      try{
+        const { error } = await sb.from('movimentacoes').insert(lote);
+        if(error) throw error;
+      }catch(e){
+        if(pareceFalhaDeConexao(e)) lote.forEach(p=>enfileirarOffline('movimentacao', p));
+        else flash('Falha ao salvar '+lote.length+' entrada(s) de importação: '+(e.message||e),'red');
+      }
+    }
+  })();
+}
 function registrarAuditoria(a){
   DB.auditorias.push(a);
   const payload = auditoriaParaSnake(a);
@@ -3749,6 +3770,16 @@ function acharCol(headers, chaves){
   for(let i=0;i<headers.length;i++){ const h=norm(headers[i]); if(chaves.some(c=>h===c||h.includes(c))) return i; }
   return -1;
 }
+// Converte "dd/mm/aaaa" (formato da coluna data_entrada da planilha) em ms.
+// Meio-dia local de propósito: com 00:00 a data pode recuar um dia ao ser
+// convertida/exibida por fuso. Retorna null se o formato não casar — nesse caso
+// o chamador cai pra Date.now() (data da importação).
+function dataEntradaParaMs(txt){
+  const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(String(txt||'').trim());
+  if(!m) return null;
+  const d = new Date(+m[3], +m[2]-1, +m[1], 12, 0, 0);
+  return isNaN(d.getTime()) ? null : d.getTime();
+}
 function parseLinhas(matriz, substituir){
   if(!matriz.length){ flash('Arquivo vazio','red'); return; }
   // acha header
@@ -3761,6 +3792,7 @@ function parseLinhas(matriz, substituir){
 
   const idxPorSerie = {}; DB.equipamentos.forEach((e,i)=>{ idxPorSerie[e.serie.toLowerCase()]=i; });
   const seriesNaPlanilha = new Set();
+  const entradasNovas = [];   // 1 movimentação 'entrada' por item genuinamente novo (ver abaixo)
   let novos=0, atualizados=0;
   for(let i=hi+1;i<matriz.length;i++){
     const row=matriz[i]; if(!row||!row.length) continue;
@@ -3786,6 +3818,13 @@ function parseLinhas(matriz, substituir){
     } else {
       DB.equipamentos.push(Object.assign({status:'estoque',tecnicoId:null,local:reg.deposito,obs:''},reg));
       idxPorSerie[serie.toLowerCase()]=DB.equipamentos.length-1; novos++;
+      // Registra a ENTRADA no estoque no histórico — só pra item GENUINAMENTE novo
+      // (reimportar o mesmo item cai no ramo de atualização acima e não duplica).
+      // ts = a data_entrada REAL da planilha (não a data de hoje); se vier vazia/
+      // inválida, usa agora. Enviado em lote depois do loop (registrarMovimentacoesEmLote).
+      entradasNovas.push({ id:uid(), ts: dataEntradaParaMs(reg.dataEntrada) || Date.now(),
+        tipo:'entrada', serie:reg.serie, de:'', para:reg.deposito||'Estoque',
+        usuario:nomeUsuarioAtual(), obs:'Entrada por importação de inventário' });
     }
   }
   let removidos=0;
@@ -3803,6 +3842,9 @@ function parseLinhas(matriz, substituir){
       });
     }
   }
+  // Grava as movimentações de entrada dos itens novos (em lote) ANTES do salvar(),
+  // pra elas já entrarem no DB.movimentacoes que o salvarLocal() persiste.
+  registrarMovimentacoesEmLote(entradasNovas);
   DB.config.importadoEm=Date.now(); salvar();
   flash(`Importado: ${novos} novos, ${atualizados} atualizados`+(removidos?`, ${removidos} removido(s) do estoque (não estavam na planilha)`:''),'green');
   goto('dashboard');
