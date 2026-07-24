@@ -10,7 +10,7 @@
 // atualiza o cache sozinha — o cache só entra em ação quando a rede falha de
 // verdade. Isso também elimina a necessidade de "lembrar de trocar a versão"
 // do cache a cada deploy: ele se mantém atualizado sozinho.
-const CACHE_NAME = 'dashboard-estoque-shell-v1';
+const CACHE_NAME = 'dashboard-estoque-shell-v2';
 
 // Só os arquivos da CASCA do app (nunca dados/API). Os dois scripts de CDN
 // (xlsx e supabase-js) precisam estar aqui com a URL EXATA usada no
@@ -23,6 +23,7 @@ const ASSETS = [
   './manifest.json',
   './icons/icon-192.png',
   './icons/icon-512.png',
+  './icons/logo-alarme365.png',
   'https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js',
   'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js',
 ];

@@ -1,7 +1,7 @@
 {
-  "name": "Estoque A365",
-  "short_name": "Estoque A365",
-  "description": "Controle de estoque e inventário de equipamentos A365",
+  "name": "Alarme 365",
+  "short_name": "Alarme 365",
+  "description": "Controle de estoque e inventário de equipamentos Alarme 365 (Orsegups)",
   "start_url": "./index.html",
   "scope": "./",
   "display": "standalone",

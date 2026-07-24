@@ -3,14 +3,14 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Controle de Estoque & Inventário</title>
+<title>Alarme 365 — Controle de Estoque</title>
 <link rel="manifest" href="manifest.json">
 <link rel="icon" href="icons/favicon-32.png" sizes="32x32" type="image/png">
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <meta name="theme-color" content="#2563eb">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="Estoque A365">
+<meta name="apple-mobile-web-app-title" content="Alarme 365">
 <script>
   /* Resolve o tema antes da primeira pintura, pra não piscar o tema errado */
   (function(){
@@ -25,7 +25,7 @@
 <style>
   /* ============================================================
      REDESIGN — dark blue / futurista (aplicado a partir do
-     preview-redesign.html aprovado). Mesmas classes/IDs que o
+     docs/preview-redesign.html aprovado). Mesmas classes/IDs que o
      app.js já gera — só tokens + CSS mudaram, nada de estrutura.
      ============================================================ */
   :root{
@@ -146,8 +146,11 @@
     background:linear-gradient(180deg,rgba(10,16,38,.96),rgba(8,12,28,.98));
     border-right:1px solid var(--line);backdrop-filter:blur(14px);
   }
-  .sidebar .logo{padding:22px 20px 16px;font-size:var(--text-lg);font-weight:700;letter-spacing:.3px;display:flex;align-items:center;gap:10px}
-  .sidebar .logo .dot{width:30px;height:30px;border-radius:var(--radius-md);background:var(--grad-brand);display:grid;place-items:center;font-size:16px;color:#fff;box-shadow:0 6px 18px var(--glow)}
+  .sidebar .logo{padding:18px 16px 14px}
+  /* Logo oficial num card branco — a sidebar é sempre azul-escura, e a arte da
+     logo é azul; o card branco garante a legibilidade. */
+  .sidebar .logo .mark{display:block;background:#fff;border-radius:11px;padding:11px 14px;box-shadow:0 5px 16px rgba(0,0,0,.28)}
+  .sidebar .logo .mark img{width:100%;height:auto;display:block}
   .sidebar nav{padding:8px 12px;flex:1;overflow:auto}
   .nav-item{display:flex;align-items:center;gap:11px;padding:10px 13px;border-radius:var(--radius-md);color:#9fb0d4;font-weight:500;font-size:var(--text-sm);width:100%;text-align:left;margin-bottom:2px;position:relative;transition:background var(--dur-fast) var(--ease),color var(--dur-fast) var(--ease),transform var(--dur-fast) var(--ease)}
   .nav-item:hover{background:rgba(120,160,255,.09);color:#fff;transform:translateX(2px)}
@@ -328,11 +331,11 @@
     display:flex;align-items:center;justify-content:center;z-index:200}
   .login-box{background:var(--panel-solid);border-radius:14px;box-shadow:0 20px 60px rgba(0,0,0,.35);width:100%;max-width:392px;padding:34px 30px 30px;animation:login-in .45s var(--ease) both}
   @keyframes login-in{from{opacity:0;transform:translateY(14px) scale(.985)}to{opacity:1;transform:none}}
-  /* Selo do logo: gradiente da marca fixo de propósito (é a marca — igual à
-     sidebar, que também é sempre escura), pra não depender do --brand claro do
-     tema escuro sob ícone branco */
-  .login-logo{width:56px;height:56px;border-radius:15px;background:linear-gradient(135deg,#4f8cff,#22d3ee);color:#fff;display:flex;align-items:center;justify-content:center;margin:0 auto 14px;box-shadow:0 10px 26px rgba(79,140,255,.4)}
-  .login-logo svg{width:28px;height:28px}
+  /* Logo oficial ALARME 365 / ORSEGUPS num card branco: a arte é azul sobre
+     transparente, então precisa de fundo claro pra ser legível — e a caixa de
+     login fica escura no tema escuro. O card branco resolve nos dois temas. */
+  .login-logo{max-width:210px;border-radius:14px;background:#fff;padding:15px 20px;margin:0 auto 18px;box-shadow:0 12px 30px rgba(20,40,110,.28)}
+  .login-logo img{width:100%;height:auto;display:block}
   .login-box h2{font-size:var(--text-xl);margin-bottom:4px;text-align:center;display:flex;align-items:center;justify-content:center;gap:8px;letter-spacing:.2px}
   .login-box .sub{color:var(--txt-soft);font-size:var(--text-sm);text-align:center;margin-bottom:22px}
   .login-box .err{background:var(--red-soft);color:var(--red);padding:9px 12px;border-radius:var(--radius-md);font-size:var(--text-sm);margin-bottom:12px;display:none}
@@ -415,9 +418,7 @@
 <body>
 <div class="login-bg" id="loginBg">
   <div class="login-box">
-    <!-- SVG bruto (ICONS.package) porque esta tela renderiza antes do app.js carregar — manter em sincronia com o mapa ICONS em app.js -->
-    <div class="login-logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16.5 9.4 7.5 4.21"/><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4a2 2 0 0 0 1-1.73Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg></div>
-    <h2>Estoque A365</h2>
+    <div class="login-logo"><img src="icons/logo-alarme365.png" alt="Alarme 365 — Orsegups"></div>
     <div class="sub" id="loginSub">Entre com seu e-mail e senha</div>
     <div class="err" id="loginErr"></div>
     <div class="field"><label>E-mail</label><input id="loginEmail" type="email" placeholder="seuemail@empresa.com"></div>
@@ -449,7 +450,7 @@
 <div class="app" id="appRoot" style="display:none">
   <aside class="sidebar">
     <!-- SVG bruto (ICONS.package) porque esta tela renderiza antes do app.js carregar — manter em sincronia com o mapa ICONS em app.js -->
-    <div class="logo"><span class="dot"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="16" height="16" aria-hidden="true"><path d="M16.5 9.4 7.5 4.21"/><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4a2 2 0 0 0 1-1.73Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg></span> <span>Estoque<b style="font-weight:800">A365</b></span></div>
+    <div class="logo"><span class="mark"><img src="icons/logo-alarme365.png" alt="Alarme 365 — Orsegups"></span></div>
     <nav id="nav"></nav>
     <div class="foot" id="footSync">Conectando...<br>Faça backup em <b>Dados</b>.</div>
   </aside>
